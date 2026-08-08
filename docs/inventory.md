@@ -56,3 +56,16 @@
   — see docs/runbook.md "Lost SSH access / server won't boot" section and
   bootstrap/05-fix-efi-bootorder.sh for the self-healing fix now installed
   (fix-efi-bootorder.service, runs every boot).
+
+## Networking
+
+- Tailscale: installed, tailnet IP 100.115.156.84, tailscaled enabled on boot.
+  No UFW changes needed (existing 100.64.0.0/10 SSH allow rule already covers it).
+- Cloudflare Tunnel: tunnel name "servingz", UUID a8ceda0a-a10a-4924-8095-fb443319382d,
+  zone zaindroid.me. Config at /etc/cloudflared/config.yml (installed copy) and
+  ~/.cloudflared/config.yml (source), credentials at
+  ~/.cloudflared/a8ceda0a-a10a-4924-8095-fb443319382d.json. cloudflared systemd
+  service enabled on boot. Subdomain scheme: *.apps.zaindroid.me (no wildcard
+  DNS record yet — only status.apps.zaindroid.me routed as a placeholder,
+  service http://localhost:9999, nothing listening there yet). Real app
+  hostnames to be added when Coolify + watchdog exist.
