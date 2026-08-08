@@ -1,0 +1,8 @@
+node:
+  name: servingz
+  total_memory_mb: 32000
+  reserved_mb: 4500
+  usable_mb: 27500
+  max_utilisation: 0.80
+
+apps: []

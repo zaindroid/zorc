@@ -1,0 +1,9 @@
+*.key
+*.pem
+*_ed25519
+*_rsa
+.env
+.env.*
+secrets/
+*.bak
+__pycache__/
