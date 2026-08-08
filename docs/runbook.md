@@ -31,3 +31,28 @@ HP F10 at boot for the boot device menu, manually select "Ubuntu" /
 ## An app eating memory
 
 TODO
+
+## EFI boot-order regression — observed pattern (2026-08-08)
+
+First real-world test of `fix-efi-bootorder.service`: a `sudo init 0` (full
+poweroff, not a warm reboot) required manual boot-menu intervention (F9 →
+Boot from EFI File → `\EFI\ubuntu\shimx64.efi`) to get back up — the firmware
+had dropped the Ubuntu entry from BootOrder again during the power-off/cold-boot
+cycle. The self-healing service correctly re-fixed the order immediately on
+that boot (confirmed via `journalctl -u fix-efi-bootorder.service`), but by
+design it can only protect boots *after* a successful one — it cannot prevent
+the specific boot where a regression first occurs, since nothing runs before
+the firmware's own boot decision.
+
+Working theory: this may be specifically tied to full power-off/cold-boot
+cycles rather than warm reboots (`sudo reboot`) — old HP firmware NVRAM
+persistence is often less reliable across a true power cycle than across an
+ACPI-triggered restart within the same power session. Not yet confirmed with
+a plain `sudo reboot` test. If true, prefer `sudo reboot` over `sudo init 0`/
+`shutdown -h`/physical power cycling for routine restarts (e.g. after kernel
+updates) to reduce the chance of landing in this state.
+
+If it happens again: same recovery as before (F9 boot menu → EFI file →
+ubuntu/shimx64.efi), then verify `sudo efibootmgr | grep BootOrder` shows 0004
+(or whatever the Ubuntu entry's current number is) first, and
+`systemctl status fix-efi-bootorder.service` shows a recent successful run.
