@@ -1,0 +1,39 @@
+{
+  "cycle_seconds": 60,
+  "core_count": 8,
+  "heartbeat_time": "09:00",
+  "thresholds": {
+    "cpu_temp_warn_c": 80,
+    "cpu_temp_crit_c": 90,
+    "cpu_temp_crit_sustained_cycles": 2,
+    "gpu_temp_warn_c": 85,
+    "disk_warn_pct": 85,
+    "disk_crit_pct": 92,
+    "ram_available_warn_pct": 15,
+    "swap_used_warn_pct": 50,
+    "load_avg_sustained_cycles": 10
+  },
+  "disks": {
+    "/": "sda (root, SATA SSD)",
+    "/mnt/fast": "nvme0n1 (NVMe, Docker data-root)",
+    "/mnt/data": "sdb1 (HDD, bulk storage)"
+  },
+  "smart_devices": ["/dev/sda", "/dev/sdb", "/dev/nvme0n1"],
+  "coolify_containers": [
+    "coolify",
+    "coolify-db",
+    "coolify-redis",
+    "coolify-realtime",
+    "coolify-proxy",
+    "coolify-sentinel"
+  ],
+  "mounts": ["/mnt/fast", "/mnt/data"],
+  "docker_user_block_port": 8000,
+  "cloudflare_tunnel_name": "servingz",
+  "node": {
+    "name": "servingz",
+    "tailscale_ip": "100.115.156.84",
+    "labels": ["always-on", "control-plane"],
+    "capabilities": ["orchestrator", "docker", "coolify", "cuda-legacy", "x86"]
+  }
+}

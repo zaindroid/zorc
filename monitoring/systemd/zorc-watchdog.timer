@@ -1,0 +1,10 @@
+[Unit]
+Description=Run the servingz watchdog every ~60 seconds
+
+[Timer]
+OnBootSec=1min
+OnUnitActiveSec=1min
+AccuracySec=5s
+
+[Install]
+WantedBy=timers.target

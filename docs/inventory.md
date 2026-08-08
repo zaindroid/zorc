@@ -159,3 +159,64 @@ Three-tier storage:
   installing the NVMe) succeeded on its own, no manual intervention needed.
   The earlier same-day rewrite (handling a missing BootOrder gracefully,
   syncing the fallback file to grubx64.efi) held up correctly.
+
+## Host watchdog + status page + node self-registration (2026-08-08)
+
+- **Watchdog**: `~/zorc/monitoring/watchdog.py`, run every ~60s by
+  `zorc-watchdog.timer` (systemd, host-level, NOT Docker — survives Docker
+  dying). Runs as root (hardened: `NoNewPrivileges`, `ProtectSystem=strict`,
+  `ProtectHome=read-only`, `PrivateTmp`, `ReadWritePaths` scoped to
+  `monitoring/` and `nodes/` only). 20 checks covering CPU/GPU temp, SMART
+  (sda/sdb/nvme0n1), disk usage, RAM/swap, load average, AC/battery power,
+  Docker daemon, all 6 Coolify containers, Postgres readiness, tailscaled,
+  cloudflared tunnel health, failed systemd units, expected mounts, and a
+  live check that the DOCKER-USER port-8000 block is actually in effect (not
+  just that a fix script ran — closes the exact gap from the empty-script
+  bug found earlier the same day).
+- **Alerting**: state-change only (not every cycle), via ntfy.sh. Topic
+  lives in `~/zorc/monitoring/secrets/notify.json` (gitignored, NEVER
+  committed — the topic's only protection is being unguessable). Sustained
+  thresholds (CPU >90C, load avg > cores) require N consecutive cycles
+  before escalating, tracked in `state/state.json`. Daily all-green
+  heartbeat separate from the healthchecks.io ping. healthchecks.io ping URL
+  not yet set — `ping_healthchecks()` is a documented no-op until added to
+  secrets/notify.json.
+- **Status page**: `~/zorc/monitoring/status/{index.html,status.json}`,
+  rewritten every cycle, served by `zorc-status-server.service`
+  (`python -m http.server`, bound to `127.0.0.1:9999` only — confirmed not
+  reachable from LAN). Reached publicly via `status.zaindroid.me` through
+  the existing tunnel, gated by Cloudflare Access (allow-list
+  zainey4@gmail.com — same pattern as Coolify's app). **Note**: Access
+  302-redirects unauthenticated requests to its login page, so this page
+  cannot currently be polled programmatically by scripts — when a future
+  multi-node swarm needs to read status.json automatically, the path is a
+  Cloudflare Access **service token** (header-based credential) on that
+  route, not assuming interactive-session access works for automation.
+- **Node self-registration**: `~/zorc/nodes/servingz.yaml`, rewritten every
+  cycle and periodically committed — a capability-schema contract
+  (node/tailscale_ip/arch/accelerator/cpu/ram_mb/power/capabilities/labels/
+  status/last_seen) designed to be the same join-script shape future
+  Jetson/Pi/5090 boards will self-report against.
+- **Python tooling**: managed via `uv` (`pyproject.toml` + `uv.lock`,
+  committed; `.venv/` gitignored). Only dependency: `pyyaml` (everything
+  else stdlib). systemd units point at the venv's python by absolute path
+  (`/home/zman/zorc/monitoring/.venv/bin/python`), not bare `python3`/`uv
+  run` — deterministic regardless of root's PATH.
+- Alert flow tested end-to-end: manually tripped `cpu_temp` warning,
+  confirmed real ntfy delivery (screenshot confirmed by user), restored
+  threshold, confirmed RECOVERED notice.
+
+## Side-fix found while building the watchdog: containerd data-root gap
+
+The earlier NVMe/Docker migration moved `/var/lib/docker` but missed
+containerd's separate data directory — container image/layer data (2.8G)
+was still on the SATA SSD at `/var/lib/containerd`, not the NVMe, because
+`/etc/docker/daemon.json`'s `data-root` does not control containerd (it has
+its own `root` setting in `/etc/containerd/config.toml`, which defaults to
+`/var/lib/containerd` when commented out). Fixed the same day: stopped
+docker+containerd, rsynced to `/mnt/fast/containerd`, set
+`root = "/mnt/fast/containerd"` in `/etc/containerd/config.toml`, restarted.
+Verified via `mount | grep overlay` that container layer lowerdir/upperdir
+paths now resolve under `/mnt/fast/containerd`. Old data retained at
+`/var/lib/containerd.old` (same retention pattern as `/var/lib/docker.old`)
+— not yet deleted, pending explicit go-ahead.

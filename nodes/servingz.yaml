@@ -1,0 +1,27 @@
+node: servingz
+tailscale_ip: 100.115.156.84
+arch: x86_64
+accelerator:
+  type: cuda
+  name: Quadro K2100M
+  vram_mb: 1996
+  driver: 470.256.02
+cpu:
+  model: Intel(R) Core(TM) i7-4810MQ CPU @ 2.80GHz
+  cores: 4
+  threads: 8
+ram_mb: 32011
+power:
+  source: ac
+  on_battery: false
+capabilities:
+- orchestrator
+- docker
+- coolify
+- cuda-legacy
+- x86
+labels:
+- always-on
+- control-plane
+status: online
+last_seen: '2026-08-08T13:43:45.845064+00:00'

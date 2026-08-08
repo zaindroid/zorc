@@ -7,3 +7,7 @@
 secrets/
 *.bak
 __pycache__/
+monitoring/state/
+monitoring/logs/
+monitoring/status/
+monitoring/.venv/

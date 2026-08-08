@@ -1,0 +1,17 @@
+[Unit]
+Description=servingz host watchdog (hardware/service checks, alerting, status page, node self-registration)
+After=network-online.target docker.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/home/zman/zorc/monitoring/.venv/bin/python /home/zman/zorc/monitoring/watchdog.py
+WorkingDirectory=/home/zman/zorc/monitoring
+User=root
+
+# Hardening — runs as root only for smartctl/iptables access, constrained otherwise.
+NoNewPrivileges=true
+ProtectSystem=strict
+ReadWritePaths=/home/zman/zorc/monitoring /home/zman/zorc/nodes
+ProtectHome=read-only
+PrivateTmp=true

@@ -1,0 +1,20 @@
+[Unit]
+Description=servingz status page server (localhost only, single-purpose — serves ONLY monitoring/status/)
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/home/zman/zorc/monitoring/.venv/bin/python -m http.server 9999 --directory /home/zman/zorc/monitoring/status --bind 127.0.0.1
+WorkingDirectory=/home/zman/zorc/monitoring/status
+User=zman
+Restart=always
+RestartSec=5
+
+# Hardening — read-only static file server, no reason to need anything else.
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=read-only
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target
