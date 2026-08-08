@@ -1,0 +1,11 @@
+[Unit]
+Description=Block Docker-published port 8000 from bypassing UFW (DOCKER-USER chain)
+After=docker.service ufw.service
+Requires=docker.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/fix-docker-ufw-bypass.sh
+
+[Install]
+WantedBy=multi-user.target

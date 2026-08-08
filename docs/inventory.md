@@ -69,3 +69,59 @@
   DNS record yet — only status.apps.zaindroid.me routed as a placeholder,
   service http://localhost:9999, nothing listening there yet). Real app
   hostnames to be added when Coolify + watchdog exist.
+
+## Coolify
+
+- Installed via official installer (v4.1.2). Containers: `coolify` (app),
+  `coolify-db` (postgres:15-alpine), `coolify-redis` (redis:7-alpine),
+  `coolify-realtime` (soketi/websocket). No separate Traefik/proxy container
+  at install time — Coolify only deploys that when a server/app is registered.
+- Dashboard: `https://coolify.zaindroid.me`, gated by Cloudflare Access
+  (allow-list: zainey4@gmail.com, one-time PIN auth, 24h session).
+  Port 8000 is NOT exposed via UFW allow rule — reachable only via localhost
+  (for the tunnel) and blocked from LAN/tailnet by a DOCKER-USER iptables
+  rule (see below).
+- Auto-update: OFF. "This Machine" (localhost) registered as the deployment
+  server, connected successfully.
+- Data root: `/data/coolify/`. Env file: `/data/coolify/source/.env`
+  (back this up externally — installer explicitly warns about this).
+
+## Known Docker + UFW/firewall interactions (found + fixed 2026-08-08)
+
+1. **Docker bypasses UFW for published container ports.** Docker inserts
+   DOCKER-USER/DOCKER-FORWARD rules ahead of UFW's chains in FORWARD, so
+   `ufw status` showing no rule for a port does NOT mean it's actually
+   blocked — Coolify's port 8000 was reachable directly over LAN/tailnet
+   despite no UFW allow rule. Fixed with a DOCKER-USER iptables rule
+   matching the pre-DNAT original dest port via conntrack (Docker's DNAT
+   rewrites the visible dest port before DOCKER-USER sees it — a plain
+   `--dport 8000` match silently does nothing). See bootstrap/09-docker-ufw-fix.sh
+   and bootstrap/09b-fix-docker-ufw-bypass.sh (systemd boot-time reapply,
+   fix-docker-ufw-bypass.service — matches the fix-efi-bootorder.service
+   pattern). NOTE: iptables-persistent was tried first for rule persistence
+   and reverted — it conflicts with the ufw package itself (both want to
+   own iptables persistence at boot; installing it silently removed ufw).
+2. **UFW blocks Docker→host SSH by default.** Coolify's "This Machine"
+   deployment model SSHes from its own container to `host.docker.internal:22`
+   (the real host sshd) even for local-server management. Docker's internal
+   network pool (10.0.0.0/8) wasn't covered by the LAN/tailnet-only SSH
+   rules, causing "Operation timed out" in Coolify's connectivity check.
+   Fixed by allowing SSH from 10.0.0.0/8 (bootstrap/10-ssh-from-docker.sh) —
+   covers all current/future Coolify project networks, not just the one
+   active at install time.
+3. **Coolify needs its own SSH key in root's authorized_keys**, even for
+   managing "This Machine" (itself) — it SSHes in as root to run Docker
+   commands. Key added manually (not scripted — it's generated internally by
+   Coolify and stored in its own data volume, not something to regenerate).
+
+## Cloudflare zone / certificate note
+
+- Free/Universal SSL only covers `zaindroid.me` and `*.zaindroid.me` (one
+  wildcard level). A `*.apps.zaindroid.me` scheme (two levels deep) is NOT
+  covered and fails TLS handshake at the edge — confirmed via openssl
+  s_client showing no certificate offered. Advanced Certificate Manager
+  (paid add-on) would be needed to cover a second-level wildcard.
+- Decision: dropped the `*.apps.zaindroid.me` scheme from the original plan
+  in favor of flat `*.zaindroid.me` hostnames (free, already covered).
+  Current: `coolify.zaindroid.me`, `status.zaindroid.me` (placeholder,
+  service http://localhost:9999, nothing listening — 502 expected).
