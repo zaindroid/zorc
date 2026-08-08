@@ -43,9 +43,16 @@
 - sudo: /etc/sudoers.d/90-zman-bootstrap grants zman passwordless sudo,
   added temporarily to unblock scripted bootstrap phases (no TTY available for
   interactive sudo from automation) — pending a decision on whether to revert.
-- GPU / NVIDIA driver: NOT YET INSTALLED. GPU is a Quadro K2100M (Kepler/GK106),
-  currently on nouveau. Ubuntu 24.04's packaged nvidia-driver-470 no longer
-  installs cleanly (repackaged to depend on nvidia-driver-535, which chains to
-  580 — neither supports Kepler). See bootstrap/04-nvidia.sh for the full
-  investigation. Open decision: pursue NVIDIA's official .run installer, or
-  skip GPU acceleration on this box entirely.
+- GPU / NVIDIA driver: INSTALLED. Quadro K2100M (Kepler/GK106), driver
+  470.256.02 (NVIDIA's official .run installer with --dkms, since Ubuntu
+  24.04's packaged nvidia-driver-470 no longer installs cleanly — see
+  bootstrap/04-nvidia.sh for that investigation). nouveau blacklisted via
+  /etc/modprobe.d/blacklist-nouveau.conf. CUDA 11.4. Verified working live via
+  nvidia-smi; DKMS-registered so it rebuilds automatically on future kernel
+  updates. Not yet reboot-tested (works live, reboot not required — deferred
+  to a time someone is watching, see runbook.md for the EFI boot-order caveat
+  discovered along the way).
+- EFI boot-order quirk (HP ZBook 15 G2 firmware): discovered during this work
+  — see docs/runbook.md "Lost SSH access / server won't boot" section and
+  bootstrap/05-fix-efi-bootorder.sh for the self-healing fix now installed
+  (fix-efi-bootorder.service, runs every boot).

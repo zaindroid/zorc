@@ -26,3 +26,17 @@
 # entirely — needs nouveau blacklisted + reboot into a non-X runlevel.
 # Paused pending a decision on whether this GPU (2GB VRAM, ~10yr old mobile
 # Kepler chip) is worth the effort versus running headless/CPU-only.
+#
+# RESOLUTION (2026-08-08): installed via NVIDIA's official .run installer
+# instead of apt. See:
+#   - bootstrap/blacklist-nouveau.conf equivalent: /etc/modprobe.d/blacklist-nouveau.conf
+#   - installer command: sudo sh NVIDIA-Linux-x86_64-470.256.02.run --dkms --silent --no-x-check
+#     (downloaded from https://download.nvidia.com/XFree86/Linux-x86_64/470.256.02/)
+#   - required `apt install dkms` first (was auto-removed by an earlier autoremove
+#     pass after the failed apt attempt was purged)
+# Verified working live via nvidia-smi (470.256.02, CUDA 11.4, Quadro K2100M).
+# DKMS-registered so it rebuilds automatically on future kernel updates.
+#
+# Also uncovered along the way: an HP ZBook 15 G2 firmware bug where the EFI
+# boot order drops the real Ubuntu entry. Fixed separately — see
+# bootstrap/05-fix-efi-bootorder.sh and docs/runbook.md.
