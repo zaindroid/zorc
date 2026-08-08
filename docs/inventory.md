@@ -37,7 +37,7 @@
   only from 192.168.0.0/24 (LAN) and 100.64.0.0/10 (Tailscale CGNAT, reserved
   for future use — Tailscale itself not installed yet).
 - fail2ban: active, default sshd jail.
-- Unattended security upgrades: enabled (/etc/apt/apt.conf.d/20auto-upgrades).
+- Unattended security upgrades: enabled (/etc/apt/apt.conf.d/20auto-upgrades). Automatic-Reboot explicitly set to false in /etc/apt/apt.conf.d/50unattended-upgrades (was commented/default, made explicit given the EFI boot-order fragility).
 - SSH: password authentication disabled (key-only), see
   /etc/ssh/sshd_config.d/99-hardening.conf. PermitRootLogin prohibit-password.
 - sudo: /etc/sudoers.d/90-zman-bootstrap grants zman passwordless sudo,
