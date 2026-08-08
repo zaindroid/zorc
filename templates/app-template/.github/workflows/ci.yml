@@ -1,0 +1,235 @@
+# .github/workflows/ci.yml
+#
+# Copy this into every app repo UNCHANGED. Agents must not edit this file.
+# If a gate fails, fix the app — never weaken the gate.
+
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE: ghcr.io/${{ github.repository }}
+
+jobs:
+
+  # ---------------------------------------------------------------- gate 1
+  static:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Secret scan
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Validate app.yaml exists and parses
+        run: |
+          test -f app.yaml || { echo "app.yaml missing — see AGENTS.md §3"; exit 1; }
+          python -c "import yaml,sys; d=yaml.safe_load(open('app.yaml')); \
+            [sys.exit(f'app.yaml missing {k}') for k in \
+             ('name','runtime','domains','health') if k not in d]"
+
+      - uses: actions/setup-node@v4
+        with: { node-version: '22', cache: npm }
+      - run: npm ci
+      - run: npm run lint
+      - run: npm run typecheck
+      - run: npm audit --audit-level=critical
+
+  # ---------------------------------------------------------------- gate 2
+  unit:
+    needs: static
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: '22', cache: npm }
+      - run: npm ci
+      - run: npm run test:unit
+
+  # ---------------------------------------------------------------- gate 3
+  integration:
+    needs: unit
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_PASSWORD: test
+          POSTGRES_DB: test
+        options: >-
+          --health-cmd pg_isready --health-interval 5s
+          --health-timeout 5s --health-retries 10
+        ports: ['5432:5432']
+      redis:
+        image: redis:7
+        options: >-
+          --health-cmd "redis-cli ping" --health-interval 5s
+          --health-timeout 5s --health-retries 10
+        ports: ['6379:6379']
+    env:
+      DATABASE_URL: postgres://postgres:test@localhost:5432/test
+      REDIS_URL: redis://localhost:6379/0
+      APP_ENV: test
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: '22', cache: npm }
+      - run: npm ci
+
+      - name: Migrations apply to empty DB
+        run: npm run migrate
+
+      - name: Migrations are idempotent
+        run: npm run migrate    # second run must be a clean no-op
+
+      - run: npm run test:integration
+
+  # ---------------------------------------------------------------- gate 4
+  container:
+    needs: integration
+    runs-on: ubuntu-latest
+    outputs:
+      digest: ${{ steps.build.outputs.digest }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - id: build
+        uses: docker/build-push-action@v6
+        with:
+          push: ${{ github.ref == 'refs/heads/main' }}
+          load:  ${{ github.ref != 'refs/heads/main' }}
+          tags: ${{ env.IMAGE }}:${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          build-args: |
+            GIT_SHA=${{ github.sha }}
+
+      - name: Smoke test the built image
+        run: |
+          docker run -d --name smoke \
+            -e APP_ENV=test -e DATABASE_URL=postgres://x -e REDIS_URL=redis://x \
+            -p 8080:8080 ${{ env.IMAGE }}:${{ github.sha }}
+
+          for i in $(seq 1 30); do
+            if curl -fsS http://localhost:8080/health; then ok=1; break; fi
+            sleep 1
+          done
+          [ "$ok" = 1 ] || { echo "health check never passed"; docker logs smoke; exit 1; }
+
+          echo "--- version endpoint"
+          curl -fsS http://localhost:8080/version | tee /tmp/v.json
+          grep -q "${GITHUB_SHA:0:7}" /tmp/v.json || { echo "SHA mismatch"; exit 1; }
+
+          echo "--- must not run as root"
+          [ "$(docker exec smoke id -u)" != "0" ] || { echo "container runs as root"; exit 1; }
+
+          echo "--- image size"
+          size=$(docker image inspect ${{ env.IMAGE }}:${{ github.sha }} --format '{{.Size}}')
+          [ "$size" -lt 524288000 ] || { echo "image over 500MB: $size"; exit 1; }
+
+          docker rm -f smoke
+
+  # ------------------------------------------------------------- staging
+  deploy-staging:
+    needs: container
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    environment: staging
+    steps:
+      - name: Trigger Coolify deploy
+        run: |
+          curl -fsS -X POST "${{ secrets.COOLIFY_STAGING_WEBHOOK }}" \
+            -H "Authorization: Bearer ${{ secrets.COOLIFY_TOKEN }}" \
+            -d '{"tag":"${{ github.sha }}"}'
+
+      - name: Wait for the new SHA to be live
+        run: |
+          for i in $(seq 1 60); do
+            live=$(curl -fsS "${{ vars.STAGING_URL }}/version" | grep -o '"sha":"[^"]*"' || true)
+            case "$live" in *"${GITHUB_SHA:0:7}"*) echo "deployed"; exit 0;; esac
+            sleep 5
+          done
+          echo "staging never reported the new SHA"; exit 1
+
+  # ------------------------------------------------------------------ e2e
+  e2e:
+    needs: deploy-staging
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: '22', cache: npm }
+      - run: npm ci
+      - run: npx playwright install --with-deps chromium
+      - run: npm run test:e2e
+        env:
+          BASE_URL: ${{ vars.STAGING_URL }}
+
+  # --------------------------------------------------- cross-app regression
+  regression:
+    needs: e2e
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check in on every other registered app
+        run: |
+          curl -fsS -o registry.yaml "${{ vars.REGISTRY_URL }}"
+          python - <<'EOF'
+          import os, sys, yaml, urllib.request
+          reg = yaml.safe_load(open('registry.yaml'))
+          root = reg['domains']['root']
+          bad = []
+          for a in reg['apps']:
+              if not a.get('critical') or not a.get('subdomain'):
+                  continue
+              url = f"https://{a['subdomain']}.{root}/health"
+              try:
+                  with urllib.request.urlopen(url, timeout=10) as r:
+                      if r.status != 200:
+                          bad.append((a['name'], r.status))
+              except Exception as e:
+                  bad.append((a['name'], str(e)))
+          if bad:
+              for n, why in bad:
+                  print(f"UNHEALTHY  {n}: {why}")
+              sys.exit("other apps broke — this deploy must not be promoted")
+          print("all critical apps healthy")
+          EOF
+
+  # ----------------------------------------------------------- production
+  deploy-production:
+    needs: regression
+    runs-on: ubuntu-latest
+    environment: production        # configure a required reviewer in GitHub
+    steps:
+      - name: Promote the exact image tested in staging
+        run: |
+          curl -fsS -X POST "${{ secrets.COOLIFY_PRODUCTION_WEBHOOK }}" \
+            -H "Authorization: Bearer ${{ secrets.COOLIFY_TOKEN }}" \
+            -d '{"tag":"${{ github.sha }}"}'
+
+      - name: Post-deploy smoke, rollback on failure
+        run: |
+          for i in $(seq 1 60); do
+            live=$(curl -fsS "${{ vars.PRODUCTION_URL }}/version" | grep -o '"sha":"[^"]*"' || true)
+            case "$live" in *"${GITHUB_SHA:0:7}"*) echo "live"; exit 0;; esac
+            sleep 5
+          done
+          echo "production unhealthy — rolling back"
+          curl -fsS -X POST "${{ secrets.COOLIFY_PRODUCTION_WEBHOOK }}" \
+            -H "Authorization: Bearer ${{ secrets.COOLIFY_TOKEN }}" \
+            -d '{"tag":"${{ vars.PREVIOUS_SHA }}"}'
+          exit 1
