@@ -1,4 +1,4 @@
-# infra
+# zorc
 
 This repo is the control plane for servingz. It contains no application code —
 app repos live under `~/projects`. This repo holds the orchestration scaffolding:
