@@ -56,3 +56,22 @@ If it happens again: same recovery as before (F9 boot menu → EFI file →
 ubuntu/shimx64.efi), then verify `sudo efibootmgr | grep BootOrder` shows 0004
 (or whatever the Ubuntu entry's current number is) first, and
 `systemctl status fix-efi-bootorder.service` shows a recent successful run.
+
+## EFI boot-order fix — resolution (2026-08-08, later same day)
+
+The original `fix-efi-bootorder.service` crashed the first time it hit a more
+severe variant of the firmware bug: `BootOrder` wiped entirely (not just
+misordered), which the script hadn't accounted for (`set -e` + no match on
+`grep 'BootOrder:'` = hard crash). Root boot config was manually repaired at
+the console: removed the old shim-based `Boot0004 "Ubuntu"` entry, created
+`Boot0005 "Ubuntu GRUB"` pointing directly at `grubx64.efi` (no shim — fine,
+Secure Boot is disabled on this system), and pointed the UEFI-spec fallback
+path (`/boot/efi/EFI/BOOT/BOOTX64.EFI`) at that same `grubx64.efi`.
+
+That fallback path turned out to be the more reliable recovery mechanism —
+it's what actually got the system booting when `BootOrder` was wiped and the
+firmware fell back to its own recovery scan. `05-fix-efi-bootorder.sh` was
+rewritten accordingly: best-effort fixes the NVRAM entry/order when possible
+(now tolerates a missing `BootOrder` instead of crashing), but *always*
+re-syncs the fallback file to `grubx64.efi` regardless — that unconditional
+step is the real safety net now, not the NVRAM order.
