@@ -125,3 +125,37 @@
   in favor of flat `*.zaindroid.me` hostnames (free, already covered).
   Current: `coolify.zaindroid.me`, `status.zaindroid.me` (placeholder,
   service http://localhost:9999, nothing listening — 502 expected).
+
+## Storage (updated 2026-08-08 — NVMe added)
+
+Three-tier storage:
+- **NVMe hot path**: `/dev/nvme0n1` (Samsung MZVLQ512HBLU-00BH1, 476.9G),
+  single ext4 partition labeled `nvmefast`, UUID
+  `1e3adfbf-3d2f-413a-9c9d-78e648790492`, mounted at `/mnt/fast`
+  (`defaults,noatime,nofail` in fstab). Docker's data-root now lives here
+  (`/etc/docker/daemon.json` → `"data-root": "/mnt/fast/docker"`, merged
+  into the existing log-driver/log-opts/default-address-pools config, not
+  replaced).
+- **SATA SSD**: `/dev/sda` (MTFDDAK512MBF), OS root (`/`).
+- **SATA HDD**: `/dev/sdb1` (`serverdata`), bulk storage at `/mnt/data`.
+  Also now holds `/mnt/data/nvme-rescue/` — a full rsync copy (28G, 195,675
+  files, verified matching) of what was on the NVMe before it was wiped
+  (reused drive, had unrelated robotics/AI project data — confirmed not
+  needed, kept as a safety-net copy anyway).
+- **Old Docker data** retained at `/var/lib/docker.old` on the SSD, NOT yet
+  deleted — pending explicit go-ahead once the new data-root is confirmed
+  stable over time.
+- All 6 Coolify containers (`coolify`, `coolify-db`, `coolify-redis`,
+  `coolify-realtime`, `coolify-proxy`, `coolify-sentinel`) verified healthy
+  on the new data-root; dashboard reachable through Access as before.
+
+## Notes on today's boot-fix bugs (both found and fixed same session)
+
+- `fix-docker-ufw-bypass.sh` was found completely empty (0 bytes) on this
+  boot, cause unknown — its systemd service failed with "Exec format error,"
+  meaning the port-8000 DOCKER-USER block did NOT reapply automatically.
+  Rewritten with known-good content, verified working again.
+- `fix-efi-bootorder.service` — first real-world reboot test (triggered by
+  installing the NVMe) succeeded on its own, no manual intervention needed.
+  The earlier same-day rewrite (handling a missing BootOrder gracefully,
+  syncing the fallback file to grubx64.efi) held up correctly.
