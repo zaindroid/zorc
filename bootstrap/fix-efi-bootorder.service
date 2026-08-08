@@ -1,0 +1,10 @@
+[Unit]
+Description=Ensure Ubuntu EFI boot entry is first in boot order (HP firmware NVRAM quirk workaround)
+After=local-fs.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/fix-efi-bootorder.sh
+
+[Install]
+WantedBy=multi-user.target
