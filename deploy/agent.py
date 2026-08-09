@@ -559,6 +559,15 @@ def delete_app(name: str) -> dict:
 
     if kind == "pages":
         with httpx.Client(timeout=20) as client:
+            # Cloudflare refuses to delete a Pages project while it still
+            # has a custom domain attached (confirmed live: 400, code
+            # 8000028) -- detach first.
+            dr = client.delete(
+                f"{CLOUDFLARE_API}/accounts/{CLOUDFLARE_ACCOUNT_ID}/pages/projects/{name}/domains/{hostname}",
+                headers=_cloudflare_headers(),
+            )
+            if dr.status_code not in (200, 404):
+                dr.raise_for_status()
             r = client.delete(
                 f"{CLOUDFLARE_API}/accounts/{CLOUDFLARE_ACCOUNT_ID}/pages/projects/{name}",
                 headers=_cloudflare_headers(),
