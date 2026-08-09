@@ -61,7 +61,10 @@ body {
 }
 
 /* ---- text effects (scramble / decode / shimmer) ---- */
-.dchar { display: inline-block; }
+/* inline (not inline-block): these spans carry no per-letter transform, and
+   adjacent inline-blocks with no whitespace between the DOM nodes don't
+   reliably wrap on mobile — plain inline flows and wraps like real text. */
+.dchar { display: inline; }
 .dchar.pulse {
   text-shadow: 0 0 10px currentColor, 0 0 24px currentColor;
   color: var(--accent);
