@@ -278,15 +278,15 @@ def mounts(cfg: dict) -> dict:
 
 
 def docker_user_port_block(cfg: dict) -> dict:
-    port = cfg["docker_user_block_port"]
+    ports = cfg["docker_user_block_ports"]
     rc, out, err = _run(["sudo", "iptables", "-L", "DOCKER-USER", "-n"])
     if rc != 0:
         return {"status": CRIT, "value": None, "message": f"couldn't read DOCKER-USER chain: {err.strip()}"}
-    has_rule = f"ctorigdstport {port}" in out and "DROP" in out
-    if has_rule:
-        return {"status": OK, "value": True, "message": f"DOCKER-USER DROP rule for port {port} is live"}
-    return {"status": CRIT, "value": False,
-             "message": f"DOCKER-USER DROP rule for port {port} is MISSING — port may be exposed to LAN/tailnet"}
+    missing = [p for p in ports if f"ctorigdstport {p}" not in out]
+    if missing:
+        return {"status": CRIT, "value": {"missing": missing},
+                 "message": f"DOCKER-USER DROP rule MISSING for port(s) {missing} — may be exposed to LAN/tailnet"}
+    return {"status": OK, "value": True, "message": f"DOCKER-USER DROP rules live for ports {ports}"}
 
 
 # ---------------------------------------------------------------------------

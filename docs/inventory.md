@@ -220,3 +220,77 @@ Verified via `mount | grep overlay` that container layer lowerdir/upperdir
 paths now resolve under `/mnt/fast/containerd`. Old data retained at
 `/var/lib/containerd.old` (same retention pattern as `/var/lib/docker.old`)
 — not yet deleted, pending explicit go-ahead.
+
+## First app deployed through the platform contract: hello-app (2026-08-09)
+
+- **Repo**: `github.com/zaindroid/hello-app` (private), FastAPI, deployed via
+  Coolify's "Private Repository (GitHub App)" resource, Dockerfile build pack.
+- **Domain**: `https://hello.zaindroid.me`, public (no Cloudflare Access —
+  intentional, unlike Coolify/status which are platform-internal admin tools).
+- **Registered**: `zorc/registry.yaml` apps, 256 MB, budget check passing.
+- **This bypassed the intended CI→GHCR→Coolify pipeline** (not wired up
+  yet — `ci.yml` template exists but no GitHub Actions run for this app).
+  Coolify built directly from the git repo on deploy instead. Wiring up
+  proper CI is the next step before a second app.
+
+### Real problems hit and fixed getting this working (all now fixed/documented)
+
+1. **Coolify's "Docker Image" resource always attempts a registry pull**,
+   even for a locally-built image with a matching tag — no local-image
+   fallback. Building on the host and deploying by image tag alone does not
+   work; the image must be pullable from somewhere.
+2. **Coolify has a known, unresolved bug pulling from GHCR specifically**
+   (upstream issue [coollabsio/coolify#4604](https://github.com/coollabsio/coolify/issues/4604))
+   — `docker login ghcr.io` succeeds and credentials are correctly stored,
+   but Coolify's pull still fails. Docker Hub works fine with the identical
+   process. Root cause undetermined upstream; we worked around it entirely
+   by switching to a git-based (Dockerfile) deploy instead of a registry pull.
+3. **Coolify's own Instance Domain was never configured** (`Settings →
+   General → URL`), defaulting to the raw public IP
+   (`http://212.201.69.230:8000`) for all OAuth callbacks/redirects — broke
+   the GitHub App creation flow (browser couldn't reach that address; it's
+   not port-forwarded and we explicitly firewall it). Fixed by setting it to
+   `https://coolify.zaindroid.me`.
+4. **Major bug in our own earlier port-80/443/8000 DOCKER-USER fix**: the
+   original rule matched on `--ctorigdstport` alone with no direction
+   check, which blocked not just inbound LAN/tailnet traffic to those ports
+   but **all outbound HTTPS from every container on the host** (a
+   connection's "original destination port" is the same 443 whether it's
+   inbound-to-us or outbound-from-us). This silently broke Coolify's own
+   GitHub API calls. Fixed properly with two refinements: (a) `-i enp0s25`
+   / `-i tailscale0` to only match traffic arriving via the actual external
+   interfaces, not the docker bridge interface outbound traffic uses; (b)
+   `--ctdir ORIGINAL` — interface restriction alone still wasn't enough,
+   since a container-initiated outbound connection's *reply* traffic also
+   legitimately arrives via those same external interfaces; `ctdir ORIGINAL`
+   ensures only the connection-initiating direction (a real inbound attempt)
+   is matched, never the reply leg of our own outbound connections.
+   `bootstrap/09b-fix-docker-ufw-bypass.sh` updated with both fixes and the
+   full explanation.
+5. **Coolify's Domains field needs a full `https://` URL**, not a bare
+   hostname — entering just `hello.zaindroid.me` produced a broken Traefik
+   rule (`Host('') && PathPrefix('hello.zaindroid.me')` — the hostname got
+   parsed as a path). Entering `https://hello.zaindroid.me` produced the
+   correct `Host('hello.zaindroid.me')` rule.
+6. **Traefik's `redirect-to-https` middleware causes an infinite redirect
+   loop** when the Cloudflare Tunnel connects to it over plain HTTP
+   (`http://localhost:80`) — Cloudflare's edge already terminated TLS, so
+   Traefik seeing a "plain HTTP" request keeps redirecting to the same
+   HTTPS URL forever. Fixed by pointing the tunnel ingress at Traefik's
+   HTTPS entrypoint instead: `service: https://localhost:443` with
+   `originRequest.noTLSVerify: true` (safe — this is a localhost-only hop,
+   real TLS is already terminated at Cloudflare's edge for the actual
+   public connection).
+7. **Coolify doesn't pass custom Dockerfile build ARGs** (our `GIT_SHA`/
+   `BUILD_TIME`) when building from a git source — those stayed `unknown`.
+   Coolify does inject its own `SOURCE_COMMIT` env var at container runtime
+   though; `main.py`'s `/version` endpoint now falls back to that when
+   `GIT_SHA` isn't set. `BUILD_TIME` has no Coolify equivalent and stays
+   `unknown` for git-based deploys — acceptable known gap until proper CI
+   passes real build args.
+
+### Verified working end-to-end
+- `/health`, `/version` (shows real short SHA), `/` all return correctly
+  from outside via `https://hello.zaindroid.me`.
+- Watchdog status page confirms `overall: ok`, all 6 original Coolify
+  containers still healthy — hello-app's deployment didn't degrade anything.

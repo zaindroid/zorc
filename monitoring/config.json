@@ -28,7 +28,7 @@
     "coolify-sentinel"
   ],
   "mounts": ["/mnt/fast", "/mnt/data"],
-  "docker_user_block_port": 8000,
+  "docker_user_block_ports": [8000, 80, 443],
   "cloudflare_tunnel_name": "servingz",
   "node": {
     "name": "servingz",
