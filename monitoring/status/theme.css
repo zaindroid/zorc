@@ -122,9 +122,19 @@ body {
   70% { box-shadow: 0 0 0 14px rgba(255,255,255,0); }
   100% { box-shadow: 0 0 0 0 rgba(255,255,255,0); }
 }
-.hero-text h1 { margin: 0; font-size: 1.3rem; font-weight: 600; letter-spacing: 0.02em; }
-.hero-text .sub { color: var(--text-dim); font-size: 0.82rem; margin-top: 0.3rem; }
+.hero-text { min-width: 0; flex: 1 1 auto; }
+.hero-text h1 {
+  margin: 0; font-size: 1.3rem; font-weight: 600; letter-spacing: 0.02em;
+  overflow-wrap: break-word; word-break: break-word;
+}
+.hero-text .sub { color: var(--text-dim); font-size: 0.82rem; margin-top: 0.3rem; overflow-wrap: break-word; }
 .hero-text .sub b { color: var(--text); font-weight: 600; }
+
+@media (max-width: 520px) {
+  .hero { padding: 1.25rem 1.25rem; gap: 1rem; }
+  .hero-text h1 { font-size: 1.05rem; }
+  .orb { width: 36px; height: 36px; }
+}
 
 /* ---- section groups ---- */
 .group-title {
@@ -147,7 +157,7 @@ body {
 }
 .check:hover { border-color: var(--border-hi); }
 .check-top { display: flex; align-items: center; justify-content: space-between; gap: 0.5rem; }
-.check-label { font-size: 0.85rem; color: var(--text); }
+.check-label { font-size: 0.85rem; color: var(--text); min-width: 0; overflow-wrap: break-word; }
 .badge {
   font-size: 0.65rem;
   letter-spacing: 0.08em;
