@@ -316,3 +316,118 @@ paths now resolve under `/mnt/fast/containerd`. Old data retained at
 - Per-app database/role (Postgres) and DB-index (Redis) assignment happens
   on request when an app actually needs one — not self-service, matches
   AGENTS.md's "ask before assuming" philosophy.
+
+## CI/CD pipeline + human approval gate for hello-app (2026-08-09)
+
+Rewrote hello-app's `ci.yml` from the Node/npm-shaped template to Python/uv
+tooling, keeping the exact same gate structure: `static -> unit ->
+integration -> container -> deploy-staging -> e2e -> regression ->
+approve-production -> deploy-production`. Registry target switched from
+`ghcr.io` to Docker Hub (`docker.io/zainey4/hello-app`) — GHCR already known
+broken with Coolify (see hello-app section above).
+
+GitHub's native "Required reviewers" Environment protection rule needs
+GitHub Pro/Team for a **private** repo — not available on the free plan
+this account is on. Standard free-plan workaround adopted:
+[`trstringer/manual-approval@v1`](https://github.com/trstringer/manual-approval)
+— opens a GitHub Issue on push-to-main after `regression` passes, blocks the
+workflow until someone comments `approved` or `denied` on it.
+
+### Bugs hit and fixed
+1. **`gitleaks-action@v2` failed with `fatal: ambiguous argument ...
+   unknown revision`** on the very first real CI run — not an actual
+   detected secret. `actions/checkout@v4` defaults to a shallow clone
+   (`fetch-depth: 1`), so gitleaks couldn't resolve the git history needed
+   to diff the push's before/after commit range. Fixed by adding
+   `fetch-depth: 0` to the checkout step in the `static` job specifically.
+2. **`approve-production` job failed to create its issue**:
+   `403 Resource not accessible by integration`. The default `GITHUB_TOKEN`
+   is read-only repo-wide unless a job explicitly requests more — no
+   `permissions:` block existed anywhere in the workflow. Fixed by adding
+   `permissions: issues: write` scoped to just that one job.
+3. **`manual-approval@v1` posts its custom `issue-body` input as the
+   *first comment* on the issue, not as the issue body itself** — the issue
+   body is always the action's own fixed "pending manual review" template
+   (`>[!NOTE] Workflow is pending manual review...`). Discovered while
+   building the approvals dashboard below: its parser was reading
+   `issue.body` and getting nothing back. Fixed by having the dashboard
+   fetch `issue.comments[0]` instead.
+
+### Approvals dashboard (same day — see feedback below)
+User feedback, twice, in order:
+- *"this is not efficient... i would want this review and approval on some
+  of our own app dashboard or something not on github commenting"* — led to
+  building a real UI instead of relying on GitHub Issue comments.
+- *"it would be better if i see the app... how the app works on user end...
+  it should have been intuitive review"* — the first version linked out to
+  a GitHub compare diff as the primary review artifact; this was correctly
+  called out as developer-centric, not an intuitive review for how the app
+  actually behaves.
+
+What got built, in `monitoring/server.py`:
+- The previously static `python -m http.server` status-page service was
+  replaced with a small FastAPI/uvicorn app — same port (9999, localhost
+  only), same Cloudflare Access policy already covering the whole
+  `status.zaindroid.me` hostname (no new Access app needed). `watchdog.py`'s
+  existing static-file generation (`status/index.html`, `status/status.json`)
+  is untouched; the new app just serves those files at `/` alongside new
+  dynamic routes.
+- `GET /approvals` — dashboard page. Polls `GET /api/approvals` every 10s.
+  Each pending approval renders as a card with a **live iframe embed of the
+  actual staging URL** as the primary review surface (labelled "this is the
+  exact build you're approving"), with the code diff, CI run, and raw
+  GitHub issue demoted to small secondary links underneath. Approve/Deny
+  buttons POST to `/api/approvals/decide`, which posts the literal
+  `approved`/`denied` comment to the GitHub issue server-side — the
+  browser never touches a GitHub token.
+- `apps_with_repos()` reads `registry.yaml`'s `apps[].repo` field directly,
+  so any future app that follows the same `ci.yml` pattern shows up on this
+  dashboard automatically — no per-app dashboard changes needed.
+- Decision endpoint validates the target repo against the known app list
+  before posting anything — the dashboard can't be used to comment on an
+  arbitrary GitHub issue outside the platform's own apps.
+- Auth token: a fine-grained GitHub PAT, resource owner `zaindroid`,
+  **All repositories**, **Issues: Read and write** only — nothing else.
+  Stored at `monitoring/secrets/github_approvals.json`, `chmod 600`, read
+  lazily per-request (never held in memory beyond that). First two tokens
+  the user generated had the wrong permission set (Contents instead of
+  Issues) — same class of mistake as the earlier `ZORC_REPO_TOKEN` gotcha;
+  fine-grained PAT permission pickers are easy to get wrong.
+- `ci.yml`'s `issue-body` is now a structured `Field: value` block (`App:`,
+  `Commit:`, `Staging:`, `Compare:`, `Run:`) specifically so the dashboard
+  can parse it reliably — documented inline in `ci.yml` not to reformat
+  without updating `server.py`'s `FIELD_RE` too.
+- `deploy-production` now force-moves a `production` git tag to the
+  deployed SHA on every successful deploy (needs `permissions: contents:
+  write` on that job, plus an `actions/checkout@v4` step it didn't
+  previously have). This makes each approval card's `Compare` link a real
+  diff against what's actually live, not a diff against the whole repo
+  history. Retroactively tagged the already-live commit (`e6bd077`) once by
+  hand so the very first dashboard-generated compare link would be
+  meaningful.
+
+### Known gaps, not addressed
+- Assumes at most one open approval issue per app repo at a time — true for
+  this single-developer, single-branch workflow today; would need
+  reconsidering if concurrent PRs/approvals per app become a thing.
+- The Coolify API token used by `ci.yml`'s webhooks is still `root`-scoped,
+  not the properly-scoped `deploy`-only token — swap deferred, not
+  forgotten (see hello-app section above).
+
+### Verified working end-to-end
+Full pipeline run on commit `e4fb1d0` went through all 9 jobs. The
+approval card on `status.zaindroid.me/approvals` correctly showed the live
+staging preview, compare, and CI run links; clicking Approve posted the
+comment via the API; `deploy-production` picked it up within ~10s,
+force-moved the `production` tag, and production served the new SHA
+(`https://hello.zaindroid.me/version` -> `e4fb1d0`) within the smoke-test
+window.
+
+### Approval notifications (same day, follow-up)
+Pending approvals were initially only visible by opening the dashboard.
+Added a step to `approve-production` (before the blocking manual-approval
+step) that posts to the same ntfy.sh topic already used for host health
+alerts (`NTFY_TOPIC` secret, reused from `monitoring/secrets/notify.json`)
+— pending approvals now show up in the same phone notification stream as
+disk/RAM/temperature alerts, rather than relying on GitHub's separate
+issue-assignment notifications.

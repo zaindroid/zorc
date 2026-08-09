@@ -210,7 +210,7 @@ td {{ padding:0.4rem 0.8rem; border-bottom:1px solid #333; font-size:0.9rem; }}
 </style></head>
 <body>
 <h1><span class="dot" style="background:{STATUS_COLORS[overall]}"></span> {hostname} — {overall.upper()}</h1>
-<div class="meta">uptime: {uptime_str} · last updated: {now.isoformat()}</div>
+<div class="meta">uptime: {uptime_str} · last updated: {now.isoformat()} · <a href="/approvals" style="color:#6fb3ff">pending approvals &rarr;</a></div>
 <table>{''.join(rows)}</table>
 </body></html>"""
 
