@@ -102,6 +102,44 @@ def get_deploy_status(job_id: str):
     return job
 
 
+@app.get("/api/apps")
+def api_list_apps():
+    return deploy_agent.list_apps()
+
+
+@app.get("/api/apps/{name}/status")
+def api_app_status(name: str):
+    try:
+        return deploy_agent.app_status(name)
+    except ValueError as e:
+        raise HTTPException(404, str(e))
+
+
+@app.get("/api/apps/{name}/logs")
+def api_app_logs(name: str):
+    return {"logs": deploy_agent.app_logs(name)}
+
+
+class AppActionRequest(BaseModel):
+    action: str  # start | stop | restart
+
+
+@app.post("/api/apps/{name}/action")
+def api_app_action(name: str, req: AppActionRequest):
+    try:
+        return deploy_agent.app_action(name, req.action)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+
+
+@app.delete("/api/apps/{name}")
+def api_delete_app(name: str):
+    try:
+        return deploy_agent.delete_app(name)
+    except ValueError as e:
+        raise HTTPException(404, str(e))
+
+
 @app.get("/api/approvals")
 def list_approvals():
     headers = {
@@ -193,6 +231,7 @@ APPROVALS_HTML = """<!doctype html>
       <a href="/" data-scramble>Status</a>
       <a href="/approvals" class="active" data-scramble>Approvals</a>
       <a href="/deploy" data-scramble>Deploy</a>
+      <a href="/apps" data-scramble>Apps</a>
     </div>
   </div>
 
@@ -355,6 +394,7 @@ DEPLOY_HTML = """<!doctype html>
       <a href="/" data-scramble>Status</a>
       <a href="/approvals" data-scramble>Approvals</a>
       <a href="/deploy" class="active" data-scramble>Deploy</a>
+      <a href="/apps" data-scramble>Apps</a>
     </div>
   </div>
 
@@ -481,3 +521,217 @@ zorcEffects.wireScrambleHovers(document.querySelector('.tabs'));
 @app.get("/deploy", response_class=HTMLResponse)
 def deploy_page():
     return DEPLOY_HTML
+
+
+APPS_HTML = """<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>servingz — apps</title>
+<link rel="stylesheet" href="/theme.css">
+<script src="/effects.js"></script>
+<style>
+.app-card { padding: 1rem 1.2rem; margin-top: 0.85rem; cursor: pointer; max-width: 700px; }
+.app-card-top { display: flex; align-items: center; justify-content: space-between; }
+.app-name { font-size: 0.95rem; font-weight: 600; }
+.app-meta { color: var(--text-dim); font-size: 0.76rem; margin-top: 0.3rem; }
+.kind-pill {
+  font-size: 0.62rem; letter-spacing: 0.08em; padding: 0.15rem 0.5rem; border-radius: 999px;
+  color: var(--text-dim); box-shadow: inset 0 0 0 1px var(--border); text-transform: uppercase;
+}
+.detail { display: none; margin-top: 1rem; padding-top: 1rem; border-top: 1px solid var(--border); }
+.detail.open { display: block; }
+.detail-row { display: flex; gap: 0.6rem; align-items: center; margin-bottom: 0.6rem; flex-wrap: wrap; }
+.actions-row { display: flex; gap: 0.6rem; margin-top: 0.8rem; flex-wrap: wrap; }
+.actions-row button {
+  border: none; border-radius: 7px; padding: 0.45rem 0.9rem; font-family: var(--font);
+  font-size: 0.78rem; font-weight: 600; cursor: pointer; color: var(--text-dim);
+  background: rgba(255,255,255,0.04); box-shadow: inset 0 0 0 1px var(--border);
+}
+.actions-row button:hover { color: var(--text); box-shadow: inset 0 0 0 1px var(--border-hi); }
+.actions-row button.danger { color: var(--crit); }
+.actions-row button.danger:hover { background: rgba(255,92,114,0.1); box-shadow: inset 0 0 0 1px rgba(255,92,114,0.4); }
+.actions-row button:disabled { opacity: 0.4; cursor: default; }
+.logs-box {
+  background: #000; border-radius: 8px; padding: 0.8rem; margin-top: 0.7rem;
+  font-size: 0.72rem; line-height: 1.5; max-height: 280px; overflow-y: auto;
+  white-space: pre-wrap; word-break: break-all; color: #9fd8b8; display: none;
+}
+.logs-box.open { display: block; }
+.confirm-box {
+  margin-top: 0.7rem; padding: 0.7rem 0.9rem; border-radius: 8px; display: none;
+  background: rgba(255,92,114,0.06); box-shadow: inset 0 0 0 1px rgba(255,92,114,0.3);
+}
+.confirm-box.open { display: block; }
+.confirm-box input {
+  width: 100%; margin-top: 0.5rem; background: rgba(255,255,255,0.04); border: 1px solid var(--border);
+  border-radius: 6px; padding: 0.45rem 0.6rem; color: var(--text); font-family: var(--font); font-size: 0.82rem;
+}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <div class="topbar">
+    <a class="brand" href="/"><span class="pip" id="brand-pip"></span> <span id="brand-text">SERVINGZ</span></a>
+    <div class="tabs">
+      <a href="/" data-scramble>Status</a>
+      <a href="/approvals" data-scramble>Approvals</a>
+      <a href="/deploy" data-scramble>Deploy</a>
+      <a href="/apps" class="active" data-scramble>Apps</a>
+    </div>
+  </div>
+
+  <div class="glass hero" id="hero">
+    <div class="orb ok" id="hero-orb"></div>
+    <div class="hero-text">
+      <h1 id="hero-title">Everything deployed</h1>
+      <div class="sub">Click a card for live status, logs, and controls.</div>
+    </div>
+  </div>
+
+  <div id="list"></div>
+</div>
+
+<script>
+async function load() {
+  const list = document.getElementById('list');
+  let apps;
+  try {
+    apps = await (await fetch('/api/apps', { cache: 'no-store' })).json();
+  } catch (e) {
+    list.innerHTML = '<div class="empty">Failed to load.</div>';
+    return;
+  }
+  if (!apps.length) {
+    list.innerHTML = '<div class="empty">Nothing deployed yet -- head to /deploy.</div>';
+    return;
+  }
+  list.innerHTML = apps.map(renderCard).join('');
+  zorcEffects.wireScrambleHovers(list);
+}
+
+function renderCard(a) {
+  return `
+    <div class="glass app-card" id="card-${a.name}">
+      <div class="app-card-top" onclick="toggle('${a.name}')">
+        <div>
+          <span class="app-name" data-scramble>${a.name}</span>
+          <div class="app-meta">${a.subdomain}.zaindroid.me &middot; ${a.memory_mb} MB &middot; ${a.repo || ''}</div>
+        </div>
+        <span class="kind-pill">${a.kind}</span>
+      </div>
+      <div class="detail" id="detail-${a.name}">
+        <div class="detail-row" id="status-${a.name}">Loading status&hellip;</div>
+        <div class="actions-row" id="actions-${a.name}"></div>
+        <div class="logs-box" id="logs-${a.name}"></div>
+        <div class="confirm-box" id="confirm-${a.name}">
+          <div>Type <b>${a.name}</b> to confirm deletion. This removes the ${a.kind === 'pages' ? 'Cloudflare Pages project' : 'Coolify app'}, DNS record${a.kind==='pages'?'':' , tunnel route'}, and registry.yaml entry.</div>
+          <input id="confirm-input-${a.name}" placeholder="${a.name}">
+          <div class="actions-row">
+            <button class="danger" onclick="doDelete('${a.name}')">Confirm delete</button>
+            <button onclick="closeConfirm('${a.name}')">Cancel</button>
+          </div>
+        </div>
+      </div>
+    </div>`;
+}
+
+const openCards = new Set();
+
+function toggle(name) {
+  const detail = document.getElementById(`detail-${name}`);
+  const isOpen = detail.classList.toggle('open');
+  if (isOpen) { openCards.add(name); loadStatus(name); } else { openCards.delete(name); }
+}
+
+async function loadStatus(name) {
+  const statusEl = document.getElementById(`status-${name}`);
+  const actionsEl = document.getElementById(`actions-${name}`);
+  let s;
+  try {
+    s = await (await fetch(`/api/apps/${name}/status`, { cache: 'no-store' })).json();
+  } catch (e) {
+    statusEl.textContent = 'Failed to load status.';
+    return;
+  }
+  const badgeClass = (s.status || '').startsWith('running') || s.status === 'success' ? 'ok'
+    : (s.status || '').startsWith('exited') || s.status === 'failure' ? 'crit' : 'warn';
+  statusEl.innerHTML = `<span class="badge ${badgeClass}">${(s.status || 'unknown').toUpperCase()}</span>` +
+    (s.fqdn ? ` <a href="${s.fqdn}" target="_blank">${s.fqdn}</a>` : '') +
+    (s.url ? ` <a href="${s.url}" target="_blank">${s.url}</a>` : '');
+
+  const buttons = [];
+  if (s.kind === 'coolify') {
+    buttons.push(`<button onclick="doAction('${name}','start')">Start</button>`);
+    buttons.push(`<button onclick="doAction('${name}','stop')">Stop</button>`);
+    buttons.push(`<button onclick="doAction('${name}','restart')">Restart</button>`);
+    buttons.push(`<button onclick="toggleLogs('${name}')">Logs</button>`);
+  }
+  buttons.push(`<button class="danger" onclick="openConfirm('${name}')">Delete</button>`);
+  actionsEl.innerHTML = buttons.join('');
+}
+
+async function doAction(name, action) {
+  const actionsEl = document.getElementById(`actions-${name}`);
+  actionsEl.querySelectorAll('button').forEach(b => b.disabled = true);
+  try {
+    const res = await fetch(`/api/apps/${name}/action`, {
+      method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({action}),
+    });
+    if (!res.ok) throw new Error(await res.text());
+  } catch (e) {
+    alert(`${action} failed: ${e.message}`);
+  }
+  setTimeout(() => loadStatus(name), 1200);
+}
+
+async function toggleLogs(name) {
+  const box = document.getElementById(`logs-${name}`);
+  const isOpen = box.classList.toggle('open');
+  if (!isOpen) return;
+  box.textContent = 'Loading logs\\u2026';
+  try {
+    const r = await (await fetch(`/api/apps/${name}/logs`, { cache: 'no-store' })).json();
+    box.textContent = r.logs || '(empty)';
+    box.scrollTop = box.scrollHeight;
+  } catch (e) {
+    box.textContent = 'Failed to load logs.';
+  }
+}
+
+function openConfirm(name) {
+  document.getElementById(`confirm-${name}`).classList.add('open');
+}
+function closeConfirm(name) {
+  document.getElementById(`confirm-${name}`).classList.remove('open');
+  document.getElementById(`confirm-input-${name}`).value = '';
+}
+
+async function doDelete(name) {
+  const input = document.getElementById(`confirm-input-${name}`);
+  if (input.value.trim() !== name) { alert('Name does not match.'); return; }
+  try {
+    const res = await fetch(`/api/apps/${name}`, { method: 'DELETE' });
+    if (!res.ok) throw new Error(await res.text());
+    document.getElementById(`card-${name}`).remove();
+  } catch (e) {
+    alert(`Delete failed: ${e.message}`);
+  }
+}
+
+const brandEl = document.getElementById('brand-text');
+zorcEffects.decodeIn(brandEl, 'SERVINGZ', { stagger: 55, dur: 300 });
+zorcEffects.shimmer(brandEl);
+zorcEffects.wireScrambleHovers(document.querySelector('.tabs'));
+
+load();
+setInterval(() => { load(); openCards.forEach(loadStatus); }, 15000);
+</script>
+</body>
+</html>"""
+
+
+@app.get("/apps", response_class=HTMLResponse)
+def apps_page():
+    return APPS_HTML

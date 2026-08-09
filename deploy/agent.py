@@ -23,6 +23,26 @@ SECRETS = Path(__file__).parent / "secrets"
 COOLIFY_TOKEN_PATH = SECRETS / "coolify.json"
 COOLIFY_URL = "http://localhost:8000/api/v1"
 
+# Deploy-agent-internal bookkeeping: which registry.yaml app name maps to
+# which actual Coolify UUID / Pages project. Deliberately NOT part of
+# registry.yaml itself -- that file is the documented, stable platform
+# contract (AGENTS.md §5); this is implementation plumbing so the /apps
+# dashboard can find the real resource behind a name.
+RESOURCE_MAP_PATH = Path(__file__).parent / "resource_map.json"
+
+
+def _load_resource_map() -> dict:
+    if RESOURCE_MAP_PATH.exists():
+        return json.loads(RESOURCE_MAP_PATH.read_text())
+    return {}
+
+
+def record_resource(name: str, *, kind: str, coolify_uuid: str | None = None) -> None:
+    """kind: 'coolify' or 'pages'."""
+    m = _load_resource_map()
+    m[name] = {"kind": kind, "coolify_uuid": coolify_uuid}
+    RESOURCE_MAP_PATH.write_text(json.dumps(m, indent=2))
+
 # Stable platform config (not secrets) -- servingz's one Coolify server, the
 # "labs" project apps live in, its one "production" environment.
 COOLIFY_SERVER_UUID = "ynlpfb7qft2ld6a0coagy5nm"
@@ -370,6 +390,7 @@ def deploy(*, owner_repo: str, name: str, git_branch: str = "main") -> dict:
         step("create_dns_record", create_dns_record, name, f"{name}.pages.dev")
         step("register_app", register_app, name=name, memory_mb=0, subdomain=name,
              repo=f"github.com/{owner_repo}", target="pages")
+        step("record_resource", record_resource, name, kind="pages")
         step("commit_and_push", git_commit_and_push, f"registry: add {name} (static, via deploy agent)")
         return {
             "log": log, "classification": classification, "status": "deployed",
@@ -390,6 +411,7 @@ def deploy(*, owner_repo: str, name: str, git_branch: str = "main") -> dict:
     step("create_dns_record", create_dns_record, name)
     step("add_tunnel_route", add_tunnel_route, domain)
     step("register_app", register_app, name=name, memory_mb=memory_mb, subdomain=name, repo=f"github.com/{owner_repo}")
+    step("record_resource", record_resource, name, kind="coolify", coolify_uuid=coolify_result.get("uuid"))
     step("commit_and_push", git_commit_and_push, f"registry: add {name} (deployed via deploy agent)")
 
     return {
@@ -401,3 +423,177 @@ def deploy(*, owner_repo: str, name: str, git_branch: str = "main") -> dict:
         "message": f"{name} created in Coolify, routed at https://{domain}, registered in registry.yaml. "
                     f"First build is running in Coolify now.",
     }
+
+
+# ============================================================ management
+# Everything below is for the /apps dashboard: list what's deployed, show
+# live status/logs, start/stop/restart, and tear down cleanly.
+
+def _find_coolify_uuid(name: str) -> str | None:
+    """Prefer the recorded mapping; fall back to a name-prefix search
+    against Coolify's own application list for apps deployed before this
+    mapping existed (e.g. hello-app, deployed by hand)."""
+    mapped = _load_resource_map().get(name)
+    if mapped and mapped.get("coolify_uuid"):
+        return mapped["coolify_uuid"]
+    with httpx.Client(timeout=15) as client:
+        r = client.get(f"{COOLIFY_URL}/applications", headers=_coolify_headers())
+        r.raise_for_status()
+        candidates = [a for a in r.json() if a.get("name", "").startswith(name)]
+    # Prefer a running one over a stopped/leftover one when there are several.
+    candidates.sort(key=lambda a: 0 if str(a.get("status", "")).startswith("running") else 1)
+    return candidates[0]["uuid"] if candidates else None
+
+
+def list_apps() -> list[dict]:
+    reg = load_registry()
+    resource_map = _load_resource_map()
+    out = []
+    for a in reg.get("apps", []):
+        entry = {
+            "name": a["name"], "target": a.get("target", "node"),
+            "memory_mb": a.get("memory_mb", 0), "subdomain": a.get("subdomain"),
+            "repo": a.get("repo"), "kind": resource_map.get(a["name"], {}).get("kind"),
+        }
+        if not entry["kind"]:
+            entry["kind"] = "pages" if entry["target"] == "pages" else "coolify"
+        out.append(entry)
+    return out
+
+
+def app_status(name: str) -> dict:
+    reg_entry = next((a for a in load_registry().get("apps", []) if a["name"] == name), None)
+    if not reg_entry:
+        raise ValueError(f"{name} is not registered")
+    kind = _load_resource_map().get(name, {}).get("kind") or \
+        ("pages" if reg_entry.get("target") == "pages" else "coolify")
+
+    if kind == "pages":
+        with httpx.Client(timeout=15) as client:
+            r = client.get(
+                f"{CLOUDFLARE_API}/accounts/{CLOUDFLARE_ACCOUNT_ID}/pages/projects/{name}",
+                headers=_cloudflare_headers(),
+            )
+            r.raise_for_status()
+            proj = r.json()["result"]
+        deployment = proj.get("latest_deployment") or {}
+        return {
+            "kind": "pages", "name": name,
+            "status": (deployment.get("latest_stage") or {}).get("status", "unknown"),
+            "url": deployment.get("url"),
+            "domains": proj.get("domains", []),
+            "memory_mb": 0,
+        }
+
+    coolify_uuid = _find_coolify_uuid(name)
+    if not coolify_uuid:
+        return {"kind": "coolify", "name": name, "status": "not_found", "memory_mb": reg_entry.get("memory_mb", 0)}
+    with httpx.Client(timeout=15) as client:
+        r = client.get(f"{COOLIFY_URL}/applications/{coolify_uuid}", headers=_coolify_headers())
+        r.raise_for_status()
+        app = r.json()
+    return {
+        "kind": "coolify", "name": name, "coolify_uuid": coolify_uuid,
+        "status": app.get("status", "unknown"),
+        "memory_mb": reg_entry.get("memory_mb", 0),
+        "fqdn": app.get("fqdn"),
+    }
+
+
+def app_logs(name: str, lines: int = 200) -> str:
+    coolify_uuid = _find_coolify_uuid(name)
+    if not coolify_uuid:
+        return "(no Coolify resource found -- static/Pages apps don't have server logs here; check the Cloudflare Pages dashboard)"
+    with httpx.Client(timeout=20) as client:
+        r = client.get(
+            f"{COOLIFY_URL}/applications/{coolify_uuid}/logs",
+            headers=_coolify_headers(), params={"lines": lines},
+        )
+        r.raise_for_status()
+        return r.json().get("logs", "")
+
+
+def app_action(name: str, action: str) -> dict:
+    """action: start | stop | restart. Coolify apps only -- Pages has no
+    such concept (it's not a running process)."""
+    if action not in ("start", "stop", "restart"):
+        raise ValueError(f"unknown action {action!r}")
+    coolify_uuid = _find_coolify_uuid(name)
+    if not coolify_uuid:
+        raise ValueError(f"no Coolify resource found for {name} (static sites can't be start/stopped)")
+    with httpx.Client(timeout=30) as client:
+        r = client.post(f"{COOLIFY_URL}/applications/{coolify_uuid}/{action}", headers=_coolify_headers())
+        r.raise_for_status()
+        return r.json()
+
+
+def remove_registry_entry(name: str) -> None:
+    text = REGISTRY_PATH.read_text()
+    lines = text.split("\n")
+    out, i, removed = [], 0, False
+    while i < len(lines):
+        if lines[i].strip() == f"- name: {name}":
+            removed = True
+            i += 1
+            while i < len(lines) and (lines[i].startswith("    ") or lines[i].strip() == ""):
+                i += 1
+            continue
+        out.append(lines[i])
+        i += 1
+    if not removed:
+        raise ValueError(f"{name} not found in registry.yaml")
+    REGISTRY_PATH.write_text("\n".join(out))
+
+
+def delete_app(name: str) -> dict:
+    """Tears down everything the deploy agent created for this app:
+    Coolify resource or Pages project, DNS record, tunnel route (Coolify
+    only), the resource_map entry, and the registry.yaml entry -- then
+    commits. Irreversible; the dashboard must confirm before calling this."""
+    reg_entry = next((a for a in load_registry().get("apps", []) if a["name"] == name), None)
+    if not reg_entry:
+        raise ValueError(f"{name} is not registered")
+    kind = _load_resource_map().get(name, {}).get("kind") or \
+        ("pages" if reg_entry.get("target") == "pages" else "coolify")
+    hostname = f"{name}.{PLATFORM_ROOT_DOMAIN}"
+
+    if kind == "pages":
+        with httpx.Client(timeout=20) as client:
+            r = client.delete(
+                f"{CLOUDFLARE_API}/accounts/{CLOUDFLARE_ACCOUNT_ID}/pages/projects/{name}",
+                headers=_cloudflare_headers(),
+            )
+            if r.status_code not in (200, 404):
+                r.raise_for_status()
+    else:
+        coolify_uuid = _find_coolify_uuid(name)
+        if coolify_uuid:
+            with httpx.Client(timeout=30) as client:
+                r = client.delete(f"{COOLIFY_URL}/applications/{coolify_uuid}", headers=_coolify_headers())
+                if r.status_code not in (200, 404):
+                    r.raise_for_status()
+        # remove the tunnel ingress rule
+        repo_config_path = ZORC_DIR / "cloudflared" / "config.yml"
+        cfg = yaml.safe_load(repo_config_path.read_text())
+        cfg["ingress"] = [r_ for r_ in cfg["ingress"] if r_.get("hostname") != hostname]
+        repo_config_path.write_text(yaml.dump(cfg, sort_keys=False))
+        subprocess.run(["sudo", "cp", str(repo_config_path), "/etc/cloudflared/config.yml"], check=True)
+        subprocess.run(["sudo", "systemctl", "reload-or-restart", "cloudflared"], check=True)
+
+    with httpx.Client(timeout=15) as client:
+        existing = client.get(
+            f"{CLOUDFLARE_API}/zones/{CLOUDFLARE_ZONE_ID}/dns_records",
+            headers=_cloudflare_headers(), params={"name": hostname},
+        )
+        existing.raise_for_status()
+        for rec in existing.json()["result"]:
+            client.delete(f"{CLOUDFLARE_API}/zones/{CLOUDFLARE_ZONE_ID}/dns_records/{rec['id']}",
+                           headers=_cloudflare_headers())
+
+    m = _load_resource_map()
+    m.pop(name, None)
+    RESOURCE_MAP_PATH.write_text(json.dumps(m, indent=2))
+
+    remove_registry_entry(name)
+    git_commit_and_push(f"registry: remove {name} (deleted via deploy agent)")
+    return {"deleted": name, "kind": kind}
