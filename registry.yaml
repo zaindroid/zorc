@@ -50,7 +50,7 @@ infrastructure:
 # ---------------------------------------------------------------------------
 apps:
   - name: mean-machines
-    target: node
+    target: pages
     memory_mb: 0
     subdomain: mean-machines
     database: null
