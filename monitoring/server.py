@@ -9,6 +9,9 @@ status.zaindroid.me — this process only binds 127.0.0.1, same as before.
 """
 import json
 import re
+import sys
+import threading
+import uuid
 from pathlib import Path
 
 import httpx
@@ -21,6 +24,11 @@ BASE_DIR = Path(__file__).parent
 STATUS_DIR = BASE_DIR / "status"
 REGISTRY_PATH = BASE_DIR.parent / "registry.yaml"
 TOKEN_PATH = BASE_DIR / "secrets" / "github_approvals.json"
+
+sys.path.insert(0, str(BASE_DIR.parent / "deploy"))
+import agent as deploy_agent  # noqa: E402
+
+DEPLOY_JOBS: dict[str, dict] = {}  # in-memory job status, fine for a single-operator platform
 
 FIELD_RE = re.compile(r"^(App|Commit|Staging|Compare|Run): (.+)$", re.MULTILINE)
 
@@ -59,6 +67,39 @@ def theme_css():
 @app.get("/effects.js")
 def effects_js():
     return Response((STATUS_DIR / "effects.js").read_text(), media_type="application/javascript")
+
+
+class DeployRequest(BaseModel):
+    owner_repo: str  # "owner/repo"
+    name: str
+    git_branch: str = "main"
+
+
+def _run_deploy_job(job_id: str, req: DeployRequest):
+    DEPLOY_JOBS[job_id]["status"] = "running"
+    try:
+        result = deploy_agent.deploy(owner_repo=req.owner_repo, name=req.name, git_branch=req.git_branch)
+        DEPLOY_JOBS[job_id].update(status="done", result=result)
+    except deploy_agent.DeployError as e:
+        DEPLOY_JOBS[job_id].update(status="failed", error={"step": e.step, "reason": e.reason})
+    except Exception as e:  # noqa: BLE001 -- surface anything unexpected to the dashboard, don't swallow
+        DEPLOY_JOBS[job_id].update(status="failed", error={"step": "unexpected", "reason": str(e)})
+
+
+@app.post("/api/deploy")
+def start_deploy(req: DeployRequest):
+    job_id = uuid.uuid4().hex[:12]
+    DEPLOY_JOBS[job_id] = {"status": "queued", "owner_repo": req.owner_repo, "name": req.name}
+    threading.Thread(target=_run_deploy_job, args=(job_id, req), daemon=True).start()
+    return {"job_id": job_id}
+
+
+@app.get("/api/deploy/{job_id}")
+def get_deploy_status(job_id: str):
+    job = DEPLOY_JOBS.get(job_id)
+    if not job:
+        raise HTTPException(404, "unknown job id")
+    return job
 
 
 @app.get("/api/approvals")
@@ -151,6 +192,7 @@ APPROVALS_HTML = """<!doctype html>
     <div class="tabs">
       <a href="/" data-scramble>Status</a>
       <a href="/approvals" class="active" data-scramble>Approvals</a>
+      <a href="/deploy" data-scramble>Deploy</a>
     </div>
   </div>
 
@@ -268,3 +310,174 @@ setInterval(load, 10000);
 @app.get("/approvals", response_class=HTMLResponse)
 def approvals_page():
     return APPROVALS_HTML
+
+
+DEPLOY_HTML = """<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>servingz — deploy</title>
+<link rel="stylesheet" href="/theme.css">
+<script src="/effects.js"></script>
+<style>
+.form-card { padding: 1.3rem 1.5rem; max-width: 560px; }
+.field { margin-top: 1rem; }
+.field label { display: block; font-size: 0.78rem; color: var(--text-dim); margin-bottom: 0.4rem; letter-spacing: 0.04em; }
+.field input {
+  width: 100%; background: rgba(255,255,255,0.04); border: 1px solid var(--border);
+  border-radius: 8px; padding: 0.6rem 0.8rem; color: var(--text); font-family: var(--font); font-size: 0.9rem;
+}
+.field input:focus { outline: none; border-color: var(--accent); }
+.field .hint { color: var(--text-faint); font-size: 0.72rem; margin-top: 0.35rem; }
+.deploy-btn {
+  margin-top: 1.3rem; background: rgba(94,177,255,0.14); color: var(--accent);
+  box-shadow: inset 0 0 0 1px rgba(94,177,255,0.4);
+}
+.deploy-btn:hover { background: rgba(94,177,255,0.22); }
+.log-card { padding: 1.1rem 1.4rem; max-width: 560px; margin-top: 1.1rem; }
+.log-line { font-size: 0.82rem; padding: 0.3rem 0; border-bottom: 1px solid var(--border); display: flex; gap: 0.6rem; align-items: baseline; }
+.log-line:last-child { border-bottom: none; }
+.log-ok { color: var(--ok); }
+.log-fail { color: var(--crit); }
+.log-pending { color: var(--text-faint); }
+.result-box { margin-top: 1rem; padding: 0.9rem 1rem; border-radius: 8px; font-size: 0.85rem; line-height: 1.6; }
+.result-box.ok { background: rgba(47,230,184,0.08); box-shadow: inset 0 0 0 1px rgba(47,230,184,0.3); color: var(--text); }
+.result-box.fail { background: rgba(255,92,114,0.08); box-shadow: inset 0 0 0 1px rgba(255,92,114,0.3); color: var(--text); }
+.result-box a { color: var(--accent); }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <div class="topbar">
+    <a class="brand" href="/"><span class="pip" id="brand-pip"></span> <span id="brand-text">SERVINGZ</span></a>
+    <div class="tabs">
+      <a href="/" data-scramble>Status</a>
+      <a href="/approvals" data-scramble>Approvals</a>
+      <a href="/deploy" class="active" data-scramble>Deploy</a>
+    </div>
+  </div>
+
+  <div class="glass hero" id="hero">
+    <div class="orb ok" id="hero-orb"></div>
+    <div class="hero-text">
+      <h1 id="hero-title">Hand over a repo</h1>
+      <div class="sub">No Dockerfile required for most apps &mdash; classification and resource
+      checks are deterministic (no LLM), Nixpacks handles the build. Static sites get flagged
+      for Cloudflare Pages instead of landing on this node.</div>
+    </div>
+  </div>
+
+  <div class="glass form-card">
+    <div class="field">
+      <label>GitHub repo (owner/name)</label>
+      <input id="repo" placeholder="zaindroid/my-new-app" autocomplete="off">
+      <div class="hint">Private repos work too, via the same GitHub App already connected.</div>
+    </div>
+    <div class="field">
+      <label>App name</label>
+      <input id="name" placeholder="my-new-app" autocomplete="off">
+      <div class="hint">Becomes the subdomain: name.zaindroid.me</div>
+    </div>
+    <div class="field">
+      <label>Branch</label>
+      <input id="branch" value="main" autocomplete="off">
+    </div>
+    <button class="deploy-btn" id="deployBtn" onclick="startDeploy()">Deploy</button>
+  </div>
+
+  <div class="glass log-card" id="logCard" style="display:none">
+    <div id="logLines"></div>
+    <div id="resultBox"></div>
+  </div>
+</div>
+
+<script>
+const STEP_LABELS = {
+  clone: 'Clone repository',
+  classify: 'Classify (static vs. app, language)',
+  budget_check: 'Check registry.yaml budget',
+  create_coolify_app: 'Create Coolify resource',
+  create_dns_record: 'Create DNS record',
+  add_tunnel_route: 'Wire Cloudflare Tunnel route',
+  deploy_to_pages: 'Deploy to Cloudflare Pages',
+  add_pages_custom_domain: 'Attach custom domain (Pages)',
+  register_app: 'Register in registry.yaml',
+  commit_and_push: 'Commit + push',
+};
+
+async function startDeploy() {
+  const owner_repo = document.getElementById('repo').value.trim();
+  const name = document.getElementById('name').value.trim();
+  const git_branch = document.getElementById('branch').value.trim() || 'main';
+  if (!owner_repo || !name) { alert('Repo and name are both required.'); return; }
+
+  document.getElementById('deployBtn').disabled = true;
+  document.getElementById('logCard').style.display = 'block';
+  document.getElementById('logLines').innerHTML = '<div class="log-line log-pending">Starting&hellip;</div>';
+  document.getElementById('resultBox').innerHTML = '';
+
+  let job;
+  try {
+    const res = await fetch('/api/deploy', {
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({owner_repo, name, git_branch}),
+    });
+    if (!res.ok) throw new Error(await res.text());
+    job = await res.json();
+  } catch (e) {
+    document.getElementById('logLines').innerHTML = `<div class="log-line log-fail">Failed to start: ${e.message}</div>`;
+    document.getElementById('deployBtn').disabled = false;
+    return;
+  }
+  poll(job.job_id);
+}
+
+async function poll(jobId) {
+  const res = await fetch(`/api/deploy/${jobId}`, { cache: 'no-store' });
+  const job = await res.json();
+  renderLog(job);
+  if (job.status === 'done' || job.status === 'failed') {
+    document.getElementById('deployBtn').disabled = false;
+    return;
+  }
+  setTimeout(() => poll(jobId), 1500);
+}
+
+function renderLog(job) {
+  const log = (job.result && job.result.log) || (job.error ? [{step: job.error.step, ok: false}] : []);
+  const lines = log.map(l => {
+    const cls = l.ok ? 'log-ok' : 'log-fail';
+    const icon = l.ok ? '\\u2713' : '\\u2717';
+    return `<div class="log-line ${cls}">${icon} ${STEP_LABELS[l.step] || l.step}</div>`;
+  });
+  if (job.status === 'running' || job.status === 'queued') {
+    lines.push('<div class="log-line log-pending">&hellip;</div>');
+  }
+  document.getElementById('logLines').innerHTML = lines.join('');
+
+  const box = document.getElementById('resultBox');
+  if (job.status === 'done') {
+    const r = job.result;
+    if (r.status === 'needs_manual_step') {
+      box.innerHTML = `<div class="result-box fail">${r.message}</div>`;
+    } else {
+      box.innerHTML = `<div class="result-box ok">${r.message}<br><a href="https://${r.domain}" target="_blank">https://${r.domain}</a></div>`;
+    }
+  } else if (job.status === 'failed') {
+    box.innerHTML = `<div class="result-box fail">Failed at <b>${STEP_LABELS[job.error.step] || job.error.step}</b>: ${job.error.reason}</div>`;
+  }
+}
+
+const brandEl = document.getElementById('brand-text');
+zorcEffects.decodeIn(brandEl, 'SERVINGZ', { stagger: 55, dur: 300 });
+zorcEffects.shimmer(brandEl);
+zorcEffects.wireScrambleHovers(document.querySelector('.tabs'));
+</script>
+</body>
+</html>"""
+
+
+@app.get("/deploy", response_class=HTMLResponse)
+def deploy_page():
+    return DEPLOY_HTML

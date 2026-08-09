@@ -1,5 +1,5 @@
 [Unit]
-Description=servingz status page + approvals dashboard (localhost only)
+Description=servingz status page + approvals + deploy agent (localhost only)
 After=network.target
 
 [Service]
@@ -10,11 +10,16 @@ User=zman
 Restart=always
 RestartSec=5
 
-# Hardening — reads status files + registry.yaml + one secrets file, calls
-# out to api.github.com. No writes at runtime.
+# Hardening -- reads status files + registry.yaml + secrets files, calls
+# out to api.github.com/Coolify/Cloudflare APIs. The deploy agent needs
+# real writes now (registry.yaml, cloudflared/config.yml, git commits,
+# /etc/cloudflared via sudo, scratch dirs for clones/wrangler under /tmp)
+# so ProtectHome stays read-only as the default but with explicit
+# exceptions instead of turning protection off wholesale.
 NoNewPrivileges=true
 ProtectSystem=strict
 ProtectHome=read-only
+ReadWritePaths=/home/zman/zorc /etc/cloudflared
 PrivateTmp=true
 
 [Install]
