@@ -49,6 +49,17 @@ infrastructure:
 # Applications. Add new entries at the end. Keep alphabetical within groups.
 # ---------------------------------------------------------------------------
 apps:
+  - name: mean-machines
+    target: node
+    memory_mb: 0
+    subdomain: mean-machines
+    database: null
+    redis_db: null
+    storage_prefix: null
+    repo: "github.com/zaindroid/mean_machines_site"
+    critical: false
+    depends_on: []
+
   - name: hello-app
     target: node
     memory_mb: 256
