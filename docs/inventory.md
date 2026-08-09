@@ -294,3 +294,25 @@ paths now resolve under `/mnt/fast/containerd`. Old data retained at
   from outside via `https://hello.zaindroid.me`.
 - Watchdog status page confirms `overall: ok`, all 6 original Coolify
   containers still healthy — hello-app's deployment didn't degrade anything.
+
+## Shared Postgres + Redis provisioned (2026-08-09)
+
+- **Postgres 18** (`postgresql-database-t5amapezxhesfta6w82ksyt0`, container
+  `t5amapezxhesfta6w82ksyt0`), deployed via Coolify as a Database resource in
+  a new `platform` project (separate from `labs`, which houses actual apps).
+  Version bumped from the template's example "17" to "18" — no reason to
+  pin to 17, nothing existing to stay compatible with. Reachable at
+  `t5amapezxhesfta6w82ksyt0:5432` on the `coolify` Docker network only — not
+  published to any host port, not tunnel/Access-exposed (nothing external
+  should reach a database directly). Verified with `pg_isready` from a
+  separate container on the same network.
+- **Redis 7.2** (container `h8nk9npsxzv9kkklvgqb93zj`), same project/pattern.
+  Reachable at `h8nk9npsxzv9kkklvgqb93zj:6379`, same network, not published.
+  Verified reachable (responds with a real Redis protocol auth challenge).
+- Neither is wired to any app yet — hello-app explicitly has no
+  postgres/redis dependency (see its `app.yaml`). This is infra provisioned
+  ahead of the next app that needs it, per `AGENTS.md` §2's now-updated
+  "declared and live" status (was "not yet provisioned" before today).
+- Per-app database/role (Postgres) and DB-index (Redis) assignment happens
+  on request when an app actually needs one — not self-service, matches
+  AGENTS.md's "ask before assuming" philosophy.

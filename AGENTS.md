@@ -35,24 +35,27 @@ correct and this file is stale — fix it in your PR.
 
 ## 2. What already exists
 
-### Shared infrastructure — declared, NOT YET PROVISIONED on servingz
+### Shared infrastructure
 
-**As of 2026-08-08, none of the row below are actually running as shared,
-app-facing services.** Coolify has its own internal `coolify-db`/
-`coolify-redis` for the platform's own use only — apps must not assume they
-can reach a shared `postgres`/`redis` hostname today. If your app needs one
-of these, **stop and ask** rather than assuming it exists; provisioning it
-is a deliberate step, not a given.
+**As of 2026-08-09: Postgres and Redis are live.** Object storage and the
+LLM gateway are still NOT provisioned — apps must not assume either exists;
+**stop and ask** before assuming, same as before. Coolify's own internal
+`coolify-db`/`coolify-redis` remain platform-only, never for apps — the
+shared instances below are separate, dedicated deployments.
 
-| Service | Reach it at (once provisioned) | Use for | Never |
+| Service | Reach it at | Use for | Never |
 |---|---|---|---|
-| **Postgres** | `postgres:5432` | relational data, job state, anything durable | query another app's DB; add a second Postgres |
-| **Redis** | `redis:6379` | queues, cache, rate limits, locks | store anything you can't lose; add another broker |
-| **Object storage** | `S3_*` env vars | files, audio, images, exports over ~100 KB | store user files on the container filesystem |
-| **LLM gateway** | `LLM_BASE_URL` | all LLM, VLM, embedding, STT, TTS calls | call a provider SDK directly; hold a provider key in an app |
+| **Postgres 18** | `t5amapezxhesfta6w82ksyt0:5432` (internal Docker network only, `coolify` network) | relational data, job state, anything durable | query another app's DB; add a second Postgres |
+| **Redis 7** | `h8nk9npsxzv9kkklvgqb93zj:6379` (internal Docker network only, `coolify` network) | queues, cache, rate limits, locks | store anything you can't lose; add another broker |
+| **Object storage** | not provisioned — ask first | files, audio, images, exports over ~100 KB | store user files on the container filesystem |
+| **LLM gateway** | not provisioned — ask first | all LLM, VLM, embedding, STT, TTS calls | call a provider SDK directly; hold a provider key in an app |
 
-Once provisioned: connection details arrive as environment variables. Never
-hardcode them.
+Postgres/Redis: **one database + one role per app** (Postgres) / **one
+logical DB index per app** (Redis) — created on request when an app needs
+one, not self-service. Connection details arrive as `DATABASE_URL`/
+`REDIS_URL` environment variables at deploy time. Never hardcode the
+hostnames above directly in app code — use the env vars so credentials and
+routing can change without an app redeploy.
 
 The LLM gateway is OpenAI-compatible — point any OpenAI SDK at `LLM_BASE_URL`.
 Routing, failover, caching, cost tracking and tracing all live there. An app

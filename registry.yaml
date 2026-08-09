@@ -33,7 +33,7 @@ domains:
 infrastructure:
   - name: postgres
     memory_mb: 1000
-    version: "17"
+    version: "18"
     note: one database + one role per app, no cross-app access
 
   - name: redis
