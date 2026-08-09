@@ -431,3 +431,59 @@ alerts (`NTFY_TOPIC` secret, reused from `monitoring/secrets/notify.json`)
 — pending approvals now show up in the same phone notification stream as
 disk/RAM/temperature alerts, rather than relying on GitHub's separate
 issue-assignment notifications.
+
+## Backups (2026-08-09)
+
+Platform-level disaster recovery — not an app-facing capability, nothing in
+`AGENTS.md`'s capability table changed. Daily via `zorc-backup.timer`
+(03:00 UTC + up to 10min random delay), `backup/backup.sh`.
+
+**What's backed up:**
+- Shared app Postgres (`t5amapezxhesfta6w82ksyt0`) — full `pg_dumpall`.
+- Coolify's own internal Postgres (`coolify-db`) — full `pg_dumpall`.
+  User is `coolify`, not `postgres` (Coolify's own `POSTGRES_USER` — cost
+  us the first test run with a "role does not exist" error).
+- `/data/coolify` in full (tar) — SSH keys, SSL certs, and critically
+  `source/.env`'s `APP_KEY`: the encryption key for every secret Coolify
+  itself stores (env vars, source connections, DB passwords it manages).
+  Without this key a restored `coolify-db` is undecryptable junk, so it has
+  to travel with every backup, not be treated as a one-time secret.
+- **Redis is deliberately excluded** — `AGENTS.md` §2 already documents it
+  as cache/queue only, nothing irreplaceable is supposed to live there.
+
+**Pipeline:** dump -> tar -> `gpg --symmetric --cipher-algo AES256`
+(encrypted locally before it ever leaves the host) -> upload to Cloudflare
+R2 via `rclone`. Local copies (`/mnt/data/backups/`) kept 7 days; remote
+copies in R2 kept 30 days, pruned by the script itself each run.
+
+**R2 setup gotchas:**
+1. R2 doesn't show a "create bucket" option until you complete a one-time
+   (free) subscription checkout under Storage & databases -> R2 -> Overview
+   — not documented clearly in the dashboard flow itself.
+2. The R2 API token is scoped to **Object Read & Write only** on the one
+   bucket (least privilege — it never needs to create/delete buckets or
+   read other buckets). This broke `rclone` by default: rclone's S3 backend
+   pre-flights every write with a `CreateBucket` call, which 403'd against
+   our deliberately-narrow token even though the bucket already existed.
+   Fixed with `no_check_bucket = true` in `rclone.conf`.
+
+**Restore tested for real**, not assumed: downloaded the actual uploaded
+object back from R2, decrypted it, and restored both dumps into fresh
+throwaway `postgres:18-alpine` / `postgres:15-alpine` containers (matching
+the real versions) — confirmed the `coolify` database and role came back
+correctly before deleting the test containers.
+
+**Known gap, flagged not fixed:** the GPG passphrase and R2 credentials
+that make backups decryptable currently exist ONLY as files on servingz
+itself (`backup/secrets/`, gitignored) — if the host's disk dies, the
+encrypted backups in R2 are unrecoverable without them. User was told to
+copy the passphrase into a password manager they control; not yet
+confirmed done. This is also why `backup/secrets/` is `chmod 600` and
+excluded via the existing repo-wide `secrets/` gitignore pattern, same as
+`monitoring/secrets/`.
+
+**Still pending:** a dedicated healthchecks.io dead-man's-switch check for
+the backup job specifically (separate from the host watchdog's own check,
+so a silently-failing backup is distinguishable from a healthy host) —
+`backup.sh` already reads `backup/secrets/healthchecks.json` for this and
+degrades gracefully if it's absent, but the check hasn't been created yet.

@@ -1,0 +1,9 @@
+[Unit]
+Description=servingz backup (shared postgres + coolify state -> R2, encrypted)
+After=network.target docker.service
+Requires=docker.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/bash /home/zman/zorc/backup/backup.sh
+User=zman
