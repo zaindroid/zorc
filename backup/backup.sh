@@ -2,8 +2,11 @@
 # servingz backup — shared app Postgres + Coolify's own Postgres + Coolify's
 # config directory (SSH keys, SSL certs, and critically its APP_KEY, the
 # encryption key for every secret Coolify stores — without it a restored
-# coolify-db is useless). Redis is deliberately NOT backed up: AGENTS.md
-# documents it as cache/queue only, nothing irreplaceable.
+# coolify-db is useless) + the Cloudflare Tunnel credentials file (without
+# this, a rebuild needs an entirely new tunnel and a DNS update for every
+# subdomain, instead of just reconnecting the existing one). Redis is
+# deliberately NOT backed up: AGENTS.md documents it as cache/queue only,
+# nothing irreplaceable.
 #
 # Archive is gpg-encrypted locally before it ever leaves the host, then
 # uploaded to Cloudflare R2. Local copies kept 7 days, remote copies 30 days.
@@ -51,8 +54,12 @@ docker exec coolify-db pg_dumpall -U coolify | gzip > "$WORKDIR/coolify_postgres
 echo "[$TS] archiving coolify config (ssh keys, ssl, APP_KEY)..."
 sudo tar czf "$WORKDIR/coolify_data.tar.gz" -C /data coolify
 
+echo "[$TS] archiving cloudflare tunnel credentials..."
+tar czf "$WORKDIR/cloudflared.tar.gz" -C /home/zman/.cloudflared \
+  "$(basename "$(ls /home/zman/.cloudflared/*.json)")" config.yml
+
 ARCHIVE="$WORKDIR/backup_${TS}.tar.gz"
-tar czf "$ARCHIVE" -C "$WORKDIR" app_postgres.sql.gz coolify_postgres.sql.gz coolify_data.tar.gz
+tar czf "$ARCHIVE" -C "$WORKDIR" app_postgres.sql.gz coolify_postgres.sql.gz coolify_data.tar.gz cloudflared.tar.gz
 
 echo "[$TS] encrypting..."
 ENCRYPTED="$STAGING/backup_${TS}.tar.gz.gpg"
