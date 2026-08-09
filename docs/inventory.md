@@ -482,8 +482,7 @@ confirmed done. This is also why `backup/secrets/` is `chmod 600` and
 excluded via the existing repo-wide `secrets/` gitignore pattern, same as
 `monitoring/secrets/`.
 
-**Still pending:** a dedicated healthchecks.io dead-man's-switch check for
-the backup job specifically (separate from the host watchdog's own check,
-so a silently-failing backup is distinguishable from a healthy host) —
-`backup.sh` already reads `backup/secrets/healthchecks.json` for this and
-degrades gracefully if it's absent, but the check hasn't been created yet.
+A dedicated healthchecks.io dead-man's-switch check (`servingz-backup`,
+~26h period) now pings on every successful run, separate from the host
+watchdog's own check — a silently-failing backup is now distinguishable
+from a healthy host.
