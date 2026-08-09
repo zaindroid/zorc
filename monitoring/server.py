@@ -14,7 +14,7 @@ from pathlib import Path
 import httpx
 import yaml
 from fastapi import FastAPI, HTTPException
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.responses import HTMLResponse, JSONResponse, Response
 from pydantic import BaseModel
 
 BASE_DIR = Path(__file__).parent
@@ -49,6 +49,11 @@ def status_page():
 @app.get("/status.json")
 def status_json():
     return JSONResponse(json.loads((STATUS_DIR / "status.json").read_text()))
+
+
+@app.get("/theme.css")
+def theme_css():
+    return Response((STATUS_DIR / "theme.css").read_text(), media_type="text/css")
 
 
 @app.get("/api/approvals")
@@ -126,54 +131,72 @@ def decide(d: Decision):
 
 
 APPROVALS_HTML = """<!doctype html>
-<html><head><meta charset="utf-8"><title>servingz approvals</title>
-<style>
-body { font-family: -apple-system, sans-serif; background:#111; color:#eee; margin:2rem; }
-h1 { font-size:1.4rem; margin-bottom:0.25rem; }
-a.back { color:#888; font-size:0.85rem; text-decoration:none; }
-a.back:hover { text-decoration:underline; }
-.empty { color:#888; margin-top:2rem; }
-.card { background:#1a1a1a; border:1px solid #333; border-radius:8px; padding:1rem 1.25rem; margin-top:1.25rem; max-width:900px; }
-.card h2 { margin:0 0 0.5rem 0; font-size:1.05rem; }
-.card .sha { color:#888; font-family:monospace; font-size:0.85rem; }
-.preview-label { color:#999; font-size:0.8rem; margin:1rem 0 0.4rem; }
-.preview-frame { width:100%; height:480px; border:1px solid #333; border-radius:6px; background:#fff; }
-.preview-missing { color:#888; font-size:0.85rem; padding:1rem; border:1px dashed #333; border-radius:6px; margin-top:0.5rem; }
-.links { margin:0.75rem 0; display:flex; gap:1rem; flex-wrap:wrap; }
-.links a { color:#6fb3ff; font-size:0.85rem; text-decoration:none; }
-.links a:hover { text-decoration:underline; }
-.actions { margin-top:1rem; display:flex; gap:0.75rem; }
-button { border:none; border-radius:6px; padding:0.5rem 1.1rem; font-size:0.9rem; cursor:pointer; }
-.approve { background:#2e7d32; color:#fff; }
-.approve:hover { background:#388e3c; }
-.deny { background:#8b2e2e; color:#fff; }
-.deny:hover { background:#a03838; }
-.meta { color:#666; font-size:0.8rem; margin-top:1rem; }
-button:disabled { opacity:0.5; cursor:default; }
-</style></head>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>servingz — approvals</title>
+<link rel="stylesheet" href="/theme.css">
+</head>
 <body>
-<a class="back" href="/">&larr; status</a>
-<h1>Pending production approvals</h1>
-<div id="list"><div class="empty">Loading&hellip;</div></div>
+<div class="wrap">
+  <div class="topbar">
+    <a class="brand" href="/"><span class="pip" id="brand-pip"></span> SERVINGZ</a>
+    <div class="tabs">
+      <a href="/">Status</a>
+      <a href="/approvals" class="active">Approvals</a>
+    </div>
+  </div>
+
+  <div class="glass hero" id="hero">
+    <div class="orb ok" id="hero-orb"></div>
+    <div class="hero-text">
+      <h1 id="hero-title">Loading&hellip;</h1>
+      <div class="sub" id="hero-sub">Anything waiting on a human shows up here, with a live preview of exactly what would ship.</div>
+    </div>
+  </div>
+
+  <div id="list"></div>
+</div>
 
 <script>
 async function load() {
   const list = document.getElementById('list');
+  const orb = document.getElementById('hero-orb');
+  const title = document.getElementById('hero-title');
   let items;
   try {
-    items = await (await fetch('/api/approvals')).json();
+    items = await (await fetch('/api/approvals', { cache: 'no-store' })).json();
   } catch (e) {
-    list.innerHTML = '<div class="empty">Failed to load — retrying&hellip;</div>';
+    title.textContent = "Can't reach the approvals service";
+    orb.className = 'orb crit';
     return;
   }
+
   if (!items.length) {
-    list.innerHTML = '<div class="empty">Nothing waiting on you right now.</div>';
+    orb.className = 'orb ok';
+    title.textContent = 'Nothing waiting on you';
+    list.innerHTML = '<div class="empty">All caught up — new deploys will show up here the moment they pass staging + regression.</div>';
     return;
   }
-  list.innerHTML = items.map(renderCard).join('');
+
+  orb.className = 'orb warn';
+  title.textContent = items.length === 1
+    ? '1 deploy waiting on your review'
+    : `${items.length} deploys waiting on your review`;
+
+  // Don't clobber cards mid-decision (buttons disabled) on the poll tick.
+  const existing = new Set([...list.querySelectorAll('.card[data-pending]')].map(el => el.id));
+  list.innerHTML = items.map(item => renderCard(item, existing)).join('');
 }
 
-function renderCard(item) {
+function cardId(item) {
+  return `card-${item.repo.replace('/', '-')}-${item.issue_number}`;
+}
+
+function renderCard(item, skip) {
+  if (skip.has(cardId(item))) return document.getElementById(cardId(item)).outerHTML;
+
   const links = [];
   if (item.staging_url) links.push(`<a href="${item.staging_url}" target="_blank">Open staging in new tab &#8599;</a>`);
   if (item.compare_url) links.push(`<a href="${item.compare_url}" target="_blank">Code diff</a>`);
@@ -181,12 +204,12 @@ function renderCard(item) {
   links.push(`<a href="${item.issue_url}" target="_blank">GitHub issue</a>`);
 
   const preview = item.staging_url
-    ? `<div class="preview-label">Live preview — this is the exact build you're approving:</div>
+    ? `<div class="preview-label">Live preview &mdash; this is the exact build you're approving:</div>
        <iframe class="preview-frame" src="${item.staging_url}" loading="lazy"></iframe>`
-    : `<div class="preview-missing">No staging URL reported for this app — check the CI run.</div>`;
+    : `<div class="preview-missing">No staging URL reported for this app &mdash; check the CI run.</div>`;
 
   return `
-    <div class="card" id="card-${item.repo.replace('/', '-')}-${item.issue_number}">
+    <div class="glass card" id="${cardId(item)}">
       <h2>${item.app}</h2>
       <div class="sha">commit ${item.commit || '(unknown)'}</div>
       ${preview}
@@ -200,6 +223,7 @@ function renderCard(item) {
 
 async function decide(repo, issue_number, decision, btn) {
   const card = btn.closest('.card');
+  card.setAttribute('data-pending', '1');
   card.querySelectorAll('button').forEach(b => b.disabled = true);
   try {
     const res = await fetch('/api/approvals/decide', {
@@ -208,8 +232,10 @@ async function decide(repo, issue_number, decision, btn) {
       body: JSON.stringify({repo, issue_number, decision}),
     });
     if (!res.ok) throw new Error(await res.text());
-    card.innerHTML = `<div class="meta">Recorded "${decision}" — CI will pick it up within ~10s.</div>`;
+    const word = decision === 'approved' ? 'Approved' : 'Denied';
+    card.innerHTML = `<h2>${card.querySelector('h2').textContent}</h2><div class="resolved">${word} &mdash; CI will pick it up within ~10s.</div>`;
   } catch (e) {
+    card.removeAttribute('data-pending');
     card.querySelectorAll('button').forEach(b => b.disabled = false);
     alert('Failed to record decision: ' + e.message);
   }
@@ -218,7 +244,8 @@ async function decide(repo, issue_number, decision, btn) {
 load();
 setInterval(load, 10000);
 </script>
-</body></html>"""
+</body>
+</html>"""
 
 
 @app.get("/approvals", response_class=HTMLResponse)

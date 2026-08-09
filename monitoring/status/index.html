@@ -1,0 +1,126 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>servingz — status</title>
+<link rel="stylesheet" href="/theme.css">
+</head>
+<body>
+<div class="wrap">
+  <div class="topbar">
+    <a class="brand" href="/"><span class="pip" id="brand-pip"></span> SERVINGZ</a>
+    <div class="tabs">
+      <a href="/" class="active">Status</a>
+      <a href="/approvals">Approvals</a>
+    </div>
+  </div>
+
+  <div class="glass hero" id="hero">
+    <div class="orb ok" id="hero-orb"></div>
+    <div class="hero-text">
+      <h1 id="hero-title">Loading&hellip;</h1>
+      <div class="sub" id="hero-sub"></div>
+    </div>
+  </div>
+
+  <div id="groups"></div>
+
+  <div class="footer-meta" id="footer-meta"></div>
+</div>
+
+<script>
+// check_id -> { label: human name, group: category }
+const CHECK_META = {
+  cloudflared:            { label: "Public tunnel",        group: "Network" },
+  tailscaled:             { label: "Private network (Tailscale)", group: "Network" },
+  docker_user_port_block: { label: "Firewall rules",        group: "Network" },
+
+  "disk_/":                { label: "Disk — system",        group: "Storage" },
+  "disk_/mnt/data":        { label: "Disk — bulk storage",  group: "Storage" },
+  "disk_/mnt/fast":        { label: "Disk — fast storage",  group: "Storage" },
+  mounts:                  { label: "Storage mounts",       group: "Storage" },
+  "smart_/dev/sda":        { label: "Drive health — sda",   group: "Storage" },
+  "smart_/dev/sdb":        { label: "Drive health — sdb",   group: "Storage" },
+  "smart_/dev/nvme0n1":    { label: "Drive health — NVMe",  group: "Storage" },
+  swap:                    { label: "Swap usage",           group: "Storage" },
+
+  cpu_temp:    { label: "CPU temperature", group: "Compute" },
+  gpu_temp:    { label: "GPU temperature", group: "Compute" },
+  load_avg:    { label: "System load",     group: "Compute" },
+  ram:         { label: "Memory",          group: "Compute" },
+  power_source:{ label: "Power source",    group: "Compute" },
+
+  docker_daemon:      { label: "Container engine",       group: "Platform" },
+  coolify_containers: { label: "App platform (Coolify)", group: "Platform" },
+  postgres_ready:     { label: "Shared database",        group: "Platform" },
+  systemd_failed:     { label: "Background services",    group: "Platform" },
+};
+const GROUP_ORDER = ["Network", "Compute", "Storage", "Platform"];
+
+function metaFor(id) {
+  return CHECK_META[id] || { label: id.replace(/_/g, " "), group: "Other" };
+}
+
+function timeAgo(iso) {
+  const s = Math.max(0, Math.floor((Date.now() - new Date(iso).getTime()) / 1000));
+  if (s < 60) return `${s}s ago`;
+  if (s < 3600) return `${Math.floor(s / 60)}m ago`;
+  return `${Math.floor(s / 3600)}h ago`;
+}
+
+async function load() {
+  let d;
+  try {
+    d = await (await fetch('/status.json', { cache: 'no-store' })).json();
+  } catch (e) {
+    document.getElementById('hero-title').textContent = "Can't reach the status service";
+    return;
+  }
+
+  const orb = document.getElementById('hero-orb');
+  orb.className = `orb ${d.overall}`;
+
+  const checks = Object.entries(d.checks);
+  const bad = checks.filter(([, c]) => c.status !== 'ok');
+
+  document.getElementById('hero-title').textContent =
+    d.overall === 'ok' ? `${d.hostname} — all systems normal`
+    : bad.length === 1 ? `${d.hostname} — 1 thing needs attention`
+    : `${d.hostname} — ${bad.length} things need attention`;
+
+  document.getElementById('hero-sub').innerHTML =
+    `up <b>${d.uptime}</b> &middot; checked ${timeAgo(d.last_updated)}`;
+
+  const byGroup = {};
+  for (const [id, c] of checks) {
+    const m = metaFor(id);
+    (byGroup[m.group] ||= []).push({ id, label: m.label, ...c });
+  }
+
+  const groupsEl = document.getElementById('groups');
+  groupsEl.innerHTML = GROUP_ORDER.filter(g => byGroup[g]).map(g => {
+    const items = byGroup[g].sort((a, b) => a.label.localeCompare(b.label));
+    return `
+      <div class="group-title">${g}</div>
+      <div class="grid">
+        ${items.map(c => `
+          <div class="glass check">
+            <div class="check-top">
+              <span class="check-label">${c.label}</span>
+              <span class="badge ${c.status}">${c.status.toUpperCase()}</span>
+            </div>
+            <div class="check-detail">${c.message}</div>
+          </div>`).join('')}
+      </div>`;
+  }).join('');
+
+  document.getElementById('footer-meta').textContent =
+    `last updated ${new Date(d.last_updated).toLocaleString()}`;
+}
+
+load();
+setInterval(load, 15000);
+</script>
+</body>
+</html>

@@ -111,13 +111,15 @@ def handle_state_change(check_id: str, result: dict, state: dict, secrets: dict)
 
     if cur_status != prev_status:
         topic = secrets.get("ntfy_topic", "")
+        name = friendly(check_id)
         if cur_status in (WARN, CRIT):
             priority = "urgent" if cur_status == CRIT else "default"
             tags = "rotating_light" if cur_status == CRIT else "warning"
-            notify.send_ntfy(topic, f"[{cur_status.upper()}] {check_id} - servingz",
+            word = "Critical" if cur_status == CRIT else "Warning"
+            notify.send_ntfy(topic, f"{word}: {name} — servingz",
                               result["message"], priority, tags)
         elif prev_status in (WARN, CRIT) and cur_status == OK:
-            notify.send_ntfy(topic, f"[RECOVERED] {check_id} - servingz",
+            notify.send_ntfy(topic, f"Recovered: {name} — servingz",
                               result["message"], "low", "white_check_mark")
         log.info("state change: %s %s -> %s (%s)", check_id, prev_status, cur_status, result["message"])
 
@@ -173,7 +175,38 @@ def write_node_yaml(cfg: dict, gpu: dict, cpu: dict, overall_status: str) -> Non
 STATUS_COLORS = {OK: "#2e7d32", WARN: "#f9a825", CRIT: "#c62828"}
 
 
+FRIENDLY_NAMES = {
+    "cloudflared": "Public tunnel",
+    "tailscaled": "Private network (Tailscale)",
+    "docker_user_port_block": "Firewall rules",
+    "disk_/": "Disk (system)",
+    "disk_/mnt/data": "Disk (bulk storage)",
+    "disk_/mnt/fast": "Disk (fast storage)",
+    "mounts": "Storage mounts",
+    "smart_/dev/sda": "Drive health (sda)",
+    "smart_/dev/sdb": "Drive health (sdb)",
+    "smart_/dev/nvme0n1": "Drive health (NVMe)",
+    "swap": "Swap usage",
+    "cpu_temp": "CPU temperature",
+    "gpu_temp": "GPU temperature",
+    "load_avg": "System load",
+    "ram": "Memory",
+    "power_source": "Power source",
+    "docker_daemon": "Container engine",
+    "coolify_containers": "App platform (Coolify)",
+    "postgres_ready": "Shared database",
+    "systemd_failed": "Background services",
+}
+
+
+def friendly(check_id: str) -> str:
+    return FRIENDLY_NAMES.get(check_id, check_id.replace("_", " "))
+
+
 def render_status_page(results: dict[str, dict], cfg: dict) -> None:
+    # Presentation lives in the static status/index.html + theme.css, which
+    # fetch and render this JSON client-side — this function only ever
+    # needs to write the data.
     STATUS_DIR.mkdir(parents=True, exist_ok=True)
     hostname = socket.gethostname()
     now = datetime.now(timezone.utc)
@@ -187,35 +220,6 @@ def render_status_page(results: dict[str, dict], cfg: dict) -> None:
     for r in results.values():
         if SEVERITY_RANK[r["status"]] > SEVERITY_RANK[overall]:
             overall = r["status"]
-
-    rows = []
-    for check_id, r in sorted(results.items()):
-        color = STATUS_COLORS[r["status"]]
-        rows.append(
-            f'<tr><td><span class="dot" style="background:{color}"></span></td>'
-            f'<td>{check_id}</td><td>{r["status"].upper()}</td>'
-            f'<td>{r["message"]}</td></tr>'
-        )
-
-    html = f"""<!doctype html>
-<html><head><meta charset="utf-8"><title>{hostname} status</title>
-<meta http-equiv="refresh" content="60">
-<style>
-body {{ font-family: -apple-system, sans-serif; background:#111; color:#eee; margin:2rem; }}
-h1 {{ font-size:1.4rem; }}
-.dot {{ display:inline-block; width:12px; height:12px; border-radius:50%; }}
-table {{ border-collapse: collapse; width:100%; margin-top:1rem; }}
-td {{ padding:0.4rem 0.8rem; border-bottom:1px solid #333; font-size:0.9rem; }}
-.meta {{ color:#999; font-size:0.85rem; }}
-</style></head>
-<body>
-<h1><span class="dot" style="background:{STATUS_COLORS[overall]}"></span> {hostname} — {overall.upper()}</h1>
-<div class="meta">uptime: {uptime_str} · last updated: {now.isoformat()} · <a href="/approvals" style="color:#6fb3ff">pending approvals &rarr;</a></div>
-<table>{''.join(rows)}</table>
-</body></html>"""
-
-    (STATUS_DIR / "index.html.tmp").write_text(html)
-    (STATUS_DIR / "index.html.tmp").rename(STATUS_DIR / "index.html")
 
     status_json = {
         "hostname": hostname,
@@ -234,7 +238,7 @@ def maybe_send_heartbeat(state: dict, results: dict, cfg: dict, secrets: dict) -
     now_time = datetime.now().strftime("%H:%M")
     if state.get("last_heartbeat_date") == today or now_time < heartbeat_time:
         return
-    issues = [f"{k}: {v['message']}" for k, v in results.items() if v["status"] != OK]
+    issues = [f"{friendly(k)}: {v['message']}" for k, v in results.items() if v["status"] != OK]
     if issues:
         msg = f"{len(issues)} active issue(s):\n" + "\n".join(issues)
         priority, tags = "default", "warning"
