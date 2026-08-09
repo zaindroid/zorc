@@ -5,14 +5,15 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>servingz — status</title>
 <link rel="stylesheet" href="/theme.css">
+<script src="/effects.js"></script>
 </head>
 <body>
 <div class="wrap">
   <div class="topbar">
-    <a class="brand" href="/"><span class="pip" id="brand-pip"></span> SERVINGZ</a>
+    <a class="brand" href="/"><span class="pip" id="brand-pip"></span> <span id="brand-text">SERVINGZ</span></a>
     <div class="tabs">
-      <a href="/" class="active">Status</a>
-      <a href="/approvals">Approvals</a>
+      <a href="/" class="active" data-scramble>Status</a>
+      <a href="/approvals" data-scramble>Approvals</a>
     </div>
   </div>
 
@@ -69,12 +70,16 @@ function timeAgo(iso) {
   return `${Math.floor(s / 3600)}h ago`;
 }
 
+let lastTitle = null;
+
 async function load() {
+  const titleEl = document.getElementById('hero-title');
   let d;
   try {
     d = await (await fetch('/status.json', { cache: 'no-store' })).json();
   } catch (e) {
-    document.getElementById('hero-title').textContent = "Can't reach the status service";
+    const msg = "Can't reach the status service";
+    if (msg !== lastTitle) { zorcEffects.decodeIn(titleEl, msg); lastTitle = msg; }
     return;
   }
 
@@ -84,10 +89,11 @@ async function load() {
   const checks = Object.entries(d.checks);
   const bad = checks.filter(([, c]) => c.status !== 'ok');
 
-  document.getElementById('hero-title').textContent =
+  const title =
     d.overall === 'ok' ? `${d.hostname} — all systems normal`
     : bad.length === 1 ? `${d.hostname} — 1 thing needs attention`
     : `${d.hostname} — ${bad.length} things need attention`;
+  if (title !== lastTitle) { zorcEffects.decodeIn(titleEl, title); lastTitle = title; }
 
   document.getElementById('hero-sub').innerHTML =
     `up <b>${d.uptime}</b> &middot; checked ${timeAgo(d.last_updated)}`;
@@ -107,17 +113,23 @@ async function load() {
         ${items.map(c => `
           <div class="glass check">
             <div class="check-top">
-              <span class="check-label">${c.label}</span>
+              <span class="check-label" data-scramble>${c.label}</span>
               <span class="badge ${c.status}">${c.status.toUpperCase()}</span>
             </div>
             <div class="check-detail">${c.message}</div>
           </div>`).join('')}
       </div>`;
   }).join('');
+  zorcEffects.wireScrambleHovers(groupsEl);
 
   document.getElementById('footer-meta').textContent =
     `last updated ${new Date(d.last_updated).toLocaleString()}`;
 }
+
+const brandEl = document.getElementById('brand-text');
+zorcEffects.decodeIn(brandEl, 'SERVINGZ', { stagger: 55, dur: 300 });
+zorcEffects.shimmer(brandEl);
+zorcEffects.wireScrambleHovers(document.querySelector('.tabs'));
 
 load();
 setInterval(load, 15000);

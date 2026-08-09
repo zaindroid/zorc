@@ -59,6 +59,15 @@ body {
   background: var(--ok);
   box-shadow: 0 0 10px 2px var(--ok-glow);
 }
+
+/* ---- text effects (scramble / decode / shimmer) ---- */
+.dchar { display: inline-block; }
+.dchar.pulse {
+  text-shadow: 0 0 10px currentColor, 0 0 24px currentColor;
+  color: var(--accent);
+  transition: text-shadow 0.15s ease, color 0.15s ease;
+}
+[data-scramble] { cursor: default; }
 .tabs { display: flex; gap: 0.4rem; }
 .tabs a {
   color: var(--text-dim);

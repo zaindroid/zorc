@@ -56,6 +56,11 @@ def theme_css():
     return Response((STATUS_DIR / "theme.css").read_text(), media_type="text/css")
 
 
+@app.get("/effects.js")
+def effects_js():
+    return Response((STATUS_DIR / "effects.js").read_text(), media_type="application/javascript")
+
+
 @app.get("/api/approvals")
 def list_approvals():
     headers = {
@@ -137,14 +142,15 @@ APPROVALS_HTML = """<!doctype html>
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>servingz — approvals</title>
 <link rel="stylesheet" href="/theme.css">
+<script src="/effects.js"></script>
 </head>
 <body>
 <div class="wrap">
   <div class="topbar">
-    <a class="brand" href="/"><span class="pip" id="brand-pip"></span> SERVINGZ</a>
+    <a class="brand" href="/"><span class="pip" id="brand-pip"></span> <span id="brand-text">SERVINGZ</span></a>
     <div class="tabs">
-      <a href="/">Status</a>
-      <a href="/approvals" class="active">Approvals</a>
+      <a href="/" data-scramble>Status</a>
+      <a href="/approvals" class="active" data-scramble>Approvals</a>
     </div>
   </div>
 
@@ -160,6 +166,11 @@ APPROVALS_HTML = """<!doctype html>
 </div>
 
 <script>
+let lastTitle = null;
+function setTitle(titleEl, text) {
+  if (text !== lastTitle) { zorcEffects.decodeIn(titleEl, text); lastTitle = text; }
+}
+
 async function load() {
   const list = document.getElementById('list');
   const orb = document.getElementById('hero-orb');
@@ -168,26 +179,27 @@ async function load() {
   try {
     items = await (await fetch('/api/approvals', { cache: 'no-store' })).json();
   } catch (e) {
-    title.textContent = "Can't reach the approvals service";
+    setTitle(title, "Can't reach the approvals service");
     orb.className = 'orb crit';
     return;
   }
 
   if (!items.length) {
     orb.className = 'orb ok';
-    title.textContent = 'Nothing waiting on you';
+    setTitle(title, 'Nothing waiting on you');
     list.innerHTML = '<div class="empty">All caught up — new deploys will show up here the moment they pass staging + regression.</div>';
     return;
   }
 
   orb.className = 'orb warn';
-  title.textContent = items.length === 1
+  setTitle(title, items.length === 1
     ? '1 deploy waiting on your review'
-    : `${items.length} deploys waiting on your review`;
+    : `${items.length} deploys waiting on your review`);
 
   // Don't clobber cards mid-decision (buttons disabled) on the poll tick.
   const existing = new Set([...list.querySelectorAll('.card[data-pending]')].map(el => el.id));
   list.innerHTML = items.map(item => renderCard(item, existing)).join('');
+  zorcEffects.wireScrambleHovers(list);
 }
 
 function cardId(item) {
@@ -210,7 +222,7 @@ function renderCard(item, skip) {
 
   return `
     <div class="glass card" id="${cardId(item)}">
-      <h2>${item.app}</h2>
+      <h2 data-scramble>${item.app}</h2>
       <div class="sha">commit ${item.commit || '(unknown)'}</div>
       ${preview}
       <div class="links">${links.join('')}</div>
@@ -240,6 +252,11 @@ async function decide(repo, issue_number, decision, btn) {
     alert('Failed to record decision: ' + e.message);
   }
 }
+
+const brandEl = document.getElementById('brand-text');
+zorcEffects.decodeIn(brandEl, 'SERVINGZ', { stagger: 55, dur: 300 });
+zorcEffects.shimmer(brandEl);
+zorcEffects.wireScrambleHovers(document.querySelector('.tabs'));
 
 load();
 setInterval(load, 10000);
