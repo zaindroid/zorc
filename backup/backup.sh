@@ -57,9 +57,21 @@ sudo tar czf "$WORKDIR/coolify_data.tar.gz" -C /data coolify
 echo "[$TS] archiving cloudflare tunnel credentials..."
 tar czf "$WORKDIR/cloudflared.tar.gz" -C /home/zman/.cloudflared \
   "$(basename "$(ls /home/zman/.cloudflared/*.json)")" config.yml
+echo "[$TS] snapshotting iht-news sqlite db (WAL-safe)..."
+python3 -c "import sqlite3,sys; src=sqlite3.connect(sys.argv[1]); dst=sqlite3.connect(sys.argv[2]); src.backup(dst); dst.close(); src.close()"   /mnt/data/iht-news/data/automation.db "$WORKDIR/iht_news_automation.db"
+gzip "$WORKDIR/iht_news_automation.db"
+
+echo "[$TS] archiving iht-news typesense search index..."
+docker run --rm -v xqs09x5gbtz6evz7szqty7u4_typesense-data:/data -v "$WORKDIR":/backup alpine \
+  tar czf /backup/iht_news_typesense.tar.gz -C /data .
+
+echo "[$TS] archiving iht-news n8n workflows..."
+docker run --rm -v xqs09x5gbtz6evz7szqty7u4_n8n-data:/data -v "$WORKDIR":/backup alpine \
+  tar czf /backup/iht_news_n8n.tar.gz -C /data .
+
 
 ARCHIVE="$WORKDIR/backup_${TS}.tar.gz"
-tar czf "$ARCHIVE" -C "$WORKDIR" app_postgres.sql.gz coolify_postgres.sql.gz coolify_data.tar.gz cloudflared.tar.gz
+tar czf "$ARCHIVE" -C "$WORKDIR" app_postgres.sql.gz coolify_postgres.sql.gz coolify_data.tar.gz cloudflared.tar.gz iht_news_automation.db.gz iht_news_typesense.tar.gz iht_news_n8n.tar.gz
 
 echo "[$TS] encrypting..."
 ENCRYPTED="$STAGING/backup_${TS}.tar.gz.gpg"
