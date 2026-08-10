@@ -450,6 +450,132 @@ def _find_coolify_uuid(name: str) -> str | None:
     return candidates[0]["uuid"] if candidates else None
 
 
+_MEM_UNIT_TO_MB = {"b": 1 / (1024 * 1024), "kib": 1 / 1024, "mib": 1, "gib": 1024, "tib": 1024 * 1024}
+
+
+def _parse_mem_to_mb(s: str) -> float:
+    """docker stats formats sizes like '86.2MiB', '1.2GiB', '512kB'."""
+    m = re.match(r"([\d.]+)\s*([a-zA-Z]+)", s.strip())
+    if not m:
+        return 0.0
+    value, unit = float(m.group(1)), m.group(2).lower().rstrip("b") + "b"
+    return value * _MEM_UNIT_TO_MB.get(unit, 1.0)
+
+
+def _docker_stats() -> list[dict]:
+    """One live snapshot of every running container's CPU/memory."""
+    result = subprocess.run(
+        ["docker", "stats", "--no-stream", "--format", "{{json .}}"],
+        capture_output=True, text=True, timeout=15, check=True,
+    )
+    out = []
+    for line in result.stdout.strip().splitlines():
+        if not line:
+            continue
+        d = json.loads(line)
+        used_str, limit_str = (d.get("MemUsage") or "0 / 0").split(" / ")
+        out.append({
+            "name": d.get("Name", ""),
+            "cpu_percent": float((d.get("CPUPerc") or "0%").rstrip("%") or 0),
+            "mem_used_mb": _parse_mem_to_mb(used_str),
+            "mem_limit_mb": _parse_mem_to_mb(limit_str),
+        })
+    return out
+
+
+def _host_memory_mb() -> tuple[float, float]:
+    """(total, available) in MB. MemAvailable (not MemFree) is the real
+    "could still be used" number -- it already accounts for reclaimable
+    page cache, which MemFree does not."""
+    info = {}
+    for line in Path("/proc/meminfo").read_text().splitlines():
+        parts = line.split()
+        if len(parts) >= 2 and parts[0] in ("MemTotal:", "MemAvailable:"):
+            info[parts[0]] = int(parts[1]) / 1024  # kB -> MB
+    return info.get("MemTotal:", 0.0), info.get("MemAvailable:", 0.0)
+
+
+def app_resources(name: str) -> dict:
+    """Live CPU/memory usage for one app, summed across all of its
+    containers (a coolify-service has several; a coolify app has one)."""
+    mapped = _load_resource_map().get(name, {})
+    kind = mapped.get("kind")
+    if kind == "pages":
+        return {"kind": "pages", "cpu_percent": 0, "mem_used_mb": 0, "containers": 0}
+    coolify_uuid = mapped.get("coolify_uuid") or _find_coolify_uuid(name)
+    if not coolify_uuid:
+        return {"kind": kind, "cpu_percent": 0, "mem_used_mb": 0, "containers": 0}
+    stats = [s for s in _docker_stats() if coolify_uuid in s["name"]]
+    return {
+        "kind": kind,
+        "cpu_percent": round(sum(s["cpu_percent"] for s in stats), 1),
+        "mem_used_mb": round(sum(s["mem_used_mb"] for s in stats), 1),
+        "containers": len(stats),
+    }
+
+
+# Coolify's own platform containers (not apps, not shared infra used by
+# apps) -- grouped as a single "platform" slice rather than one each.
+_PLATFORM_CONTAINER_PREFIXES = (
+    "coolify", "coolify-db", "coolify-redis", "coolify-proxy",
+    "coolify-realtime", "coolify-sentinel",
+)
+
+
+def resource_overview() -> dict:
+    """Host-wide memory picture for the /apps pie chart: total RAM, how
+    much every registered app is actually using right now (not its
+    declared budget -- the real number), a platform slice for Coolify's
+    own containers, and the remainder attributed to the OS/everything else
+    not individually tracked."""
+    stats = _docker_stats()
+    resource_map = _load_resource_map()
+    reg_apps = {a["name"] for a in load_registry().get("apps", [])}
+
+    slices = []
+    attributed_mb = 0.0
+    matched_container_names = set()
+
+    for name in reg_apps:
+        mapped = resource_map.get(name, {})
+        coolify_uuid = mapped.get("coolify_uuid") or _find_coolify_uuid(name)
+        if not coolify_uuid:
+            slices.append({"name": name, "mem_used_mb": 0.0})
+            continue
+        app_stats = [s for s in stats if coolify_uuid in s["name"]]
+        used = sum(s["mem_used_mb"] for s in app_stats)
+        matched_container_names.update(s["name"] for s in app_stats)
+        slices.append({"name": name, "mem_used_mb": round(used, 1)})
+        attributed_mb += used
+
+    platform_stats = [s for s in stats if s["name"] not in matched_container_names
+                       and any(s["name"].startswith(p) for p in _PLATFORM_CONTAINER_PREFIXES)]
+    platform_mb = sum(s["mem_used_mb"] for s in platform_stats)
+    matched_container_names.update(s["name"] for s in platform_stats)
+    slices.append({"name": "platform (Coolify)", "mem_used_mb": round(platform_mb, 1)})
+    attributed_mb += platform_mb
+
+    # Anything running that isn't a registered app or a known platform
+    # container (shared Postgres/Redis, leftover/manual containers, etc.)
+    other_stats = [s for s in stats if s["name"] not in matched_container_names]
+    other_mb = sum(s["mem_used_mb"] for s in other_stats)
+    slices.append({"name": "other containers", "mem_used_mb": round(other_mb, 1)})
+    attributed_mb += other_mb
+
+    total_mb, available_mb = _host_memory_mb()
+    real_used_mb = max(0.0, total_mb - available_mb)  # everything actually in use, containers + OS
+    os_mb = max(0.0, real_used_mb - attributed_mb)
+    slices.append({"name": "OS / system", "mem_used_mb": round(os_mb, 1)})
+    slices.append({"name": "free", "mem_used_mb": round(available_mb, 1)})
+
+    return {
+        "total_mb": round(total_mb, 1),
+        "used_mb": round(real_used_mb, 1),
+        "available_mb": round(available_mb, 1),
+        "slices": [s for s in slices if s["mem_used_mb"] > 0],
+    }
+
+
 def list_apps() -> list[dict]:
     reg = load_registry()
     resource_map = _load_resource_map()
@@ -508,10 +634,12 @@ def app_status(name: str) -> dict:
         overall = "running:healthy" if containers and all(
             str(c["status"]).startswith("running") for c in containers
         ) else "degraded" if any(str(c["status"]).startswith("running") for c in containers) else "exited"
+        usage = app_resources(name)
         return {
             "kind": "coolify-service", "name": name, "coolify_uuid": service_uuid,
             "status": overall, "containers": containers,
             "memory_mb": reg_entry.get("memory_mb", 0),
+            "cpu_percent": usage["cpu_percent"], "mem_used_mb": usage["mem_used_mb"],
         }
 
     coolify_uuid = _find_coolify_uuid(name)
@@ -521,11 +649,13 @@ def app_status(name: str) -> dict:
         r = client.get(f"{COOLIFY_URL}/applications/{coolify_uuid}", headers=_coolify_headers())
         r.raise_for_status()
         app = r.json()
+    usage = app_resources(name)
     return {
         "kind": "coolify", "name": name, "coolify_uuid": coolify_uuid,
         "status": app.get("status", "unknown"),
         "memory_mb": reg_entry.get("memory_mb", 0),
         "fqdn": app.get("fqdn"),
+        "cpu_percent": usage["cpu_percent"], "mem_used_mb": usage["mem_used_mb"],
     }
 
 

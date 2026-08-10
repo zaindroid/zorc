@@ -140,6 +140,11 @@ def api_delete_app(name: str):
         raise HTTPException(404, str(e))
 
 
+@app.get("/api/resources")
+def api_resources():
+    return deploy_agent.resource_overview()
+
+
 @app.get("/api/approvals")
 def list_approvals():
     headers = {
@@ -568,6 +573,20 @@ APPS_HTML = """<!doctype html>
   width: 100%; margin-top: 0.5rem; background: rgba(255,255,255,0.04); border: 1px solid var(--border);
   border-radius: 6px; padding: 0.45rem 0.6rem; color: var(--text); font-family: var(--font); font-size: 0.82rem;
 }
+.resource-card { padding: 1.2rem 1.4rem; margin-top: 1rem; display: flex; gap: 1.6rem; align-items: center; flex-wrap: wrap; }
+.pie-wrap { flex: none; display: flex; flex-direction: column; align-items: center; gap: 0.5rem; }
+.pie-chart {
+  width: 140px; height: 140px; border-radius: 50%;
+  box-shadow: 0 0 0 1px var(--border), 0 0 24px rgba(0,0,0,0.3);
+}
+.pie-total { font-size: 0.72rem; color: var(--text-dim); text-align: center; }
+.pie-total b { color: var(--text); font-size: 0.9rem; }
+.legend { flex: 1; min-width: 220px; display: grid; grid-template-columns: repeat(auto-fill, minmax(190px, 1fr)); gap: 0.5rem 1rem; }
+.legend-item { display: flex; align-items: center; gap: 0.5rem; font-size: 0.78rem; }
+.legend-swatch { width: 10px; height: 10px; border-radius: 3px; flex: none; }
+.legend-name { color: var(--text); flex: 1; }
+.legend-value { color: var(--text-dim); font-variant-numeric: tabular-nums; }
+.app-cpu-mem { display: inline-flex; gap: 0.7rem; margin-left: 0.6rem; color: var(--text-dim); font-size: 0.76rem; }
 </style>
 </head>
 <body>
@@ -590,6 +609,14 @@ APPS_HTML = """<!doctype html>
     </div>
   </div>
 
+  <div class="glass resource-card" id="resource-card">
+    <div class="pie-wrap">
+      <div class="pie-chart" id="pie-chart"></div>
+      <div class="pie-total" id="pie-total">Loading&hellip;</div>
+    </div>
+    <div class="legend" id="legend"></div>
+  </div>
+
   <div id="list"></div>
 </div>
 
@@ -609,6 +636,47 @@ async function load() {
   }
   list.innerHTML = apps.map(renderCard).join('');
   zorcEffects.wireScrambleHovers(list);
+}
+
+const PIE_COLORS = ['#5eb1ff', '#2fe6b8', '#ffb454', '#ff5c72', '#c792ea', '#7fdbff', '#f78fb3', '#82b366'];
+
+function fmtMb(mb) {
+  return mb >= 1024 ? `${(mb / 1024).toFixed(1)} GB` : `${Math.round(mb)} MB`;
+}
+
+async function loadResources() {
+  const pie = document.getElementById('pie-chart');
+  const total = document.getElementById('pie-total');
+  const legend = document.getElementById('legend');
+  let r;
+  try {
+    r = await (await fetch('/api/resources', { cache: 'no-store' })).json();
+  } catch (e) {
+    total.textContent = 'Failed to load.';
+    return;
+  }
+  const slices = r.slices.filter(s => s.mem_used_mb > 0);
+  let angle = 0;
+  const stops = slices.map((s, i) => {
+    const pct = (s.mem_used_mb / r.total_mb) * 100;
+    const color = s.name === 'free' ? 'rgba(255,255,255,0.06)' : PIE_COLORS[i % PIE_COLORS.length];
+    const start = angle;
+    angle += pct;
+    return `${color} ${start.toFixed(2)}% ${angle.toFixed(2)}%`;
+  });
+  pie.style.background = `conic-gradient(${stops.join(', ')})`;
+  total.innerHTML = `<b>${fmtMb(r.used_mb)}</b> used of ${fmtMb(r.total_mb)}`;
+
+  legend.innerHTML = slices.map((s, i) => {
+    const color = s.name === 'free' ? 'rgba(255,255,255,0.15)' : PIE_COLORS[i % PIE_COLORS.length];
+    return `
+      <div class="legend-item">
+        <span class="legend-swatch" style="background:${color}"></span>
+        <span class="legend-name" data-scramble>${s.name}</span>
+        <span class="legend-value">${fmtMb(s.mem_used_mb)}</span>
+      </div>`;
+  }).join('');
+  zorcEffects.wireScrambleHovers(legend);
 }
 
 function renderCard(a) {
@@ -660,7 +728,8 @@ async function loadStatus(name) {
   const badgeClass = badgeOf(s.status);
   let statusHtml = `<span class="badge ${badgeClass}">${(s.status || 'unknown').toUpperCase()}</span>` +
     (s.fqdn ? ` <a href="${s.fqdn}" target="_blank">${s.fqdn}</a>` : '') +
-    (s.url ? ` <a href="${s.url}" target="_blank">${s.url}</a>` : '');
+    (s.url ? ` <a href="${s.url}" target="_blank">${s.url}</a>` : '') +
+    (s.mem_used_mb !== undefined ? ` <span class="app-cpu-mem"><span>${fmtMb(s.mem_used_mb)} RAM</span><span>${s.cpu_percent}% CPU</span></span>` : '');
   if (s.containers && s.containers.length) {
     statusHtml += '<div style="margin-top:0.5rem; display:flex; flex-direction:column; gap:0.3rem;">' +
       s.containers.map(c => `<div><span class="badge ${badgeOf(c.status)}" style="font-size:0.58rem">${c.status.toUpperCase()}</span> ${c.name}</div>`).join('') +
@@ -733,7 +802,8 @@ zorcEffects.shimmer(brandEl);
 zorcEffects.wireScrambleHovers(document.querySelector('.tabs'));
 
 load();
-setInterval(() => { load(); openCards.forEach(loadStatus); }, 15000);
+loadResources();
+setInterval(() => { load(); loadResources(); openCards.forEach(loadStatus); }, 15000);
 </script>
 </body>
 </html>"""
