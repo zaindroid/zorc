@@ -655,18 +655,25 @@ async function loadStatus(name) {
     statusEl.textContent = 'Failed to load status.';
     return;
   }
-  const badgeClass = (s.status || '').startsWith('running') || s.status === 'success' ? 'ok'
-    : (s.status || '').startsWith('exited') || s.status === 'failure' ? 'crit' : 'warn';
-  statusEl.innerHTML = `<span class="badge ${badgeClass}">${(s.status || 'unknown').toUpperCase()}</span>` +
+  const badgeOf = (st) => (st || '').startsWith('running') || st === 'success' ? 'ok'
+    : (st || '').startsWith('exited') || st === 'failure' ? 'crit' : 'warn';
+  const badgeClass = badgeOf(s.status);
+  let statusHtml = `<span class="badge ${badgeClass}">${(s.status || 'unknown').toUpperCase()}</span>` +
     (s.fqdn ? ` <a href="${s.fqdn}" target="_blank">${s.fqdn}</a>` : '') +
     (s.url ? ` <a href="${s.url}" target="_blank">${s.url}</a>` : '');
+  if (s.containers && s.containers.length) {
+    statusHtml += '<div style="margin-top:0.5rem; display:flex; flex-direction:column; gap:0.3rem;">' +
+      s.containers.map(c => `<div><span class="badge ${badgeOf(c.status)}" style="font-size:0.58rem">${c.status.toUpperCase()}</span> ${c.name}</div>`).join('') +
+      '</div>';
+  }
+  statusEl.innerHTML = statusHtml;
 
   const buttons = [];
-  if (s.kind === 'coolify') {
+  if (s.kind === 'coolify' || s.kind === 'coolify-service') {
     buttons.push(`<button onclick="doAction('${name}','start')">Start</button>`);
     buttons.push(`<button onclick="doAction('${name}','stop')">Stop</button>`);
     buttons.push(`<button onclick="doAction('${name}','restart')">Restart</button>`);
-    buttons.push(`<button onclick="toggleLogs('${name}')">Logs</button>`);
+    if (s.kind === 'coolify') buttons.push(`<button onclick="toggleLogs('${name}')">Logs</button>`);
   }
   buttons.push(`<button class="danger" onclick="openConfirm('${name}')">Delete</button>`);
   actionsEl.innerHTML = buttons.join('');

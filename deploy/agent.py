@@ -37,10 +37,15 @@ def _load_resource_map() -> dict:
     return {}
 
 
-def record_resource(name: str, *, kind: str, coolify_uuid: str | None = None) -> None:
-    """kind: 'coolify' or 'pages'."""
+def record_resource(name: str, *, kind: str, coolify_uuid: str | None = None,
+                     domains: list[str] | None = None) -> None:
+    """kind: 'coolify' | 'coolify-service' | 'pages'. domains is only
+    needed for 'coolify-service' -- a docker-compose stack can expose
+    several subdomains that don't derive from `name` the way a normal
+    app's single hostname does, so delete_app needs them listed explicitly
+    to clean DNS up properly."""
     m = _load_resource_map()
-    m[name] = {"kind": kind, "coolify_uuid": coolify_uuid}
+    m[name] = {"kind": kind, "coolify_uuid": coolify_uuid, "domains": domains or []}
     RESOURCE_MAP_PATH.write_text(json.dumps(m, indent=2))
 
 # Stable platform config (not secrets) -- servingz's one Coolify server, the
@@ -485,6 +490,30 @@ def app_status(name: str) -> dict:
             "memory_mb": 0,
         }
 
+    if kind == "coolify-service":
+        # A docker-compose stack -- Coolify decomposes it into "service
+        # applications" and "service databases", each with their own
+        # status. No single running/stopped flag for the whole thing;
+        # report the worst-case status across containers plus the list.
+        service_uuid = _load_resource_map().get(name, {}).get("coolify_uuid")
+        if not service_uuid:
+            return {"kind": "coolify-service", "name": name, "status": "not_found",
+                    "memory_mb": reg_entry.get("memory_mb", 0)}
+        with httpx.Client(timeout=15) as client:
+            r = client.get(f"{COOLIFY_URL}/services/{service_uuid}", headers=_coolify_headers())
+            r.raise_for_status()
+            svc = r.json()
+        containers = [{"name": a.get("name"), "status": a.get("status", "unknown")}
+                      for a in svc.get("applications", []) + svc.get("databases", [])]
+        overall = "running:healthy" if containers and all(
+            str(c["status"]).startswith("running") for c in containers
+        ) else "degraded" if any(str(c["status"]).startswith("running") for c in containers) else "exited"
+        return {
+            "kind": "coolify-service", "name": name, "coolify_uuid": service_uuid,
+            "status": overall, "containers": containers,
+            "memory_mb": reg_entry.get("memory_mb", 0),
+        }
+
     coolify_uuid = _find_coolify_uuid(name)
     if not coolify_uuid:
         return {"kind": "coolify", "name": name, "status": "not_found", "memory_mb": reg_entry.get("memory_mb", 0)}
@@ -501,6 +530,11 @@ def app_status(name: str) -> dict:
 
 
 def app_logs(name: str, lines: int = 200) -> str:
+    kind = _load_resource_map().get(name, {}).get("kind")
+    if kind == "coolify-service":
+        return ("(this is a multi-container service -- open it in Coolify directly "
+                "to see per-container logs, e.g. wordpress/db/typesense/n8n each "
+                "have their own log stream)")
     coolify_uuid = _find_coolify_uuid(name)
     if not coolify_uuid:
         return "(no Coolify resource found -- static/Pages apps don't have server logs here; check the Cloudflare Pages dashboard)"
@@ -514,10 +548,19 @@ def app_logs(name: str, lines: int = 200) -> str:
 
 
 def app_action(name: str, action: str) -> dict:
-    """action: start | stop | restart. Coolify apps only -- Pages has no
-    such concept (it's not a running process)."""
+    """action: start | stop | restart. Coolify apps/services only -- Pages
+    has no such concept (it's not a running process)."""
     if action not in ("start", "stop", "restart"):
         raise ValueError(f"unknown action {action!r}")
+    kind = _load_resource_map().get(name, {}).get("kind")
+    if kind == "coolify-service":
+        service_uuid = _load_resource_map().get(name, {}).get("coolify_uuid")
+        if not service_uuid:
+            raise ValueError(f"no Coolify service found for {name}")
+        with httpx.Client(timeout=30) as client:
+            r = client.post(f"{COOLIFY_URL}/services/{service_uuid}/{action}", headers=_coolify_headers())
+            r.raise_for_status()
+            return r.json()
     coolify_uuid = _find_coolify_uuid(name)
     if not coolify_uuid:
         raise ValueError(f"no Coolify resource found for {name} (static sites can't be start/stopped)")
@@ -553,9 +596,42 @@ def delete_app(name: str) -> dict:
     reg_entry = next((a for a in load_registry().get("apps", []) if a["name"] == name), None)
     if not reg_entry:
         raise ValueError(f"{name} is not registered")
-    kind = _load_resource_map().get(name, {}).get("kind") or \
-        ("pages" if reg_entry.get("target") == "pages" else "coolify")
+    mapped = _load_resource_map().get(name, {})
+    kind = mapped.get("kind") or ("pages" if reg_entry.get("target") == "pages" else "coolify")
     hostname = f"{name}.{PLATFORM_ROOT_DOMAIN}"
+
+    if kind == "coolify-service":
+        service_uuid = mapped.get("coolify_uuid")
+        if service_uuid:
+            with httpx.Client(timeout=30) as client:
+                r = client.delete(f"{COOLIFY_URL}/services/{service_uuid}", headers=_coolify_headers())
+                if r.status_code not in (200, 404):
+                    r.raise_for_status()
+        domains = mapped.get("domains") or []
+        repo_config_path = ZORC_DIR / "cloudflared" / "config.yml"
+        cfg = yaml.safe_load(repo_config_path.read_text())
+        service_hostnames = {f"{d}.{PLATFORM_ROOT_DOMAIN}" for d in domains}
+        cfg["ingress"] = [r_ for r_ in cfg["ingress"] if r_.get("hostname") not in service_hostnames]
+        repo_config_path.write_text(yaml.dump(cfg, sort_keys=False))
+        subprocess.run(["sudo", "cp", str(repo_config_path), "/etc/cloudflared/config.yml"], check=True)
+        subprocess.run(["sudo", "systemctl", "reload-or-restart", "cloudflared"], check=True)
+        with httpx.Client(timeout=15) as client:
+            for d in domains:
+                h = f"{d}.{PLATFORM_ROOT_DOMAIN}"
+                existing = client.get(
+                    f"{CLOUDFLARE_API}/zones/{CLOUDFLARE_ZONE_ID}/dns_records",
+                    headers=_cloudflare_headers(), params={"name": h},
+                )
+                existing.raise_for_status()
+                for rec in existing.json()["result"]:
+                    client.delete(f"{CLOUDFLARE_API}/zones/{CLOUDFLARE_ZONE_ID}/dns_records/{rec['id']}",
+                                   headers=_cloudflare_headers())
+        m = _load_resource_map()
+        m.pop(name, None)
+        RESOURCE_MAP_PATH.write_text(json.dumps(m, indent=2))
+        remove_registry_entry(name)
+        git_commit_and_push(f"registry: remove {name} (deleted via deploy agent)")
+        return {"deleted": name, "kind": kind}
 
     if kind == "pages":
         with httpx.Client(timeout=20) as client:

@@ -1,0 +1,16 @@
+{
+  "iht-news": {
+    "kind": "coolify",
+    "coolify_uuid": "q14jqq3q4i4laj82m54rvkf9",
+    "domains": []
+  },
+  "iht-news-backend": {
+    "kind": "coolify-service",
+    "coolify_uuid": "xqs09x5gbtz6evz7szqty7u4",
+    "domains": [
+      "iht-cms",
+      "iht-search",
+      "iht-automations"
+    ]
+  }
+}
