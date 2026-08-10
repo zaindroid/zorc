@@ -10,10 +10,15 @@ import logging
 import os
 import shutil
 import subprocess
+import sys
+from pathlib import Path
 
 log = logging.getLogger("watchdog.checks")
 
 OK, WARN, CRIT = "ok", "warn", "crit"
+
+sys.path.insert(0, str(Path(__file__).parent.parent / "deploy"))
+import agent as deploy_agent  # noqa: E402
 
 
 def _run(cmd: list[str], timeout: int = 10) -> tuple[int, str, str]:
@@ -336,3 +341,29 @@ def gather_node_info(cfg: dict, gpu_check_result: dict, cpu_check_result: dict) 
         "capabilities": cfg["node"]["capabilities"],
         "labels": cfg["node"]["labels"],
     }
+
+
+def app_memory_pressure(name: str, memory_mb_limit: int, cfg: dict) -> dict:
+    """Live memory usage of a registered app against its declared Coolify
+    limit. Alert-only by design -- there's no auto-scale lever on this
+    platform (Coolify only supports replica scaling in Swarm mode, which
+    this host doesn't use), so this exists to tell a human when an app
+    needs attention, not to act on its own.
+    """
+    if memory_mb_limit <= 0:
+        return {"status": OK, "value": 0, "message": f"{name}: no memory limit declared (static site)"}
+    warn_pct = cfg["thresholds"].get("app_memory_warn_pct", 80)
+    crit_pct = cfg["thresholds"].get("app_memory_crit_pct", 95)
+    try:
+        usage = deploy_agent.app_resources(name)
+    except Exception as e:
+        return {"status": OK, "value": None, "message": f"{name}: could not read live usage ({e})"}
+    used_mb = usage.get("mem_used_mb", 0)
+    pct = round(100 * used_mb / memory_mb_limit, 1) if memory_mb_limit else 0
+    msg = f"{name}: {pct}% of {memory_mb_limit}MB limit ({used_mb}MB used, {usage.get('containers', 0)} container(s))"
+    # Note: sustain logic is applied by watchdog.py, same as cpu_temp -- here
+    # over-warn is reported as warn (raw), watchdog.py escalates to crit once
+    # sustained for app_memory_sustained_cycles consecutive cycles.
+    if pct >= warn_pct:
+        return {"status": WARN, "value": pct, "message": msg, "raw_over_crit": pct >= crit_pct}
+    return {"status": OK, "value": pct, "message": msg, "raw_over_crit": False}

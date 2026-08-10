@@ -157,6 +157,11 @@ def run_all_checks(cfg: dict) -> dict[str, dict]:
     results["mounts"] = checks.mounts(cfg)
     results["docker_user_port_block"] = checks.docker_user_port_block(cfg)
 
+    for app in checks.deploy_agent.list_apps():
+        results[f"app_mem_{app['name']}"] = checks.app_memory_pressure(
+            app["name"], app["memory_mb"], cfg
+        )
+
     return results, cpu, gpu, la
 
 
@@ -264,6 +269,11 @@ def main() -> int:
                   cfg["thresholds"]["cpu_temp_crit_sustained_cycles"], CRIT)
     apply_sustain(state, results, "load_avg", la.get("raw_over", False),
                   cfg["thresholds"]["load_avg_sustained_cycles"], WARN)
+
+    for check_id, result in list(results.items()):
+        if check_id.startswith("app_mem_"):
+            apply_sustain(state, results, check_id, result.get("raw_over_crit", False),
+                          cfg["thresholds"]["app_memory_sustained_cycles"], CRIT)
 
     for check_id, result in results.items():
         handle_state_change(check_id, result, state, secrets)

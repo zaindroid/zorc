@@ -11,7 +11,10 @@
     "disk_crit_pct": 92,
     "ram_available_warn_pct": 15,
     "swap_used_warn_pct": 50,
-    "load_avg_sustained_cycles": 10
+    "load_avg_sustained_cycles": 10,
+    "app_memory_warn_pct": 80,
+    "app_memory_crit_pct": 95,
+    "app_memory_sustained_cycles": 5
   },
   "disks": {
     "/": "sda (root, SATA SSD)",
