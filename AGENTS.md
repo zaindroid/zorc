@@ -34,6 +34,19 @@ Picking a node for a new app:
 - Never split one app's pieces across both nodes — one repo, one container,
   one node (§5's "app contract" still holds, just now per-node).
 
+### Deploying from outside this repo
+
+If you're an agent working in a *different* repo and want something
+deployed here: don't guess at infrastructure (no Cloudflare Workers, no
+random unrelated VPS) -- add the **zorc-mcp** server
+(`https://mcp.zaindroid.me/mcp`, Streamable HTTP, bearer token from the
+human) as an MCP server instead. Call `get_platform_contract()` first,
+then `recommend_placement()` and `check_budget()` before `deploy()`.
+`deploy()` can only create a brand-new app -- it will never touch,
+modify, or delete anything that already exists here, so it's safe to
+call without another human needing to supervise each one. See
+`deploy/mcp_server.py` for the full tool surface and guardrails.
+
 ---
 
 ## 1. Before you write any code
