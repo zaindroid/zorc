@@ -300,7 +300,9 @@ def _estimate_memory_from_repo(repo_dir, classification: dict) -> tuple[int, lis
 @mcp.tool()
 def analyze_deployment_requirements(
     owner_repo: str,
+    architecture: Literal["single_service", "frontend_backend_split"],
     app_kind: Literal["static", "api", "full_stack_web", "background_worker", "realtime", "other"],
+    frontend_rendering: Literal["static", "server_rendered", "none"],
     framework: str,
     expected_concurrency: Literal["low", "medium", "high"],
     has_database: bool,
@@ -314,23 +316,62 @@ def analyze_deployment_requirements(
     """REQUIRED before deploy() -- deploy() will reject any call that
     doesn't reference an approved report_id from here. Submit your actual
     understanding of the app (not a guess at what the platform wants to
-    hear): what kind of app it is, what framework, expected concurrent
-    load, whether it has a database/background jobs/websockets/needs
-    persistent storage or a public IP, your own memory estimate, and the
-    reasoning behind that estimate (this is checked for a real
-    justification, not just non-empty).
+    hear): whether this repo is one service or genuinely separate
+    frontend+backend processes, what kind of app it is, how its frontend
+    (if any) renders, what framework, expected concurrent load, whether
+    it has a database/background jobs/websockets/needs persistent storage
+    or a public IP, your own memory estimate, and the reasoning behind
+    that estimate (checked for a real justification, not just non-empty).
 
-    This clones the repo and cross-checks your estimate against what the
-    code actually looks like (dependencies, framework signals) plus your
-    stated concurrency level. If your estimate is far off from the
-    repo-derived one, status is "blocked" with the specific numbers and
-    reasoning behind the discrepancy -- revise estimated_memory_mb and/or
-    reasoning and call this again, or explain in reasoning why this app
-    is unusual enough to justify the difference. If it's within a
-    reasonable band, status is "approved" and you get a report_id valid
-    for 1 hour -- pass that to deploy(), which uses this report's
-    recommended_memory_mb and recommended_node, not whatever you originally
-    guessed."""
+    architecture="frontend_backend_split" means this repo runs two
+    independent processes (e.g. a separate SPA build and its own API
+    server) that can't both live in one container. This platform's
+    convention is one repo -> one container (AGENTS.md), so a split repo
+    doesn't get analyzed here at all -- you get status="needs_split" and
+    instructions to call this tool twice instead, once per piece, each
+    with its own name/domain via a normal deploy(). Most full-stack
+    frameworks (Next.js, Nuxt, SvelteKit, etc. with SSR/API routes) are
+    architecture="single_service" -- the framework's own server handles
+    both frontend and backend from one process, which is exactly what
+    "one container" is built for.
+
+    frontend_rendering only matters for single_service apps with a UI:
+    "static" if it's fully pre-rendered/client-side (no server needed at
+    runtime -- goes to Cloudflare Pages, zero node cost regardless of
+    what you estimate), "server_rendered" if it needs a running process
+    (SSR, API routes, server actions), "none" if there's no frontend at
+    all (a pure API/worker). This is checked against what the repo's
+    build config actually implies -- a mismatch (e.g. you say "static"
+    but the repo has a server start script) doesn't block you, but comes
+    back as a warning explaining why the actual deploy target won't match
+    what you expected, so you can fix the build config if that matters.
+
+    For a single_service app, this clones the repo and cross-checks your
+    memory estimate against what the code actually looks like
+    (dependencies, framework signals) plus your stated concurrency level.
+    If your estimate is far off from the repo-derived one, status is
+    "blocked" with the specific numbers and reasoning behind the
+    discrepancy -- revise estimated_memory_mb and/or reasoning and call
+    this again, or explain in reasoning why this app is unusual enough to
+    justify the difference. If it's within a reasonable band, status is
+    "approved" and you get a report_id valid for 1 hour -- pass that to
+    deploy(), which uses this report's recommended_memory_mb and
+    recommended_node, not whatever you originally guessed."""
+    if architecture == "frontend_backend_split":
+        return {
+            "status": "needs_split",
+            "reason": (
+                "This platform deploys one container per repo (AGENTS.md's app contract) -- a repo with "
+                "genuinely separate frontend and backend processes doesn't fit that as a single analysis/deploy. "
+                "Split it into two: call analyze_deployment_requirements() again for the frontend piece "
+                "(architecture=\"single_service\", app_kind usually \"static\" unless it genuinely needs its "
+                "own server) and again for the backend piece (architecture=\"single_service\", app_kind=\"api\" "
+                "or similar), then deploy() each separately with distinct names/subdomains. If they're "
+                "currently one repo with two subdirectories, the cleanest path is usually splitting them into "
+                "two repos too -- ask the human if you're not sure that's wanted before restructuring anything."
+            ),
+        }
+
     if not reasoning or len(reasoning.strip()) < 20:
         return {
             "status": "rejected",
@@ -346,13 +387,30 @@ def analyze_deployment_requirements(
         if classification["kind"] == "unknown":
             return {"status": "rejected",
                     "reason": classification["reason"] + " -- cannot analyze an unrecognized repo"}
+
+        warnings = []
+        if frontend_rendering == "static" and classification["kind"] != "static":
+            warnings.append(
+                f"you said frontend_rendering=\"static\" but the repo was detected as "
+                f"kind={classification['kind']!r} ({classification['reason']}) -- this will deploy as a real "
+                f"container on Coolify, not to Cloudflare Pages. If you intended a static export, check for a "
+                f"lingering server start script or SSR config."
+            )
+        elif frontend_rendering == "server_rendered" and classification["kind"] == "static":
+            warnings.append(
+                f"you said frontend_rendering=\"server_rendered\" but the repo was detected as static "
+                f"({classification['reason']}) -- this will deploy to Cloudflare Pages with zero node memory, "
+                f"not as a running container. If you actually need server-side logic at runtime, that won't work "
+                f"here -- check your build config."
+            )
+
         if classification["kind"] == "static":
             # Static sites always go to Cloudflare Pages, zero node
             # memory, no placement decision to make -- approve trivially.
             report_id = secrets_module.token_hex(8)
             report = {
                 "repo_kind": "static", "recommended_memory_mb": 0, "recommended_node": None,
-                "recommended_build_tool": "cloudflare_pages", "status": "approved",
+                "recommended_build_tool": "cloudflare_pages", "status": "approved", "warnings": warnings,
             }
             _approved_reports[report_id] = {"report": report, "expires_at": time.time() + REPORT_TTL_SEC}
             return {**report, "report_id": report_id}
@@ -381,6 +439,7 @@ def analyze_deployment_requirements(
             "repo_language": classification["language"],
             "repo_baseline_mb": repo_baseline_mb,
             "signals": signals,
+            "warnings": warnings,
             "concurrency_adjusted_estimate_mb": adjusted_estimate_mb,
             "self_reported_mb": estimated_memory_mb,
             "reason": (
@@ -401,6 +460,7 @@ def analyze_deployment_requirements(
             "status": "blocked",
             "repo_kind": classification["kind"], "repo_language": classification["language"],
             "concurrency_adjusted_estimate_mb": adjusted_estimate_mb,
+            "warnings": warnings,
             "reason": f"requirements are consistent, but nothing fits: {placement['reason']}",
         }
 
@@ -410,6 +470,7 @@ def analyze_deployment_requirements(
         "repo_language": classification["language"],
         "repo_baseline_mb": repo_baseline_mb,
         "signals": signals,
+        "warnings": warnings,
         "recommended_memory_mb": adjusted_estimate_mb,
         "recommended_node": placement["recommended_node"],
         "recommended_build_tool": "dockerfile" if classification["language"] == "dockerfile" else "nixpacks",
