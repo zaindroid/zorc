@@ -29,31 +29,47 @@ def main(path):
         reg = yaml.safe_load(f)
 
     errors = 0
-    node = reg["node"]
+    nodes = reg["nodes"]
     apps = reg.get("apps") or []
     infra = reg.get("infrastructure") or []
 
-    # ---- budget -----------------------------------------------------------
-    ceiling = node["usable_mb"] * node["max_utilisation"]
-    app_total = sum(a.get("memory_mb", 0) for a in apps)
+    # ---- budget, per node ---------------------------------------------------
+    # Each app's target names exactly one node (or "pages", the zero-memory
+    # static-site edge target, which isn't in `nodes` at all). Budget is
+    # independent per node -- an app on hostinger-vps never affects
+    # servingz's headroom and vice versa.
+    for node_name, node in nodes.items():
+        node_apps = [a for a in apps if a.get("target") == node_name]
+        ceiling = node["usable_mb"] * node["max_utilisation"]
+        app_total = sum(a.get("memory_mb", 0) for a in node_apps)
 
-    print(f"node          {node['name']}")
-    print(f"usable        {node['usable_mb']} MB")
-    print(f"ceiling       {ceiling:.0f} MB  ({node['max_utilisation']:.0%})")
-    print(f"allocated     {app_total} MB across {len(apps)} apps")
-    print(f"headroom      {ceiling - app_total:.0f} MB")
-    print()
+        print(f"node          {node_name}")
+        print(f"usable        {node['usable_mb']} MB")
+        print(f"ceiling       {ceiling:.0f} MB  ({node['max_utilisation']:.0%})")
+        print(f"allocated     {app_total} MB across {len(node_apps)} apps")
+        print(f"headroom      {ceiling - app_total:.0f} MB")
+        print()
 
-    if app_total > ceiling:
-        errors += fail(
-            f"over budget by {app_total - ceiling:.0f} MB. "
-            "Reduce an app's footprint, retire something, or add a node. "
-            "Do NOT raise max_utilisation."
-        )
+        if app_total > ceiling:
+            errors += fail(
+                f"{node_name}: over budget by {app_total - ceiling:.0f} MB. "
+                "Reduce an app's footprint, retire something, or use the other node. "
+                "Do NOT raise max_utilisation."
+            )
 
-    # Warn before it becomes a problem.
-    if ceiling * 0.85 < app_total <= ceiling:
-        print(f"WARN  at {app_total / ceiling:.0%} of ceiling — plan the next node.\n")
+        # Warn before it becomes a problem.
+        if ceiling * 0.85 < app_total <= ceiling:
+            print(f"WARN  {node_name} at {app_total / ceiling:.0%} of ceiling — plan ahead.\n")
+
+    # Every app must target a real node or "pages" -- not e.g. a typo or a
+    # retired node name that would otherwise silently skip budget checking.
+    valid_targets = set(nodes.keys()) | {"pages"}
+    for a in apps:
+        if a.get("target") not in valid_targets:
+            errors += fail(
+                f"{a['name']}: target={a.get('target')!r} is not a known node "
+                f"(valid: {sorted(valid_targets)})"
+            )
 
     # ---- collisions -------------------------------------------------------
     def dupes(values):
@@ -87,16 +103,18 @@ def main(path):
     for a in apps:
         if a.get("target") == "pages" and a.get("memory_mb", 0) != 0:
             errors += fail(f"{a['name']}: target=pages must declare memory_mb: 0")
-        if a.get("target") == "node" and a.get("memory_mb", 0) == 0:
-            errors += fail(f"{a['name']}: target=node must declare a memory limit")
+        if a.get("target") in nodes and a.get("memory_mb", 0) == 0:
+            errors += fail(f"{a['name']}: target={a['target']!r} must declare a memory limit")
         if a.get("memory_mb", 0) > 1024:
             print(f"WARN  {a['name']} requests {a['memory_mb']} MB — justify in the PR")
 
+    # Shared infrastructure (Postgres/Redis/Traefik) only runs on servingz --
+    # see registry.yaml's own comment above the infrastructure block.
     infra_total = sum(i.get("memory_mb", 0) for i in infra)
-    if infra_total > node["reserved_mb"]:
+    if infra_total > nodes["servingz"]["reserved_mb"]:
         errors += fail(
             f"infrastructure declares {infra_total} MB but only "
-            f"{node['reserved_mb']} MB is reserved"
+            f"{nodes['servingz']['reserved_mb']} MB is reserved on servingz"
         )
 
     print()

@@ -1,0 +1,27 @@
+node: hostinger-vps
+public_ip: 2.25.105.110
+arch: x86_64
+accelerator: null
+cpu:
+  model: AMD EPYC 9354P 32-Core Processor
+  cores: 2
+  threads: 2
+ram_mb: 7987
+power:
+  source: ac
+  on_battery: false
+capabilities:
+- docker
+- coolify-managed
+- public-ip
+- x86
+labels:
+- hostinger
+- registered-manually
+status: online
+last_seen: '2026-08-13T05:05:00+00:00'
+note: >
+  Registered manually via SSH inspection + Coolify server API
+  (2026-08-13), not yet wired into zorc-watchdog's periodic
+  self-registration -- unlike servingz.yaml, this file will go stale until
+  a remote-poll or self-registering agent is added for this node.

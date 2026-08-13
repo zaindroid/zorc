@@ -5,12 +5,29 @@
 #
 # Adding an app = a PR against this file. That PR is the approval gate.
 
-node:
-  name: servingz
-  total_memory_mb: 32000
-  reserved_mb: 4500
-  usable_mb: 27500
-  max_utilisation: 0.80      # never allocate beyond 22000 MB
+# Every node the platform can deploy to. Each app's `target:` below must
+# name one of these keys (or the literal "pages" for the static-site edge
+# target, which isn't a node at all). Budget is enforced separately PER
+# NODE — an app on hostinger-vps has zero effect on servingz's headroom.
+nodes:
+  servingz:
+    total_memory_mb: 32000
+    reserved_mb: 4500        # platform + Postgres + Redis + Traefik + OS
+    usable_mb: 27500
+    max_utilisation: 0.80    # never allocate beyond 22000 MB
+    server_uuid: ynlpfb7qft2ld6a0coagy5nm   # Coolify server UUID ("localhost")
+    has_public_ip: false     # home network, reachable only via Cloudflare Tunnel
+    provider: self-hosted
+
+  hostinger-vps:
+    total_memory_mb: 7800
+    reserved_mb: 1200        # Docker + Traefik + OS -- no shared Postgres/Redis here
+    usable_mb: 6600
+    max_utilisation: 0.80    # never allocate beyond ~5280 MB
+    server_uuid: tbzuopqpb0hcwx4uheyxqz1t
+    has_public_ip: true      # real public IPv4 -- can take direct ingress
+    ip: 2.25.105.110
+    provider: hostinger
 
 domains:
   root: zaindroid.me
@@ -26,9 +43,10 @@ domains:
 
 # ---------------------------------------------------------------------------
 # Shared infrastructure. Agents must not modify this block.
-# NOT YET PROVISIONED as running services on servingz (see AGENTS.md §2) —
-# these entries reserve budget/naming for when they are. Only Coolify's own
-# internal coolify-db/coolify-redis run today, which apps must not use.
+# Live on servingz only (see AGENTS.md §2) -- hostinger-vps has no shared
+# Postgres/Redis of its own; apps placed there needing either must reach
+# servingz's instances over the internet (not the local Docker network),
+# or ask before assuming that's acceptable for the workload.
 # ---------------------------------------------------------------------------
 infrastructure:
   - name: postgres
@@ -50,7 +68,7 @@ infrastructure:
 # ---------------------------------------------------------------------------
 apps:
   - name: iht-news-backend
-    target: node
+    target: servingz
     memory_mb: 768
     subdomain: iht-search
     database: null
@@ -61,7 +79,7 @@ apps:
     depends_on: []
 
   - name: iht-news
-    target: node
+    target: servingz
     memory_mb: 768
     subdomain: iht-news
     database: null
@@ -72,7 +90,7 @@ apps:
     depends_on: []
 
   - name: hello-app
-    target: node
+    target: servingz
     memory_mb: 256
     subdomain: hello
     database: null

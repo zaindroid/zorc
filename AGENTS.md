@@ -2,19 +2,45 @@
 
 **Read this file completely before writing code, creating files, or deploying.**
 
-This is a multi-app platform. Many services share one host and one set of
-shared infrastructure. Your changes must not degrade services you did not
-write.
+This is a multi-app platform spanning **two nodes**, orchestrated through one
+Coolify instance. Many services share each host and one set of shared
+infrastructure. Your changes must not degrade services you did not write.
 
 If this file conflicts with your instincts, a tutorial you recall, or a pattern
 from another codebase — **this file wins.** If something you need isn't covered,
 stop and ask the human rather than inventing a convention.
 
+### Nodes
+
+| Node | Reach | Public IP | Use for | Shared Postgres/Redis |
+|---|---|---|---|---|
+| **servingz** | home network, via Cloudflare Tunnel only | No | default — most apps | Yes, native Docker network |
+| **hostinger-vps** | direct, real public IPv4 (`2.25.105.110`) | Yes | apps that need direct public ingress, or when servingz is out of headroom | No — reach servingz's over the internet, or ask first |
+
+Both are managed by the **same Coolify instance** (runs on servingz) as two
+Coolify "Servers" — one Coolify project, one API, one dashboard, regardless
+of which node an app actually runs on. `registry.yaml`'s `nodes:` section is
+the source of truth for each node's budget and Coolify `server_uuid`; every
+app's `target:` field names exactly one of those node keys (or `pages` for
+the Cloudflare Pages static-site edge target, which isn't a node at all).
+`deploy/agent.py`'s `deploy()` takes a `target_node` argument to place a new
+app on the node of your choice — defaults to `servingz` if not specified.
+
+Picking a node for a new app:
+- Default to **servingz** unless there's a specific reason not to.
+- Pick **hostinger-vps** when the app needs direct public-IP ingress
+  servingz structurally can't provide (e.g. something that can't sit behind
+  the Cloudflare Tunnel), or when servingz's headroom (§1) doesn't fit it.
+- Never split one app's pieces across both nodes — one repo, one container,
+  one node (§5's "app contract" still holds, just now per-node).
+
 ---
 
 ## 1. Before you write any code
 
-Run these. Every task. No exceptions.
+Run these on **the node you're about to deploy to** — servingz and
+hostinger-vps are separate hosts with separate Docker state, checking one
+tells you nothing about the other. Every task. No exceptions.
 
 ```bash
 docker ps --format '{{.Names}}\t{{.Image}}\t{{.Status}}'   # what is running
@@ -110,15 +136,20 @@ It does not belong on the node. Deploy to the edge platform. Zero node memory.
 **4. Long-running or scheduled work?**
 It's a queue worker, not an HTTP service. No ingress, no subdomain.
 
-**5. Otherwise, a new app.** Check the memory budget *before* writing code:
+**5. Otherwise, a new app.** Decide which node it targets (see "Picking a
+node" above), then check *that node's* budget *before* writing code — the
+two nodes have separate budgets, checking the wrong one tells you nothing:
 
 ```
-sum(memory_mb of all apps) + yours  ≤  (total_ram_mb − 4500) × 0.80
+sum(memory_mb of apps targeting this node) + yours  ≤  (usable_mb − reserved_mb) × max_utilisation
 ```
 
-The 4500 MB covers the platform, Postgres, Redis, Traefik and the OS. If your
-app doesn't fit: **stop and tell the human.** Do not shrink your declared limit
-to squeeze in. Do not raise the utilisation ceiling.
+using that node's numbers from `registry.yaml`'s `nodes:` section (same
+math `scripts/check_budget.py` enforces in CI). `reserved_mb` covers the
+platform, Traefik and the OS on every node, plus Postgres and Redis on
+servingz specifically (they don't run on hostinger-vps). If your app
+doesn't fit on the node you wanted: **stop and tell the human.** Do not
+shrink your declared limit to squeeze in. Do not raise the utilisation ceiling.
 
 **6. Need infrastructure that doesn't exist?** Stop and ask.
 

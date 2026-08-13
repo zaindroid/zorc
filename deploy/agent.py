@@ -48,9 +48,10 @@ def record_resource(name: str, *, kind: str, coolify_uuid: str | None = None,
     m[name] = {"kind": kind, "coolify_uuid": coolify_uuid, "domains": domains or []}
     RESOURCE_MAP_PATH.write_text(json.dumps(m, indent=2))
 
-# Stable platform config (not secrets) -- servingz's one Coolify server, the
-# "labs" project apps live in, its one "production" environment.
-COOLIFY_SERVER_UUID = "ynlpfb7qft2ld6a0coagy5nm"
+# Stable platform config (not secrets) -- the "labs" project every app
+# lives in regardless of which node it's placed on, its one "production"
+# environment. Per-node Coolify server_uuid lives in registry.yaml's
+# `nodes` section (single source of truth) -- see node_config() below.
 COOLIFY_PROJECT_UUID = "p81uewe25gri9vdgtbt4kx7c"
 COOLIFY_ENVIRONMENT_NAME = "production"
 COOLIFY_ENVIRONMENT_UUID = "bn4ub336dd38hhe59qq04xtg"
@@ -88,14 +89,18 @@ def _cloudflare_headers() -> dict:
     return {"Authorization": f"Bearer {_cloudflare_token()}", "Content-Type": "application/json"}
 
 
-def create_dns_record(subdomain: str, target: str | None = None) -> None:
-    """CNAME <subdomain>.zaindroid.me -> target (defaults to the existing
-    tunnel, same pattern every Coolify-routed subdomain already uses).
-    Pages custom domains need their own record pointed at *.pages.dev
-    instead -- Cloudflare does NOT auto-create this even though the zone
-    and the Pages project are on the same account (confirmed against the
-    live API: attaching a custom domain leaves it status=pending with
-    "CNAME record not set" until this exists)."""
+def create_dns_record(subdomain: str, target: str | None = None, record_type: str = "CNAME") -> None:
+    """<subdomain>.zaindroid.me -> target. Defaults to a CNAME at the
+    existing Cloudflare Tunnel, the pattern every servingz-routed
+    subdomain uses (servingz has no public IP, so this is the only way
+    in). A node with a real public IP (has_public_ip: true in registry.yaml)
+    needs record_type="A" with target=that node's IP instead -- a CNAME
+    cannot point at a bare IP address, and there's no tunnel involved.
+    Pages custom domains need their own CNAME pointed at *.pages.dev --
+    Cloudflare does NOT auto-create this even though the zone and the
+    Pages project are on the same account (confirmed against the live
+    API: attaching a custom domain leaves it status=pending with "CNAME
+    record not set" until this exists)."""
     hostname = f"{subdomain}.{PLATFORM_ROOT_DOMAIN}"
     target = target or f"{CLOUDFLARE_TUNNEL_ID}.cfargotunnel.com"
     with httpx.Client(timeout=15) as client:
@@ -110,7 +115,7 @@ def create_dns_record(subdomain: str, target: str | None = None) -> None:
             f"{CLOUDFLARE_API}/zones/{CLOUDFLARE_ZONE_ID}/dns_records",
             headers=_cloudflare_headers(),
             json={
-                "type": "CNAME",
+                "type": record_type,
                 "name": hostname,
                 "content": target,
                 "proxied": True,
@@ -181,11 +186,25 @@ def load_registry() -> dict:
     return yaml.safe_load(REGISTRY_PATH.read_text())
 
 
-def budget_headroom_mb() -> float:
+def node_config(node_name: str) -> dict:
+    """Raises KeyError with the valid options listed if node_name isn't a
+    real node -- callers should let that surface rather than silently
+    falling back to servingz, since a typo'd target is exactly the kind of
+    mistake check_budget.py exists to catch before it reaches deploy()."""
     reg = load_registry()
-    node = reg["node"]
+    nodes = reg["nodes"]
+    if node_name not in nodes:
+        raise KeyError(f"{node_name!r} is not a known node (valid: {sorted(nodes)})")
+    return nodes[node_name]
+
+
+def budget_headroom_mb(node_name: str = "servingz") -> float:
+    reg = load_registry()
+    node = node_config(node_name)
     ceiling = node["usable_mb"] * node["max_utilisation"]
-    allocated = sum(a.get("memory_mb", 0) for a in reg.get("apps", []))
+    allocated = sum(
+        a.get("memory_mb", 0) for a in reg.get("apps", []) if a.get("target") == node_name
+    )
     return ceiling - allocated
 
 
@@ -249,14 +268,14 @@ def classify(repo_dir: Path) -> dict:
             "reason": "no recognizable manifest — needs a human decision"}
 
 
-def check_deploy_budget(name: str, memory_mb: int) -> tuple[bool, str]:
+def check_deploy_budget(name: str, memory_mb: int, node_name: str = "servingz") -> tuple[bool, str]:
     if name_taken(name):
         return False, f"'{name}' is already registered in registry.yaml"
-    headroom = budget_headroom_mb()
+    headroom = budget_headroom_mb(node_name)
     if memory_mb > headroom:
-        return False, (f"needs {memory_mb} MB but only {headroom:.0f} MB of headroom left "
-                        f"— does not fit without retiring something or adding a node")
-    return True, f"fits — {headroom:.0f} MB headroom, {memory_mb} MB requested"
+        return False, (f"needs {memory_mb} MB but only {headroom:.0f} MB of headroom left on "
+                        f"{node_name} — does not fit without retiring something or using the other node")
+    return True, f"fits on {node_name} — {headroom:.0f} MB headroom, {memory_mb} MB requested"
 
 
 def build_pack_for(language: str) -> str:
@@ -264,10 +283,10 @@ def build_pack_for(language: str) -> str:
 
 
 def create_coolify_app(*, name: str, git_repository: str, git_branch: str,
-                        build_pack: str, memory_mb: int, domain: str) -> dict:
+                        build_pack: str, memory_mb: int, domain: str, server_uuid: str) -> dict:
     payload = {
         "project_uuid": COOLIFY_PROJECT_UUID,
-        "server_uuid": COOLIFY_SERVER_UUID,
+        "server_uuid": server_uuid,
         "environment_name": COOLIFY_ENVIRONMENT_NAME,
         "git_repository": git_repository,
         "git_branch": git_branch,
@@ -287,12 +306,13 @@ def create_coolify_app(*, name: str, git_repository: str, git_branch: str,
         return r.json()
 
 
-def register_app(*, name: str, memory_mb: int, subdomain: str, repo: str, target: str = "node",
+def register_app(*, name: str, memory_mb: int, subdomain: str, repo: str, target: str = "servingz",
                   database: bool = False, redis: bool = False, critical: bool = False) -> None:
     """Appends a new entry to registry.yaml and commits it — mirrors what a
     human did by hand for hello-app. target must be "pages" for static
-    sites (memory_mb: 0) or "node" for real apps -- check_budget.py's own
-    sanity rule rejects node+0 or pages+nonzero combinations."""
+    sites (memory_mb: 0) or a real node name from registry.yaml's `nodes`
+    section for real apps -- check_budget.py's own sanity rule rejects
+    node+0 or pages+nonzero combinations, and an unknown target name."""
     if name_taken(name):
         return  # idempotent -- a repeated deploy of the same app shouldn't double-register it
     text = REGISTRY_PATH.read_text()
@@ -350,15 +370,22 @@ class DeployError(Exception):
         super().__init__(f"{step}: {reason}")
 
 
-def deploy(*, owner_repo: str, name: str, git_branch: str = "main") -> dict:
+def deploy(*, owner_repo: str, name: str, git_branch: str = "main", target_node: str = "servingz") -> dict:
     """Full pipeline: clone -> classify -> budget check -> either Cloudflare
     Pages (static) or Coolify (real app), DNS + registration either way.
     Raises DeployError with the exact step and reason on any failure;
     nothing partially-applied is rolled back automatically -- if a later
     step fails, earlier ones (e.g. a created Coolify app) stay in place and
     need manual cleanup. Fine for a single-operator platform; would need
-    real rollback before handing this to more than one person."""
+    real rollback before handing this to more than one person.
+
+    target_node picks which node from registry.yaml's `nodes` section a
+    real app (not a static site -- those always go to Cloudflare Pages
+    regardless of target_node) gets deployed to. Ignored for static sites.
+    Raises KeyError immediately (via node_config) if target_node isn't a
+    real node -- fail before cloning anything, not after."""
     log = []
+    node = node_config(target_node)  # raises KeyError immediately on a bad name
 
     def step(name_, fn, *a, **kw):
         try:
@@ -382,7 +409,7 @@ def deploy(*, owner_repo: str, name: str, git_branch: str = "main") -> dict:
     if classification["kind"] == "unknown":
         raise DeployError("classify", classification["reason"] + " — cannot proceed automatically")
 
-    ok, reason = step("budget_check", check_deploy_budget, name, classification["memory_mb"])
+    ok, reason = step("budget_check", check_deploy_budget, name, classification["memory_mb"], target_node)
     if not ok:
         raise DeployError("budget_check", reason)
 
@@ -411,11 +438,20 @@ def deploy(*, owner_repo: str, name: str, git_branch: str = "main") -> dict:
         "create_coolify_app", create_coolify_app,
         name=name, git_repository=f"https://github.com/{owner_repo}",
         git_branch=git_branch, build_pack=build_pack, memory_mb=memory_mb, domain=domain,
+        server_uuid=node["server_uuid"],
     )
 
-    step("create_dns_record", create_dns_record, name)
-    step("add_tunnel_route", add_tunnel_route, domain)
-    step("register_app", register_app, name=name, memory_mb=memory_mb, subdomain=name, repo=f"github.com/{owner_repo}")
+    # A node with a real public IP is reached directly (A record at its IP,
+    # Coolify's own Traefik terminates TLS there) -- no Cloudflare Tunnel
+    # involved, unlike servingz which has no public IP of its own.
+    if node.get("has_public_ip"):
+        step("create_dns_record", create_dns_record, name, target=node["ip"], record_type="A")
+    else:
+        step("create_dns_record", create_dns_record, name)
+        step("add_tunnel_route", add_tunnel_route, domain)
+
+    step("register_app", register_app, name=name, memory_mb=memory_mb, subdomain=name,
+         repo=f"github.com/{owner_repo}", target=target_node)
     step("record_resource", record_resource, name, kind="coolify", coolify_uuid=coolify_result.get("uuid"))
     step("commit_and_push", git_commit_and_push, f"registry: add {name} (deployed via deploy agent)")
 
@@ -424,9 +460,10 @@ def deploy(*, owner_repo: str, name: str, git_branch: str = "main") -> dict:
         "classification": classification,
         "status": "deployed",
         "domain": domain,
+        "target_node": target_node,
         "coolify_uuid": coolify_result.get("uuid"),
-        "message": f"{name} created in Coolify, routed at https://{domain}, registered in registry.yaml. "
-                    f"First build is running in Coolify now.",
+        "message": f"{name} created in Coolify on {target_node}, routed at https://{domain}, "
+                    f"registered in registry.yaml. First build is running in Coolify now.",
     }
 
 
