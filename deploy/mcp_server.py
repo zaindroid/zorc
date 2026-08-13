@@ -600,10 +600,33 @@ class BearerAuthMiddleware(BaseHTTPMiddleware):
     TokenVerifier expects a full authorization-server flow with client
     registration) -- this is a single static token shared across the
     user's own agents, so a plain ASGI middleware checking one header is
-    the right amount of complexity, not an under-engineered shortcut."""
+    the right amount of complexity, not an under-engineered shortcut.
+
+    Real bug found live: this middleware used to blanket-401 EVERY path
+    that wasn't in PUBLIC_PATHS, including OAuth discovery endpoints
+    (.well-known/oauth-protected-resource, .well-known/oauth-authorization-
+    server, .well-known/openid-configuration) and /register that this
+    server never implements at all. Per the MCP Authorization spec, a
+    client that gets 401 on the first request is *supposed* to probe
+    those to figure out how to authenticate -- getting 401 back (instead
+    of a real 404, since those routes genuinely don't exist here) reads
+    as "OAuth is required but broken" rather than "OAuth isn't offered,
+    fall back to whatever static auth you have," and Claude Code's MCP
+    client stopped sending the configured bearer header entirely after
+    that exchange. Confirmed via this server's own request logs during a
+    real failed connection attempt. Fix: let those specific paths bypass
+    this middleware and fall through to Starlette's normal routing, which
+    404s them correctly since no route is registered for any of them --
+    a real "not supported here" instead of a misleading "unauthorized.\""""
+
+    _OAUTH_DISCOVERY_PREFIXES = ("/.well-known/",)
+    _OAUTH_DISCOVERY_PATHS = {"/register"}
 
     async def dispatch(self, request: Request, call_next):
-        if request.url.path in PUBLIC_PATHS:
+        path = request.url.path
+        if (path in PUBLIC_PATHS
+                or path in self._OAUTH_DISCOVERY_PATHS
+                or path.startswith(self._OAUTH_DISCOVERY_PREFIXES)):
             return await call_next(request)
         expected = f"Bearer {_load_token()}"
         if request.headers.get("authorization", "") != expected:
