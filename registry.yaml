@@ -27,6 +27,7 @@ nodes:
     server_uuid: tbzuopqpb0hcwx4uheyxqz1t
     has_public_ip: true      # real public IPv4 -- can take direct ingress
     ip: 2.25.105.110
+    tailscale_ip: 100.112.175.41   # used for live cross-node resource checks (deploy/agent.py live_headroom_mb)
     provider: hostinger
 
 domains:

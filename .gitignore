@@ -11,3 +11,4 @@ monitoring/state/
 monitoring/logs/
 monitoring/status/status.json*
 monitoring/.venv/
+deploy/mcp_audit.log

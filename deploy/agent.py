@@ -198,6 +198,46 @@ def node_config(node_name: str) -> dict:
     return nodes[node_name]
 
 
+# This file always runs on servingz. Reaching any other node for a live
+# resource check needs its own SSH access -- generated specifically for
+# this (deploy/secrets/hostinger_vps_deploy_key), never a personal key.
+LOCAL_NODE = "servingz"
+REMOTE_DEPLOY_KEY = SECRETS / "hostinger_vps_deploy_key"
+
+
+def _remote_host_memory_mb(tailscale_ip: str) -> tuple[float, float]:
+    """Same as _host_memory_mb() (defined further down) but for a node
+    this process isn't running on, over SSH via the dedicated deploy key."""
+    result = subprocess.run(
+        ["ssh", "-o", "StrictHostKeyChecking=accept-new", "-o", "ConnectTimeout=10",
+         "-i", str(REMOTE_DEPLOY_KEY), f"root@{tailscale_ip}", "cat", "/proc/meminfo"],
+        capture_output=True, text=True, timeout=15, check=True,
+    )
+    info = {}
+    for line in result.stdout.splitlines():
+        parts = line.split()
+        if len(parts) >= 2 and parts[0] in ("MemTotal:", "MemAvailable:"):
+            info[parts[0]] = int(parts[1]) / 1024  # kB -> MB
+    return info.get("MemTotal:", 0.0), info.get("MemAvailable:", 0.0)
+
+
+def live_headroom_mb(node_name: str) -> float:
+    """Real, right-now available memory on the target node -- independent
+    of registry.yaml's static budget, so it catches drift from something
+    already eating memory *right now* that the static number alone can't
+    see. A second, live check used immediately before create_coolify_app,
+    alongside (never instead of) the static budget_headroom_mb() check."""
+    node = node_config(node_name)
+    if node_name == LOCAL_NODE:
+        _, available_mb = _host_memory_mb()
+    else:
+        tailscale_ip = node.get("tailscale_ip")
+        if not tailscale_ip:
+            raise RuntimeError(f"{node_name!r} has no tailscale_ip in registry.yaml -- cannot live-check it")
+        _, available_mb = _remote_host_memory_mb(tailscale_ip)
+    return available_mb
+
+
 def budget_headroom_mb(node_name: str = "servingz") -> float:
     reg = load_registry()
     node = node_config(node_name)
@@ -371,13 +411,18 @@ class DeployError(Exception):
 
 
 def deploy(*, owner_repo: str, name: str, git_branch: str = "main", target_node: str = "servingz") -> dict:
-    """Full pipeline: clone -> classify -> budget check -> either Cloudflare
-    Pages (static) or Coolify (real app), DNS + registration either way.
-    Raises DeployError with the exact step and reason on any failure;
-    nothing partially-applied is rolled back automatically -- if a later
-    step fails, earlier ones (e.g. a created Coolify app) stay in place and
-    need manual cleanup. Fine for a single-operator platform; would need
-    real rollback before handing this to more than one person.
+    """Full pipeline: clone -> classify -> budget check -> live resource
+    check -> either Cloudflare Pages (static) or Coolify (real app), DNS +
+    registration either way. Raises DeployError with the exact step and
+    reason on any failure. For the Coolify path, a failure after
+    create_coolify_app succeeds triggers a best-effort rollback of that
+    Coolify app (see the try/except below) -- DNS records and tunnel
+    routes created before the failure are NOT rolled back (a stale DNS
+    record pointing at nothing is a cosmetic issue, not a resource one;
+    the Coolify app itself is what actually consumes node memory, so
+    that's what gets cleaned up). The static-site path has no rollback --
+    it fails much earlier in practice and Pages projects cost no node
+    memory either way.
 
     target_node picks which node from registry.yaml's `nodes` section a
     real app (not a static site -- those always go to Cloudflare Pages
@@ -434,6 +479,21 @@ def deploy(*, owner_repo: str, name: str, git_branch: str = "main", target_node:
     memory_mb = classification["memory_mb"]
     build_pack = build_pack_for(classification["language"])
 
+    # Live re-check immediately before creating anything -- catches drift
+    # from something already eating memory on the target node right now,
+    # which the static budget_headroom_mb() check above can't see (it only
+    # knows what registry.yaml *declares* apps use, not what they actually
+    # use this second). Belt-and-suspenders, not a replacement for it.
+    def _check_live_headroom():
+        live = live_headroom_mb(target_node)
+        if memory_mb > live:
+            raise RuntimeError(
+                f"needs {memory_mb} MB but only {live:.0f} MB is actually free on "
+                f"{target_node} right now (static budget said this would fit -- "
+                f"something is using more memory than registry.yaml accounts for)"
+            )
+    step("live_resource_check", _check_live_headroom)
+
     coolify_result = step(
         "create_coolify_app", create_coolify_app,
         name=name, git_repository=f"https://github.com/{owner_repo}",
@@ -441,19 +501,41 @@ def deploy(*, owner_repo: str, name: str, git_branch: str = "main", target_node:
         server_uuid=node["server_uuid"],
     )
 
-    # A node with a real public IP is reached directly (A record at its IP,
-    # Coolify's own Traefik terminates TLS there) -- no Cloudflare Tunnel
-    # involved, unlike servingz which has no public IP of its own.
-    if node.get("has_public_ip"):
-        step("create_dns_record", create_dns_record, name, target=node["ip"], record_type="A")
-    else:
-        step("create_dns_record", create_dns_record, name)
-        step("add_tunnel_route", add_tunnel_route, domain)
+    try:
+        # A node with a real public IP is reached directly (A record at its IP,
+        # Coolify's own Traefik terminates TLS there) -- no Cloudflare Tunnel
+        # involved, unlike servingz which has no public IP of its own.
+        if node.get("has_public_ip"):
+            step("create_dns_record", create_dns_record, name, target=node["ip"], record_type="A")
+        else:
+            step("create_dns_record", create_dns_record, name)
+            step("add_tunnel_route", add_tunnel_route, domain)
 
-    step("register_app", register_app, name=name, memory_mb=memory_mb, subdomain=name,
-         repo=f"github.com/{owner_repo}", target=target_node)
-    step("record_resource", record_resource, name, kind="coolify", coolify_uuid=coolify_result.get("uuid"))
-    step("commit_and_push", git_commit_and_push, f"registry: add {name} (deployed via deploy agent)")
+        step("register_app", register_app, name=name, memory_mb=memory_mb, subdomain=name,
+             repo=f"github.com/{owner_repo}", target=target_node)
+        step("record_resource", record_resource, name, kind="coolify", coolify_uuid=coolify_result.get("uuid"))
+        step("commit_and_push", git_commit_and_push, f"registry: add {name} (deployed via deploy agent)")
+    except DeployError:
+        # create_coolify_app already succeeded above -- a real app now
+        # exists on the target node consuming its declared memory. Leaving
+        # it in place on a later-step failure would mean a half-registered
+        # app silently sitting there forever. This only matters once
+        # external callers (the MCP server) can trigger deploy()
+        # unattended; a human running this by hand used to just clean up
+        # manually, which is what the old docstring here described.
+        coolify_uuid = coolify_result.get("uuid")
+        try:
+            if coolify_uuid:
+                with httpx.Client(timeout=30) as client:
+                    r = client.delete(f"{COOLIFY_URL}/applications/{coolify_uuid}", headers=_coolify_headers())
+                    if r.status_code not in (200, 404):
+                        log.append({"step": "rollback_coolify_app", "ok": False,
+                                    "error": f"cleanup returned HTTP {r.status_code}"})
+                    else:
+                        log.append({"step": "rollback_coolify_app", "ok": True})
+        except Exception as cleanup_err:
+            log.append({"step": "rollback_coolify_app", "ok": False, "error": str(cleanup_err)})
+        raise
 
     return {
         "log": log,

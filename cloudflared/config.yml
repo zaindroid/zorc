@@ -5,6 +5,8 @@ ingress:
   service: http://localhost:8000
 - hostname: status.zaindroid.me
   service: http://localhost:9999
+- hostname: mcp.zaindroid.me
+  service: http://localhost:8081
 - hostname: hello.zaindroid.me
   service: https://localhost:443
   originRequest:
