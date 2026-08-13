@@ -13,10 +13,12 @@ boundary is what limits this server's blast radius to "a new resource
 might exist" rather than "an existing app might break."
 """
 import json
+import secrets as secrets_module
 import shutil
 import time
 from collections import deque
 from pathlib import Path
+from typing import Literal
 
 import uvicorn
 from mcp.server.mcpserver import MCPServer
@@ -43,6 +45,27 @@ _deploy_timestamps: deque[float] = deque()
 
 BUILD_SHA = "dev"  # overwritten by Coolify's build-arg injection if configured; fine as a static fallback
 
+# Approved requirements-analysis reports, keyed by report_id. deploy()
+# requires one of these -- it's the mechanism that makes the analysis
+# step mandatory rather than an optional suggestion the calling agent can
+# skip. In-memory and short-lived on purpose: a report reflects the repo
+# at analysis time, and shouldn't outlive the deploy attempt it was made
+# for by much (the repo could change in between otherwise).
+REPORT_TTL_SEC = 3600
+_approved_reports: dict[str, dict] = {}  # report_id -> {"report": {...}, "expires_at": float}
+
+# Dependencies that push real memory usage well above a bare framework's
+# baseline -- headless browsers, ML/data libs, image/video processing.
+# Substring-matched against dependency names, so "playwright-core" etc
+# still hit "playwright". Deliberately not exhaustive -- this narrows the
+# self-reported-vs-repo-derived gap for the common heavy cases, it isn't
+# meant to be a complete static analyzer.
+_HEAVY_DEPENDENCY_SIGNALS = (
+    "next", "nuxt", "gatsby", "@remix-run", "puppeteer", "playwright",
+    "sharp", "canvas", "ffmpeg", "tensorflow", "torch", "opencv",
+    "pandas", "numpy", "scipy", "django", "selenium",
+)
+
 
 def _audit(action: str, params: dict, outcome: dict) -> None:
     """Structured JSON-lines audit log -- every mutating call, in or out,
@@ -65,11 +88,19 @@ mcp = MCPServer(
     version="1.0.0",
     instructions=(
         "Deploy and inspect apps on the zorc platform (Coolify-orchestrated, "
-        "two nodes: servingz and hostinger-vps). Call get_platform_contract() "
-        "first to learn the required app shape before writing any code. Then "
-        "recommend_placement() and check_budget() before calling deploy() -- "
-        "deploy() runs those checks again itself, but previewing first avoids "
-        "wasted work if something won't fit. deploy() only ever creates a new "
+        "two nodes: servingz and hostinger-vps). Workflow: (1) "
+        "get_platform_contract() to learn the required app shape before "
+        "writing any code, (2) check_capability_exists() so you don't build "
+        "something that already exists here, (3) once the repo exists, "
+        "analyze_deployment_requirements() -- REQUIRED, not optional: submit "
+        "your real understanding of the app (kind, framework, expected load, "
+        "database/background-jobs/websocket/storage/public-ip needs, your own "
+        "memory estimate and the reasoning behind it) and it's cross-checked "
+        "against what the repo actually looks like; a poorly-justified or "
+        "wildly-off estimate gets blocked with the specific discrepancy "
+        "rather than silently accepted, (4) deploy() using the report_id that "
+        "call returns -- memory and node placement come from that report, not "
+        "from anything you pass directly. deploy() only ever creates a new "
         "app; it cannot touch, modify, or delete anything that already exists."
     ),
 )
@@ -108,6 +139,14 @@ def get_platform_contract() -> dict:
             "static": "index.html with no backend manifest -> Cloudflare Pages, zero node memory",
             "node / python / go / dockerfile": "-> Coolify on the chosen node, real memory_mb budget applies",
         },
+        "deploy_workflow": (
+            "Once your repo exists and pushes to GitHub: call analyze_deployment_requirements() -- "
+            "REQUIRED before deploy(), not optional. It clones the repo, cross-checks your own stated "
+            "requirements against what the code actually looks like, and either approves (returns a "
+            "report_id) or blocks with the specific reason if your estimate doesn't hold up. deploy() "
+            "then takes that report_id and derives memory/node placement from it, not from anything "
+            "passed directly."
+        ),
         "note": "This mirrors deploy/agent.py's classify() and AGENTS.md's app contract exactly -- "
                 "classify_repo() will tell you which kind your actual repo will be detected as.",
     }
@@ -163,7 +202,10 @@ def check_capability_exists(description: str) -> dict:
 def classify_repo(owner_repo: str) -> dict:
     """Dry-run: clones the repo and classifies it (kind/language/estimated
     memory) exactly as deploy() would internally, WITHOUT deploying
-    anything. Use this to preview before committing to a real deploy()."""
+    anything. Use this to preview before committing to a real deploy().
+    Note: the memory estimate here is classify()'s flat per-language
+    default -- call analyze_deployment_requirements() for a real,
+    requirement-informed number; deploy() requires that step anyway."""
     repo_dir = agent.clone_repo(owner_repo)
     try:
         return agent.classify(repo_dir)
@@ -171,13 +213,10 @@ def classify_repo(owner_repo: str) -> dict:
         shutil.rmtree(repo_dir, ignore_errors=True)
 
 
-@mcp.tool()
-def recommend_placement(memory_mb: int, needs_public_ip: bool = False) -> dict:
-    """Recommends which node to target, implementing AGENTS.md's written
-    decision procedure: default to servingz; move to hostinger-vps only if
-    direct public-IP ingress is needed or servingz doesn't have headroom.
-    Pure recommendation, no side effects -- deploy() re-checks this for
-    real at deploy time regardless of what you pass as target_node."""
+def _recommend_placement(memory_mb: int, needs_public_ip: bool) -> dict:
+    """AGENTS.md's written decision procedure, as code: default to
+    servingz; move to hostinger-vps only if direct public-IP ingress is
+    needed or servingz doesn't have headroom."""
     reg = agent.load_registry()
     nodes = reg["nodes"]
 
@@ -207,6 +246,180 @@ def recommend_placement(memory_mb: int, needs_public_ip: bool = False) -> dict:
                               f"{node_name} does ({headroom:.0f}MB)"}
     return {"recommended_node": None, "fits": False,
             "reason": f"doesn't fit on any node (needs {memory_mb}MB, servingz has {servingz_headroom:.0f}MB)"}
+
+
+@mcp.tool()
+def recommend_placement(memory_mb: int, needs_public_ip: bool = False) -> dict:
+    """Recommends which node to target, implementing AGENTS.md's written
+    decision procedure. Pure recommendation, no side effects -- a quick
+    preview tool. For an actual deploy(), use
+    analyze_deployment_requirements() instead, which does this same
+    placement step but from a properly-derived memory estimate rather
+    than a number you supply directly."""
+    return _recommend_placement(memory_mb, needs_public_ip)
+
+
+def _estimate_memory_from_repo(repo_dir, classification: dict) -> tuple[int, list[str]]:
+    """A richer estimate than classify()'s flat per-language default --
+    looks at actual dependencies, not just which manifest file exists.
+    Returns (estimated_mb, signals) where signals explains what pushed
+    the estimate up, if anything. Deliberately not exhaustive static
+    analysis -- just enough to catch the common heavy cases (SSR
+    frameworks, headless browsers, ML/data libs) and sanity-check a
+    self-reported estimate against them."""
+    base_mb = classification["memory_mb"]
+    signals: list[str] = []
+    deps: set[str] = set()
+
+    pkg_json = repo_dir / "package.json"
+    requirements_txt = repo_dir / "requirements.txt"
+    if pkg_json.exists():
+        try:
+            pkg = json.loads(pkg_json.read_text())
+            deps = {d.lower() for d in {**pkg.get("dependencies", {}), **pkg.get("devDependencies", {})}}
+        except (json.JSONDecodeError, OSError):
+            pass
+    elif requirements_txt.exists():
+        for line in requirements_txt.read_text().splitlines():
+            line = line.strip().lower()
+            if line and not line.startswith("#"):
+                deps.add(line.split("==")[0].split(">=")[0].split("[")[0].strip())
+
+    heavy_hits = sorted({d for d in deps for signal in _HEAVY_DEPENDENCY_SIGNALS if signal in d})
+    if heavy_hits:
+        base_mb = max(base_mb, 768)
+        signals.append(f"heavy dependencies detected: {heavy_hits}")
+
+    if len(deps) > 40:
+        base_mb = max(base_mb, 512)
+        signals.append(f"{len(deps)} dependencies -- larger than typical")
+
+    return base_mb, signals
+
+
+@mcp.tool()
+def analyze_deployment_requirements(
+    owner_repo: str,
+    app_kind: Literal["static", "api", "full_stack_web", "background_worker", "realtime", "other"],
+    framework: str,
+    expected_concurrency: Literal["low", "medium", "high"],
+    has_database: bool,
+    has_background_jobs: bool,
+    needs_websockets: bool,
+    needs_persistent_storage: bool,
+    needs_public_ip: bool,
+    estimated_memory_mb: int,
+    reasoning: str,
+) -> dict:
+    """REQUIRED before deploy() -- deploy() will reject any call that
+    doesn't reference an approved report_id from here. Submit your actual
+    understanding of the app (not a guess at what the platform wants to
+    hear): what kind of app it is, what framework, expected concurrent
+    load, whether it has a database/background jobs/websockets/needs
+    persistent storage or a public IP, your own memory estimate, and the
+    reasoning behind that estimate (this is checked for a real
+    justification, not just non-empty).
+
+    This clones the repo and cross-checks your estimate against what the
+    code actually looks like (dependencies, framework signals) plus your
+    stated concurrency level. If your estimate is far off from the
+    repo-derived one, status is "blocked" with the specific numbers and
+    reasoning behind the discrepancy -- revise estimated_memory_mb and/or
+    reasoning and call this again, or explain in reasoning why this app
+    is unusual enough to justify the difference. If it's within a
+    reasonable band, status is "approved" and you get a report_id valid
+    for 1 hour -- pass that to deploy(), which uses this report's
+    recommended_memory_mb and recommended_node, not whatever you originally
+    guessed."""
+    if not reasoning or len(reasoning.strip()) < 20:
+        return {
+            "status": "rejected",
+            "reason": "reasoning must actually justify the estimate (at least 20 characters) -- "
+                      "a placeholder isn't acceptable, explain what in the app drives this number",
+        }
+    if estimated_memory_mb <= 0:
+        return {"status": "rejected", "reason": "estimated_memory_mb must be a positive number"}
+
+    repo_dir = agent.clone_repo(owner_repo)
+    try:
+        classification = agent.classify(repo_dir)
+        if classification["kind"] == "unknown":
+            return {"status": "rejected",
+                    "reason": classification["reason"] + " -- cannot analyze an unrecognized repo"}
+        if classification["kind"] == "static":
+            # Static sites always go to Cloudflare Pages, zero node
+            # memory, no placement decision to make -- approve trivially.
+            report_id = secrets_module.token_hex(8)
+            report = {
+                "repo_kind": "static", "recommended_memory_mb": 0, "recommended_node": None,
+                "recommended_build_tool": "cloudflare_pages", "status": "approved",
+            }
+            _approved_reports[report_id] = {"report": report, "expires_at": time.time() + REPORT_TTL_SEC}
+            return {**report, "report_id": report_id}
+
+        repo_baseline_mb, signals = _estimate_memory_from_repo(repo_dir, classification)
+    finally:
+        shutil.rmtree(repo_dir, ignore_errors=True)
+
+    concurrency_multiplier = {"low": 1.0, "medium": 1.5, "high": 2.5}[expected_concurrency]
+    adjusted_estimate_mb = round(repo_baseline_mb * concurrency_multiplier)
+    if has_background_jobs:
+        adjusted_estimate_mb += 128
+        signals.append("+128MB for background jobs")
+    if needs_websockets:
+        adjusted_estimate_mb += 128
+        signals.append("+128MB for websockets")
+
+    lower_bound = adjusted_estimate_mb * 0.5
+    upper_bound = adjusted_estimate_mb * 2.0
+    mismatched = not (lower_bound <= estimated_memory_mb <= upper_bound)
+
+    if mismatched:
+        return {
+            "status": "blocked",
+            "repo_kind": classification["kind"],
+            "repo_language": classification["language"],
+            "repo_baseline_mb": repo_baseline_mb,
+            "signals": signals,
+            "concurrency_adjusted_estimate_mb": adjusted_estimate_mb,
+            "self_reported_mb": estimated_memory_mb,
+            "reason": (
+                f"self-reported {estimated_memory_mb}MB is too far from the repo-derived estimate of "
+                f"{adjusted_estimate_mb}MB (baseline {repo_baseline_mb}MB for {classification['language']}"
+                + (f", {'; '.join(signals)}" if signals else "")
+                + f", x{concurrency_multiplier} for {expected_concurrency} concurrency). "
+                  f"Either the estimate is too low (real risk of the container getting OOM-killed) or too "
+                  f"high (wastes node budget another app could use). Revise estimated_memory_mb and "
+                  f"reasoning to match what the code actually needs, or if this app is genuinely unusual, "
+                  f"explain specifically why in reasoning and call this again."
+            ),
+        }
+
+    placement = _recommend_placement(adjusted_estimate_mb, needs_public_ip)
+    if not placement["fits"]:
+        return {
+            "status": "blocked",
+            "repo_kind": classification["kind"], "repo_language": classification["language"],
+            "concurrency_adjusted_estimate_mb": adjusted_estimate_mb,
+            "reason": f"requirements are consistent, but nothing fits: {placement['reason']}",
+        }
+
+    report_id = secrets_module.token_hex(8)
+    report = {
+        "repo_kind": classification["kind"],
+        "repo_language": classification["language"],
+        "repo_baseline_mb": repo_baseline_mb,
+        "signals": signals,
+        "recommended_memory_mb": adjusted_estimate_mb,
+        "recommended_node": placement["recommended_node"],
+        "recommended_build_tool": "dockerfile" if classification["language"] == "dockerfile" else "nixpacks",
+        "app_kind": app_kind,
+        "framework": framework,
+        "status": "approved",
+    }
+    _approved_reports[report_id] = {"report": report, "expires_at": time.time() + REPORT_TTL_SEC}
+    return {**report, "report_id": report_id,
+            "note": f"valid for {REPORT_TTL_SEC // 60} minutes -- pass report_id to deploy()"}
 
 
 @mcp.tool()
@@ -240,18 +453,36 @@ def app_metrics(name: str) -> dict:
 
 
 @mcp.tool()
-def deploy(owner_repo: str, name: str, target_node: str = "servingz", git_branch: str = "main") -> dict:
+def deploy(owner_repo: str, name: str, report_id: str, git_branch: str = "main") -> dict:
     """Deploys a new app. THE ONLY MUTATING TOOL ON THIS SERVER -- creates
     a brand-new app; never touches, modifies, or deletes any existing one.
-    Runs the full guardrail sequence: name-collision refusal, classify,
-    static + live budget checks, then the actual Coolify/Pages deploy with
-    best-effort rollback if a later step fails. Rate-limited to 5
-    successful deploys/hour (read-only tools above are unlimited). Call
-    get_platform_contract() and recommend_placement() first if you
-    haven't -- this tool re-checks everything for real regardless, but
-    previewing avoids wasted clone/build time on something that won't fit
-    or already exists."""
-    params = {"owner_repo": owner_repo, "name": name, "target_node": target_node, "git_branch": git_branch}
+    Requires report_id from a prior, APPROVED analyze_deployment_requirements()
+    call for this same repo -- there is no way to pass memory_mb or
+    target_node directly, they come from that report, not from whatever
+    you originally guessed. This is what makes the requirements analysis
+    mandatory rather than an optional suggestion.
+
+    Runs the full guardrail sequence: report validity + expiry, name-collision
+    refusal, then the actual Coolify/Pages deploy (using the report's
+    recommended_memory_mb and recommended_node) with best-effort rollback if a
+    later step fails. Rate-limited to 5 successful deploys/hour (read-only
+    tools are unlimited)."""
+    params = {"owner_repo": owner_repo, "name": name, "report_id": report_id, "git_branch": git_branch}
+
+    entry = _approved_reports.get(report_id)
+    if entry is None:
+        outcome = {"status": "rejected",
+                   "reason": f"no approved report {report_id!r} -- call analyze_deployment_requirements() "
+                              "first (or it expired; reports are valid for 1 hour)"}
+        _audit("deploy", params, outcome)
+        return outcome
+    if time.time() > entry["expires_at"]:
+        del _approved_reports[report_id]
+        outcome = {"status": "rejected", "reason": f"report {report_id!r} expired -- call "
+                                                     "analyze_deployment_requirements() again"}
+        _audit("deploy", params, outcome)
+        return outcome
+    report = entry["report"]
 
     now = time.time()
     while _deploy_timestamps and now - _deploy_timestamps[0] > DEPLOY_RATE_WINDOW_SEC:
@@ -273,17 +504,23 @@ def deploy(owner_repo: str, name: str, target_node: str = "servingz", git_branch
         _audit("deploy", params, outcome)
         return outcome
 
+    target_node = report["recommended_node"] or "servingz"  # static sites: recommended_node is None, unused by agent.deploy()'s static branch
+    memory_mb_override = report["recommended_memory_mb"] if report["repo_kind"] != "static" else None
+
     try:
-        result = agent.deploy(owner_repo=owner_repo, name=name, git_branch=git_branch, target_node=target_node)
+        result = agent.deploy(owner_repo=owner_repo, name=name, git_branch=git_branch,
+                               target_node=target_node, memory_mb_override=memory_mb_override)
         _deploy_timestamps.append(now)
-        _audit("deploy", params, {"status": "deployed", "domain": result.get("domain")})
+        _audit("deploy", params, {"status": "deployed", "domain": result.get("domain"), "report": report})
         return result
     except agent.DeployError as e:
         outcome = {"status": "failed", "step": e.step, "reason": e.reason}
         _audit("deploy", params, outcome)
         return outcome
     except KeyError as e:
-        # node_config() raising on a bad target_node
+        # node_config() raising on a bad target_node -- shouldn't happen
+        # since the report's node came from _recommend_placement(), but
+        # surfaced explicitly rather than swallowed if it somehow does.
         outcome = {"status": "rejected", "reason": str(e)}
         _audit("deploy", params, outcome)
         return outcome

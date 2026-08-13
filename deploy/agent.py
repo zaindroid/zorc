@@ -410,7 +410,8 @@ class DeployError(Exception):
         super().__init__(f"{step}: {reason}")
 
 
-def deploy(*, owner_repo: str, name: str, git_branch: str = "main", target_node: str = "servingz") -> dict:
+def deploy(*, owner_repo: str, name: str, git_branch: str = "main", target_node: str = "servingz",
+           memory_mb_override: int | None = None) -> dict:
     """Full pipeline: clone -> classify -> budget check -> live resource
     check -> either Cloudflare Pages (static) or Coolify (real app), DNS +
     registration either way. Raises DeployError with the exact step and
@@ -428,7 +429,17 @@ def deploy(*, owner_repo: str, name: str, git_branch: str = "main", target_node:
     real app (not a static site -- those always go to Cloudflare Pages
     regardless of target_node) gets deployed to. Ignored for static sites.
     Raises KeyError immediately (via node_config) if target_node isn't a
-    real node -- fail before cloning anything, not after."""
+    real node -- fail before cloning anything, not after.
+
+    memory_mb_override, if given, replaces classify()'s flat per-language
+    default (384MB for node/python/dockerfile, 256 for go) for the budget
+    check and the actual Coolify memory limit. classify() alone can't
+    know an app's real requirements -- how much traffic it expects,
+    whether it runs background jobs, how many/how heavy its dependencies
+    are -- it only knows which manifest file exists. This is the hook
+    callers with better information (e.g. mcp_server.py's requirements
+    analysis) use to supply an informed number instead. Ignored for
+    static sites, which always cost zero node memory regardless."""
     log = []
     node = node_config(target_node)  # raises KeyError immediately on a bad name
 
@@ -454,7 +465,9 @@ def deploy(*, owner_repo: str, name: str, git_branch: str = "main", target_node:
     if classification["kind"] == "unknown":
         raise DeployError("classify", classification["reason"] + " — cannot proceed automatically")
 
-    ok, reason = step("budget_check", check_deploy_budget, name, classification["memory_mb"], target_node)
+    memory_mb = memory_mb_override if memory_mb_override is not None else classification["memory_mb"]
+
+    ok, reason = step("budget_check", check_deploy_budget, name, memory_mb, target_node)
     if not ok:
         raise DeployError("budget_check", reason)
 
@@ -476,7 +489,6 @@ def deploy(*, owner_repo: str, name: str, git_branch: str = "main", target_node:
                        f"custom domain https://{domain} attached, registered in registry.yaml.",
         }
 
-    memory_mb = classification["memory_mb"]
     build_pack = build_pack_for(classification["language"])
 
     # Live re-check immediately before creating anything -- catches drift
