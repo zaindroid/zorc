@@ -101,6 +101,17 @@ apps:
     critical: false
     depends_on: []
 
+  - name: zorc-mcp
+    target: servingz
+    memory_mb: 128
+    subdomain: mcp
+    database: null
+    redis_db: null
+    storage_prefix: null
+    repo: "github.com/zaindroid/zorc"
+    critical: false
+    depends_on: []
+
 # ---------------------------------------------------------------------------
 # Reserved names — do not allocate these to apps.
 # ---------------------------------------------------------------------------
