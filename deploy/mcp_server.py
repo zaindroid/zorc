@@ -101,7 +101,13 @@ mcp = MCPServer(
         "rather than silently accepted, (4) deploy() using the report_id that "
         "call returns -- memory and node placement come from that report, not "
         "from anything you pass directly. deploy() only ever creates a new "
-        "app; it cannot touch, modify, or delete anything that already exists."
+        "app; it cannot touch, modify, or delete anything that already exists. "
+        "If your app needs any env var beyond DATABASE_URL/APP_ENV/LOG_LEVEL, "
+        "declare it in app.yaml's env: section (see get_platform_contract) -- "
+        "internal secrets get generated and set for you automatically; "
+        "anything tied to a real external account must be passed to deploy() "
+        "via env_overrides, and analyze_deployment_requirements()'s report "
+        "tells you which is which before you get there."
     ),
 )
 
@@ -113,7 +119,9 @@ def get_platform_contract() -> dict:
     this before writing any code for a new app."""
     return {
         "required_files": {
-            "app.yaml": "declares name, memory_mb, port, domains, dependencies",
+            "app.yaml": "declares name, memory_mb, port, domains, dependencies, and "
+                        "(optional) an env: section for anything beyond the three "
+                        "auto-provided vars -- see env_vars_beyond_defaults below",
             "Dockerfile": "only if your stack needs something build-autodetection "
                            "can't handle; otherwise a standard manifest "
                            "(package.json / requirements.txt / go.mod / etc) is enough",
@@ -127,6 +135,21 @@ def get_platform_contract() -> dict:
             "GET /openapi.json": "your API spec",
         },
         "env_vars_provided_at_deploy": ["DATABASE_URL", "APP_ENV", "LOG_LEVEL"],
+        "env_vars_beyond_defaults": (
+            "If your app needs any env var other than the three above (a JWT/session "
+            "signing secret, a third-party API key, anything your code reads at "
+            "startup), declare it in app.yaml's env: section -- undeclared vars are "
+            "never invented for you, and per the fail-loudly rule below your app "
+            "should refuse to start without them, which means an undeclared one WILL "
+            "crash-loop after an otherwise-successful deploy. Two kinds: "
+            "`{GENERATE_ME: {generate: hex}}` for internal secrets zorc generates "
+            "itself and sets before your container's first real start (you never see "
+            "the value); `{EXTERNAL_KEY: {required: true}}` for anything tied to a "
+            "real external account -- zorc can't invent those, so you (or whoever "
+            "calls deploy()) must supply the actual value via deploy()'s "
+            "env_overrides. analyze_deployment_requirements()'s report tells you "
+            "which is which before you ever call deploy()."
+        ),
         "hard_rules": [
             "No host port binding -- Traefik reaches containers by name on the shared network.",
             "No cross-app database access -- each app owns its database, no exceptions.",
@@ -388,6 +411,15 @@ def analyze_deployment_requirements(
             return {"status": "rejected",
                     "reason": classification["reason"] + " -- cannot analyze an unrecognized repo"}
 
+        try:
+            declared_env = agent.parse_app_yaml(repo_dir)["env"]
+        except ValueError as e:
+            return {"status": "rejected", "reason": f"app.yaml is malformed: {e}"}
+        env_requirements = {
+            "generated_internally": sorted(k for k, spec in declared_env.items() if "generate" in spec),
+            "required_from_caller": sorted(k for k, spec in declared_env.items() if "required" in spec),
+        }
+
         warnings = []
         if frontend_rendering == "static" and classification["kind"] != "static":
             warnings.append(
@@ -440,6 +472,7 @@ def analyze_deployment_requirements(
             "repo_baseline_mb": repo_baseline_mb,
             "signals": signals,
             "warnings": warnings,
+            "env_requirements": env_requirements,
             "concurrency_adjusted_estimate_mb": adjusted_estimate_mb,
             "self_reported_mb": estimated_memory_mb,
             "reason": (
@@ -461,6 +494,7 @@ def analyze_deployment_requirements(
             "repo_kind": classification["kind"], "repo_language": classification["language"],
             "concurrency_adjusted_estimate_mb": adjusted_estimate_mb,
             "warnings": warnings,
+            "env_requirements": env_requirements,
             "reason": f"requirements are consistent, but nothing fits: {placement['reason']}",
         }
 
@@ -476,11 +510,15 @@ def analyze_deployment_requirements(
         "recommended_build_tool": "dockerfile" if classification["language"] == "dockerfile" else "nixpacks",
         "app_kind": app_kind,
         "framework": framework,
+        "env_requirements": env_requirements,
         "status": "approved",
     }
     _approved_reports[report_id] = {"report": report, "expires_at": time.time() + REPORT_TTL_SEC}
-    return {**report, "report_id": report_id,
-            "note": f"valid for {REPORT_TTL_SEC // 60} minutes -- pass report_id to deploy()"}
+    note = f"valid for {REPORT_TTL_SEC // 60} minutes -- pass report_id to deploy()"
+    if env_requirements["required_from_caller"]:
+        note += (f"; deploy() will need env_overrides for {env_requirements['required_from_caller']} "
+                 "(tied to an external account, zorc can't generate these itself)")
+    return {**report, "report_id": report_id, "note": note}
 
 
 @mcp.tool()
@@ -514,7 +552,8 @@ def app_metrics(name: str) -> dict:
 
 
 @mcp.tool()
-def deploy(owner_repo: str, name: str, report_id: str, git_branch: str = "main") -> dict:
+def deploy(owner_repo: str, name: str, report_id: str, git_branch: str = "main",
+           env_overrides: dict[str, str] | None = None) -> dict:
     """Deploys a new app. THE ONLY MUTATING TOOL ON THIS SERVER -- creates
     a brand-new app; never touches, modifies, or deletes any existing one.
     Requires report_id from a prior, APPROVED analyze_deployment_requirements()
@@ -523,12 +562,25 @@ def deploy(owner_repo: str, name: str, report_id: str, git_branch: str = "main")
     you originally guessed. This is what makes the requirements analysis
     mandatory rather than an optional suggestion.
 
+    env_overrides supplies values for env vars the repo's app.yaml declares
+    as required: true -- these are tied to an external account (a real
+    third-party API key, etc), so they can't be generated automatically;
+    check the report's env_requirements (from analyze_deployment_requirements)
+    for which ones to collect before calling deploy(). Anything app.yaml
+    marks generate: hex (internal secrets like JWT_SECRET) is handled
+    entirely server-side -- you never see or need to pass those. If a
+    required var has no matching entry here, deploy() rejects up front,
+    before creating anything, rather than leaving a container crash-looping
+    on a missing secret for someone to debug later.
+
     Runs the full guardrail sequence: report validity + expiry, name-collision
     refusal, then the actual Coolify/Pages deploy (using the report's
-    recommended_memory_mb and recommended_node) with best-effort rollback if a
-    later step fails. Rate-limited to 5 successful deploys/hour (read-only
-    tools are unlimited)."""
-    params = {"owner_repo": owner_repo, "name": name, "report_id": report_id, "git_branch": git_branch}
+    recommended_memory_mb and recommended_node, and resolving+setting env
+    vars before the container's first real start) with best-effort rollback
+    if a later step fails. Rate-limited to 5 successful deploys/hour
+    (read-only tools are unlimited)."""
+    params = {"owner_repo": owner_repo, "name": name, "report_id": report_id, "git_branch": git_branch,
+              "env_overrides_keys": sorted((env_overrides or {}).keys())}  # keys only -- never log secret values
 
     entry = _approved_reports.get(report_id)
     if entry is None:
@@ -570,7 +622,8 @@ def deploy(owner_repo: str, name: str, report_id: str, git_branch: str = "main")
 
     try:
         result = agent.deploy(owner_repo=owner_repo, name=name, git_branch=git_branch,
-                               target_node=target_node, memory_mb_override=memory_mb_override)
+                               target_node=target_node, memory_mb_override=memory_mb_override,
+                               env_overrides=env_overrides)
         _deploy_timestamps.append(now)
         _audit("deploy", params, {"status": "deployed", "domain": result.get("domain"), "report": report})
         return result

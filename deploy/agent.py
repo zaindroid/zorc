@@ -9,6 +9,7 @@ human, never silently decided.
 """
 import json
 import re
+import secrets
 import subprocess
 import tempfile
 import uuid
@@ -308,6 +309,74 @@ def classify(repo_dir: Path) -> dict:
             "reason": "no recognizable manifest — needs a human decision"}
 
 
+# Only generation strategy supported for now -- a 256-bit random hex
+# string, the right shape for JWT/session/signing secrets. Not meant for
+# values tied to an external account (API keys, third-party credentials)
+# -- those can't be conjured locally and must come through as
+# "required" instead, supplied by whoever calls deploy().
+_ENV_GENERATE_STRATEGIES = {"hex": lambda: secrets.token_hex(32)}
+
+
+def parse_app_yaml(repo_dir: Path) -> dict:
+    """Reads app.yaml's optional `env:` section, if present. Format:
+
+        env:
+          JWT_SECRET:
+            generate: hex        # zorc generates a random value itself,
+                                  # sets it via Coolify before first boot --
+                                  # the calling agent/human never sees it.
+          STRIPE_SECRET_KEY:
+            required: true       # tied to an external account -- must be
+                                  # supplied via deploy()'s env_overrides,
+                                  # deploy() fails loudly (before creating
+                                  # anything) if it's missing.
+
+    Missing app.yaml or a missing/empty env: section is not an error --
+    most apps only need the platform-provided DATABASE_URL/APP_ENV/
+    LOG_LEVEL and declare nothing here."""
+    app_yaml_path = repo_dir / "app.yaml"
+    if not app_yaml_path.exists():
+        return {"env": {}}
+    try:
+        parsed = yaml.safe_load(app_yaml_path.read_text()) or {}
+    except yaml.YAMLError as e:
+        raise ValueError(f"app.yaml is not valid YAML: {e}")
+    env = parsed.get("env") or {}
+    for key, spec in env.items():
+        if not isinstance(spec, dict) or ("generate" not in spec and "required" not in spec):
+            raise ValueError(
+                f"app.yaml env.{key} must be either {{generate: hex}} or {{required: true}}, got {spec!r}"
+            )
+        if "generate" in spec and spec["generate"] not in _ENV_GENERATE_STRATEGIES:
+            raise ValueError(
+                f"app.yaml env.{key}.generate={spec['generate']!r} is not supported "
+                f"(supported: {sorted(_ENV_GENERATE_STRATEGIES)})"
+            )
+    return {"env": env}
+
+
+def resolve_env_vars(repo_dir: Path, env_overrides: dict[str, str] | None) -> tuple[dict[str, str], list[str]]:
+    """Cross-references app.yaml's env: section against env_overrides
+    (values the caller already has, e.g. a real third-party API key).
+    Returns (vars_to_set, missing_required) -- vars_to_set is the full set
+    of {key: value} to push to Coolify (generated values included, caller
+    never has to see or handle those), missing_required lists any
+    required-but-unsupplied keys so deploy() can fail before creating
+    anything rather than deploying a container guaranteed to crash-loop."""
+    env_overrides = env_overrides or {}
+    declared = parse_app_yaml(repo_dir)["env"]
+    vars_to_set: dict[str, str] = {}
+    missing_required: list[str] = []
+    for key, spec in declared.items():
+        if "generate" in spec:
+            vars_to_set[key] = _ENV_GENERATE_STRATEGIES[spec["generate"]]()
+        elif key in env_overrides:
+            vars_to_set[key] = env_overrides[key]
+        else:
+            missing_required.append(key)
+    return vars_to_set, missing_required
+
+
 def check_deploy_budget(name: str, memory_mb: int, node_name: str = "servingz") -> tuple[bool, str]:
     if name_taken(name):
         return False, f"'{name}' is already registered in registry.yaml"
@@ -323,7 +392,15 @@ def build_pack_for(language: str) -> str:
 
 
 def create_coolify_app(*, name: str, git_repository: str, git_branch: str,
-                        build_pack: str, memory_mb: int, domain: str, server_uuid: str) -> dict:
+                        build_pack: str, memory_mb: int, domain: str, server_uuid: str,
+                        instant_deploy: bool = True) -> dict:
+    """instant_deploy=False when the app declares env vars that must be set
+    (see resolve_env_vars) -- Coolify's default behaviour builds and starts
+    the container immediately on creation, before there's any chance to
+    push those vars in, which is exactly how blylinks-crm crash-looped on
+    JWT_SECRET. False here means "create the resource, don't start it yet";
+    the caller is responsible for setting env vars and then calling
+    trigger_coolify_deploy() itself once they're in place."""
     payload = {
         "project_uuid": COOLIFY_PROJECT_UUID,
         "server_uuid": server_uuid,
@@ -339,11 +416,36 @@ def create_coolify_app(*, name: str, git_repository: str, git_branch: str,
         "is_force_https_enabled": True,
         "health_check_enabled": True,
         "health_check_path": "/health",
+        "instant_deploy": instant_deploy,
     }
     with httpx.Client(timeout=30) as client:
         r = client.post(f"{COOLIFY_URL}/applications/public", headers=_coolify_headers(), json=payload)
         r.raise_for_status()
         return r.json()
+
+
+def set_coolify_env_vars(coolify_uuid: str, vars_to_set: dict[str, str]) -> None:
+    """Pushes each {key: value} to Coolify as a runtime env var on the
+    given application. Called after create_coolify_app (instant_deploy=
+    False) and before trigger_coolify_deploy, so the container's first
+    real start already has everything it needs."""
+    with httpx.Client(timeout=30) as client:
+        for key, value in vars_to_set.items():
+            r = client.post(
+                f"{COOLIFY_URL}/applications/{coolify_uuid}/envs",
+                headers=_coolify_headers(),
+                json={"key": key, "value": value, "is_preview": False},
+            )
+            r.raise_for_status()
+
+
+def trigger_coolify_deploy(coolify_uuid: str) -> None:
+    """Explicitly starts the first real build+deploy -- the counterpart to
+    create_coolify_app(instant_deploy=False). Coolify's own webhook-style
+    deploy-trigger endpoint, keyed by application uuid."""
+    with httpx.Client(timeout=30) as client:
+        r = client.get(f"{COOLIFY_URL}/deploy", headers=_coolify_headers(), params={"uuid": coolify_uuid})
+        r.raise_for_status()
 
 
 def register_app(*, name: str, memory_mb: int, subdomain: str, repo: str, target: str = "servingz",
@@ -411,7 +513,7 @@ class DeployError(Exception):
 
 
 def deploy(*, owner_repo: str, name: str, git_branch: str = "main", target_node: str = "servingz",
-           memory_mb_override: int | None = None) -> dict:
+           memory_mb_override: int | None = None, env_overrides: dict[str, str] | None = None) -> dict:
     """Full pipeline: clone -> classify -> budget check -> live resource
     check -> either Cloudflare Pages (static) or Coolify (real app), DNS +
     registration either way. Raises DeployError with the exact step and
@@ -439,7 +541,16 @@ def deploy(*, owner_repo: str, name: str, git_branch: str = "main", target_node:
     are -- it only knows which manifest file exists. This is the hook
     callers with better information (e.g. mcp_server.py's requirements
     analysis) use to supply an informed number instead. Ignored for
-    static sites, which always cost zero node memory regardless."""
+    static sites, which always cost zero node memory regardless.
+
+    env_overrides supplies values for any app.yaml env: entries marked
+    required: true (e.g. a real third-party API key) -- see
+    resolve_env_vars(). Entries marked generate: hex are handled
+    internally and never need (or use) anything from env_overrides. If
+    app.yaml declares a required var with no matching entry here, deploy()
+    fails at the resolve_env_vars step, before create_coolify_app runs --
+    no half-built container left crash-looping for a human to clean up.
+    Ignored for static sites (no runtime env vars to set)."""
     log = []
     node = node_config(target_node)  # raises KeyError immediately on a bad name
 
@@ -491,6 +602,15 @@ def deploy(*, owner_repo: str, name: str, git_branch: str = "main", target_node:
 
     build_pack = build_pack_for(classification["language"])
 
+    env_vars_to_set, missing_required_env = step("resolve_env_vars", resolve_env_vars, repo_dir, env_overrides)
+    if missing_required_env:
+        raise DeployError(
+            "resolve_env_vars",
+            f"app.yaml requires {missing_required_env} but no value was supplied for "
+            f"{'it' if len(missing_required_env) == 1 else 'them'} -- pass via deploy()'s env_overrides "
+            "(these are tied to an external account/service, zorc cannot generate them itself)",
+        )
+
     # Live re-check immediately before creating anything -- catches drift
     # from something already eating memory on the target node right now,
     # which the static budget_headroom_mb() check above can't see (it only
@@ -510,10 +630,18 @@ def deploy(*, owner_repo: str, name: str, git_branch: str = "main", target_node:
         "create_coolify_app", create_coolify_app,
         name=name, git_repository=f"https://github.com/{owner_repo}",
         git_branch=git_branch, build_pack=build_pack, memory_mb=memory_mb, domain=domain,
-        server_uuid=node["server_uuid"],
+        server_uuid=node["server_uuid"], instant_deploy=not env_vars_to_set,
     )
 
     try:
+        if env_vars_to_set:
+            # instant_deploy was False above specifically so this can run
+            # first -- the container's actual first start happens at
+            # trigger_coolify_deploy, by which point every declared env var
+            # (generated or caller-supplied) is already set.
+            step("set_env_vars", set_coolify_env_vars, coolify_result["uuid"], env_vars_to_set)
+            step("trigger_coolify_deploy", trigger_coolify_deploy, coolify_result["uuid"])
+
         # A node with a real public IP is reached directly (A record at its IP,
         # Coolify's own Traefik terminates TLS there) -- no Cloudflare Tunnel
         # involved, unlike servingz which has no public IP of its own.
