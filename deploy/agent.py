@@ -481,20 +481,42 @@ def add_tunnel_route(hostname: str) -> None:
     """Every Coolify-managed app routes through the same Traefik hop --
     Traefik dispatches to the right container by Host() header, using the
     domains we set on the Coolify app resource. Same pattern as every
-    existing app entry (hello.zaindroid.me, hello-staging.zaindroid.me)."""
+    existing app entry (hello.zaindroid.me, hello-staging.zaindroid.me).
+
+    Real bug found live: the idempotency check used to read the REPO copy
+    of cloudflared's config, not the live one at /etc/cloudflared. A first
+    attempt that wrote the repo file successfully but then failed at the
+    `sudo cp` (or the reload) left the repo "ahead" of what's actually
+    served. A retry saw the hostname already in the repo file, treated
+    that as "already routed," and returned without ever copying to
+    /etc/cloudflared or reloading cloudflared -- reported ok:true while
+    the tunnel kept serving its old rules with no route for the new
+    hostname at all (blylinks-crm: container healthy, but every request
+    404'd at Cloudflare's edge before reaching it). Fix: check the LIVE
+    config for the idempotency test (that's the thing that actually
+    determines whether traffic gets routed), and always sync+reload if a
+    prior partial failure left the repo file ahead of it -- so a retry
+    after a failed cp/reload actually finishes the job instead of
+    silently no-op'ing."""
     config_path = Path("/etc/cloudflared/config.yml")
     repo_config_path = ZORC_DIR / "cloudflared" / "config.yml"
+
+    live_cfg = yaml.safe_load(config_path.read_text())
+    if any(r.get("hostname") == hostname for r in live_cfg["ingress"]):
+        return  # genuinely already serving this route -- nothing to do
+
     cfg = yaml.safe_load(repo_config_path.read_text())
-    new_rule = {
-        "hostname": hostname,
-        "service": "https://localhost:443",
-        "originRequest": {"noTLSVerify": True},
-    }
-    if any(r.get("hostname") == hostname for r in cfg["ingress"]):
-        return  # already routed, idempotent
-    cfg["ingress"].insert(-1, new_rule)  # keep the catch-all 404 rule last
-    new_yaml = yaml.dump(cfg, sort_keys=False)
-    repo_config_path.write_text(new_yaml)
+    if not any(r.get("hostname") == hostname for r in cfg["ingress"]):
+        new_rule = {
+            "hostname": hostname,
+            "service": "https://localhost:443",
+            "originRequest": {"noTLSVerify": True},
+        }
+        cfg["ingress"].insert(-1, new_rule)  # keep the catch-all 404 rule last
+        repo_config_path.write_text(yaml.dump(cfg, sort_keys=False))
+    # Always push to live + reload from here, even if the repo file already
+    # had the rule (a prior run got this far before failing) -- that's
+    # exactly the case that silently broke before.
     subprocess.run(["sudo", "cp", str(repo_config_path), str(config_path)], check=True)
     subprocess.run(["sudo", "systemctl", "reload-or-restart", "cloudflared"], check=True)
 
