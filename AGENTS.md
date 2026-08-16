@@ -2,8 +2,9 @@
 
 **Read this file completely before writing code, creating files, or deploying.**
 
-This is a multi-app platform spanning **two nodes**, orchestrated through one
-Coolify instance. Many services share each host and one set of shared
+This is a multi-app platform spanning a **growing fleet of nodes**,
+orchestrated through one Coolify instance for every node whose `backend` is
+`coolify` (see below). Many services share each host and one set of shared
 infrastructure. Your changes must not degrade services you did not write.
 
 If this file conflicts with your instincts, a tutorial you recall, or a pattern
@@ -12,27 +13,78 @@ stop and ask the human rather than inventing a convention.
 
 ### Nodes
 
-| Node | Reach | Public IP | Use for | Shared Postgres/Redis |
-|---|---|---|---|---|
-| **servingz** | home network, via Cloudflare Tunnel only | No | default — most apps | Yes, native Docker network |
-| **hostinger-vps** | direct, real public IPv4 (`2.25.105.110`) | Yes | apps that need direct public ingress, or when servingz is out of headroom | No — reach servingz's over the internet, or ask first |
+`registry.yaml`'s `nodes:` section is the source of truth for every node:
+budget (`usable_mb`, `reserved_mb`, `max_utilisation`), Coolify `server_uuid`,
+`has_public_ip`, and two policy fields — **set by a human, in this file
+only, never derived from or overridable by a node's own self-reported
+data** (see `nodes/<name>.yaml` below): `backend` (`coolify` today;
+`zorc-agent` reserved for future lightweight devices that can't run full
+Coolify) and `is_control_plane` (whether shared Postgres/Redis/Traefik and
+Traefik-fronted apps are allowed there). Every app's `target:` field names
+exactly one node key (or `pages` for the Cloudflare Pages static-site edge
+target, which isn't a node at all).
 
-Both are managed by the **same Coolify instance** (runs on servingz) as two
-Coolify "Servers" — one Coolify project, one API, one dashboard, regardless
-of which node an app actually runs on. `registry.yaml`'s `nodes:` section is
-the source of truth for each node's budget and Coolify `server_uuid`; every
-app's `target:` field names exactly one of those node keys (or `pages` for
-the Cloudflare Pages static-site edge target, which isn't a node at all).
-`deploy/agent.py`'s `deploy()` takes a `target_node` argument to place a new
-app on the node of your choice — defaults to `servingz` if not specified.
+Two nodes exist today — **more will be added over time, don't assume
+exactly two anywhere in your own reasoning; always read the current set
+from `registry.yaml`**:
 
-Picking a node for a new app:
-- Default to **servingz** unless there's a specific reason not to.
-- Pick **hostinger-vps** when the app needs direct public-IP ingress
-  servingz structurally can't provide (e.g. something that can't sit behind
-  the Cloudflare Tunnel), or when servingz's headroom (§1) doesn't fit it.
-- Never split one app's pieces across both nodes — one repo, one container,
-  one node (§5's "app contract" still holds, just now per-node).
+| Node | Reach | Public IP | Control plane |
+|---|---|---|---|
+| **servingz** | home network, via Cloudflare Tunnel only | No | Yes — shared Postgres/Redis, default for most apps |
+| **hostinger-vps** | direct, real public IPv4 (`2.25.105.110`) | Yes | No — apps that need direct public ingress, or when servingz is out of headroom |
+
+Separately, `nodes/<name>.yaml` (one file per node) holds **live,
+self-reported telemetry** — architecture, CPU, RAM, power source, GPU/
+accelerator, online status, last-seen timestamp — refreshed automatically
+every cycle by `zorc-watchdog.timer` (locally on servingz, over SSH for
+every other node). This is informational only: it feeds the placement
+scorer's fitness ranking below, it never grants trust or control-plane
+status by itself.
+
+Picking a node for a new app is automated, not manual guesswork: call
+`recommend_placement()` (or let `analyze_deployment_requirements()` do it
+for you as part of the normal deploy flow). It scores every node in
+`registry.yaml` on budget fit, public-IP requirement, optional
+architecture match, and live reachability/telemetry freshness, and
+returns the best-suited one with its reasoning — see
+`deploy/mcp_server.py`'s `_recommend_placement()`. The one fixed default
+that survives is "prefer a control-plane node when nothing else forces
+otherwise" — this file's long-standing default-to-servingz guidance,
+expressed as a score nudge rather than a hardcoded node name, so a new
+node dropped into `registry.yaml` needs no changes here to participate
+correctly.
+
+Never split one app's pieces across both nodes — one repo, one container,
+one node (§5's "app contract" still holds, just now per-node).
+
+### Adding a node
+
+Registration is deliberately **not** something an external agent can
+trigger on its own — a new node is a new trust boundary (new SSH access,
+new compute zorc can reach and run things on) and stays human-confirmed,
+indefinitely, not just for now.
+
+What any agent *can* do: call `propose_node(hostname)` for a read-only
+capability report — reachability, hardware, whether Docker/Coolify are
+already present — but only for a host a human has already added to
+`nodes/candidates.yaml`. It refuses anything else outright; it is not a
+"probe any host a caller names" tool, same reasoning as this platform
+never accepting an arbitrary DNS zone/record from a caller. Use that
+report to guide actual onboarding, which a human runs themselves: the
+full `bootstrap/*.sh` sequence for a new control-plane-capable node, or
+Coolify's own lighter server-add flow for a worker node (see
+`hostinger-vps`'s onboarding as precedent) — then add the node to
+`registry.yaml`'s `nodes:` section, a normal reviewed edit like any other
+change to that file.
+
+**Physical/embedded targets (sensors, robots, voice bots, AI agents) are
+explicitly not part of this node model and must never be added as new
+actions on the existing deploy surface** — "deploy a container" and
+"command a physical device" carry very different real-world blast radii.
+Any future capability along those lines needs its own, separately-scoped
+MCP tool surface designed from scratch for that risk profile, not bolted
+onto this one's already-built auth/audit plumbing because it's
+convenient.
 
 ### Deploying from outside this repo
 
@@ -51,9 +103,9 @@ call without another human needing to supervise each one. See
 
 ## 1. Before you write any code
 
-Run these on **the node you're about to deploy to** — servingz and
-hostinger-vps are separate hosts with separate Docker state, checking one
-tells you nothing about the other. Every task. No exceptions.
+Run these on **the node you're about to deploy to** — every node is a
+separate host with separate Docker state, checking one tells you nothing
+about another. Every task. No exceptions.
 
 ```bash
 docker ps --format '{{.Names}}\t{{.Image}}\t{{.Status}}'   # what is running
@@ -150,8 +202,8 @@ It does not belong on the node. Deploy to the edge platform. Zero node memory.
 It's a queue worker, not an HTTP service. No ingress, no subdomain.
 
 **5. Otherwise, a new app.** Decide which node it targets (see "Picking a
-node" above), then check *that node's* budget *before* writing code — the
-two nodes have separate budgets, checking the wrong one tells you nothing:
+node" above), then check *that node's* budget *before* writing code — each
+node has its own separate budget, checking the wrong one tells you nothing:
 
 ```
 sum(memory_mb of apps targeting this node) + yours  ≤  (usable_mb − reserved_mb) × max_utilisation
