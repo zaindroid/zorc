@@ -246,6 +246,69 @@ def live_headroom_mb(node_name: str) -> float:
     return available_mb
 
 
+def remote_node_probe(node_name: str) -> dict:
+    """Runs the same arch/cpu/ram/power/accelerator detection
+    monitoring/checks.py's gather_node_info() uses locally, but over SSH
+    against a remote node -- for any node that doesn't run the full zorc
+    monitoring stack itself (every node but servingz, today).
+
+    Ships the ACTUAL function source from checks.py (via inspect.getsource)
+    rather than a hand-copied duplicate, so a future fix to arch/GPU/power
+    detection there is automatically what gets probed remotely too -- one
+    place to fix, not two. Needs nothing installed on the target beyond a
+    python3 interpreter, which every node already has.
+
+    Shared by two callers: watchdog.py's periodic refresh of non-local
+    nodes' nodes/<name>.yaml, and propose_node()'s one-off pre-registration
+    capability report -- same probe either way, just a different caller
+    and a different thing done with the result."""
+    import inspect
+    import sys as _sys
+    monitoring_dir = str(ZORC_DIR / "monitoring")
+    if monitoring_dir not in _sys.path:
+        _sys.path.insert(0, monitoring_dir)
+    import checks  # deploy/ and monitoring/ import each other; deferred so this only pays the circular-import cost when actually called
+
+    node = node_config(node_name)
+    tailscale_ip = node.get("tailscale_ip")
+    if not tailscale_ip:
+        raise RuntimeError(f"{node_name!r} has no tailscale_ip in registry.yaml -- cannot probe it remotely")
+
+    funcs_src = "\n\n".join(
+        inspect.getsource(getattr(checks, fn_name))
+        for fn_name in ("_run", "_detect_accelerator", "_detect_power_source", "_detect_cpu")
+    )
+    probe_script = f'''
+import json, os, subprocess, platform
+from pathlib import Path
+
+{funcs_src}
+
+def _meminfo_total_mb():
+    with open("/proc/meminfo") as f:
+        for line in f:
+            if line.startswith("MemTotal:"):
+                return int(line.split()[1]) // 1024
+    return None
+
+print(json.dumps({{
+    "arch": platform.machine(),
+    "accelerator": _detect_accelerator(),
+    "cpu": _detect_cpu(),
+    "ram_mb": _meminfo_total_mb(),
+    "power": _detect_power_source(),
+}}))
+'''
+    proc = subprocess.run(
+        ["ssh", "-o", "StrictHostKeyChecking=accept-new", "-o", "ConnectTimeout=10",
+         "-i", str(REMOTE_DEPLOY_KEY), f"root@{tailscale_ip}", "python3", "-"],
+        input=probe_script, capture_output=True, text=True, timeout=20,
+    )
+    if proc.returncode != 0:
+        raise RuntimeError(f"remote probe on {node_name!r} failed: {(proc.stderr or proc.stdout)[-500:]}")
+    return json.loads(proc.stdout)
+
+
 def budget_headroom_mb(node_name: str = "servingz") -> float:
     reg = load_registry()
     node = node_config(node_name)

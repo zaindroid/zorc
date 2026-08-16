@@ -177,6 +177,58 @@ def write_node_yaml(cfg: dict, gpu: dict, cpu: dict, overall_status: str) -> Non
     tmp.rename(path)
 
 
+def refresh_remote_nodes(cfg: dict) -> None:
+    """Keeps every OTHER registered node's nodes/<name>.yaml fresh, reusing
+    the exact same hardware probe gather_node_info() runs locally above --
+    just reached over SSH (agent.remote_node_probe()) for nodes that don't
+    run this watchdog themselves. Was a one-time manual snapshot for
+    hostinger-vps before this; now part of the same periodic cycle
+    servingz already self-registers through.
+
+    One remote node being unreachable is logged and marked as such in its
+    own file -- never allowed to fail this node's own self-registration
+    above, which must always complete regardless."""
+    reg = checks.deploy_agent.load_registry()
+    local_name = cfg["node"]["name"]
+    NODES_DIR.mkdir(parents=True, exist_ok=True)
+    for node_name, node_cfg in reg.get("nodes", {}).items():
+        if node_name == local_name:
+            continue
+        path = NODES_DIR / f"{node_name}.yaml"
+        existing = {}
+        if path.exists():
+            try:
+                existing = yaml.safe_load(path.read_text()) or {}
+            except yaml.YAMLError:
+                existing = {}
+        try:
+            probed = checks.deploy_agent.remote_node_probe(node_name)
+            info = {
+                "node": node_name,
+                "tailscale_ip": node_cfg.get("tailscale_ip"),
+                "arch": probed["arch"],
+                "accelerator": probed["accelerator"],
+                "cpu": probed["cpu"],
+                "ram_mb": probed["ram_mb"],
+                "power": probed["power"],
+                # Hand-maintained, never returned by the hardware probe --
+                # preserved across refreshes rather than wiped.
+                "capabilities": existing.get("capabilities", []),
+                "labels": existing.get("labels", []),
+                "status": "online",
+                "last_seen": now_iso(),
+            }
+        except Exception as e:
+            log.warning("remote probe failed for node %r: %s", node_name, e)
+            info = dict(existing)
+            info["node"] = node_name
+            info["status"] = "unreachable"
+        tmp = path.with_suffix(".yaml.tmp")
+        with open(tmp, "w") as f:
+            yaml.safe_dump(info, f, sort_keys=False, default_flow_style=False)
+        tmp.rename(path)
+
+
 STATUS_COLORS = {OK: "#2e7d32", WARN: "#f9a825", CRIT: "#c62828"}
 
 
@@ -284,6 +336,14 @@ def main() -> int:
             overall = r["status"]
     node_status = "online" if overall != CRIT else "degraded"
     write_node_yaml(cfg, gpu, cpu, node_status)
+    try:
+        refresh_remote_nodes(cfg)
+    except Exception as e:
+        # This node's own self-registration above already completed and
+        # must not be undone by a fleet-wide refresh problem -- log and
+        # move on, same as this cycle already does for a single remote
+        # node being unreachable (handled inside refresh_remote_nodes).
+        log.warning("refresh_remote_nodes failed: %s", e)
 
     render_status_page(results, cfg)
     maybe_send_heartbeat(state, results, cfg, secrets)
