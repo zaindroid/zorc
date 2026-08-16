@@ -246,33 +246,25 @@ def live_headroom_mb(node_name: str) -> float:
     return available_mb
 
 
-def remote_node_probe(node_name: str) -> dict:
+def _probe_hardware_over_ssh(tailscale_ip: str, ssh_key: Path) -> dict:
     """Runs the same arch/cpu/ram/power/accelerator detection
     monitoring/checks.py's gather_node_info() uses locally, but over SSH
-    against a remote node -- for any node that doesn't run the full zorc
-    monitoring stack itself (every node but servingz, today).
+    against a remote host, using an explicit key -- the shared primitive
+    both remote_node_probe() (an already-registered node, always
+    REMOTE_DEPLOY_KEY) and propose_node() (a not-yet-registered candidate,
+    whatever key nodes/candidates.yaml says for it) build on.
 
     Ships the ACTUAL function source from checks.py (via inspect.getsource)
     rather than a hand-copied duplicate, so a future fix to arch/GPU/power
     detection there is automatically what gets probed remotely too -- one
     place to fix, not two. Needs nothing installed on the target beyond a
-    python3 interpreter, which every node already has.
-
-    Shared by two callers: watchdog.py's periodic refresh of non-local
-    nodes' nodes/<name>.yaml, and propose_node()'s one-off pre-registration
-    capability report -- same probe either way, just a different caller
-    and a different thing done with the result."""
+    python3 interpreter, which every node already has."""
     import inspect
     import sys as _sys
     monitoring_dir = str(ZORC_DIR / "monitoring")
     if monitoring_dir not in _sys.path:
         _sys.path.insert(0, monitoring_dir)
     import checks  # deploy/ and monitoring/ import each other; deferred so this only pays the circular-import cost when actually called
-
-    node = node_config(node_name)
-    tailscale_ip = node.get("tailscale_ip")
-    if not tailscale_ip:
-        raise RuntimeError(f"{node_name!r} has no tailscale_ip in registry.yaml -- cannot probe it remotely")
 
     funcs_src = "\n\n".join(
         inspect.getsource(getattr(checks, fn_name))
@@ -301,12 +293,111 @@ print(json.dumps({{
 '''
     proc = subprocess.run(
         ["ssh", "-o", "StrictHostKeyChecking=accept-new", "-o", "ConnectTimeout=10",
-         "-i", str(REMOTE_DEPLOY_KEY), f"root@{tailscale_ip}", "python3", "-"],
+         "-i", str(ssh_key), f"root@{tailscale_ip}", "python3", "-"],
         input=probe_script, capture_output=True, text=True, timeout=20,
     )
     if proc.returncode != 0:
-        raise RuntimeError(f"remote probe on {node_name!r} failed: {(proc.stderr or proc.stdout)[-500:]}")
+        raise RuntimeError(f"remote probe on {tailscale_ip!r} failed: {(proc.stderr or proc.stdout)[-500:]}")
     return json.loads(proc.stdout)
+
+
+def _ssh_run(tailscale_ip: str, ssh_key: Path, remote_cmd: list[str]) -> tuple[int, str, str]:
+    """One-off remote command, same connection conventions as
+    _probe_hardware_over_ssh -- used for the small existing-software checks
+    (docker, coolify) propose_node() runs alongside the hardware probe."""
+    proc = subprocess.run(
+        ["ssh", "-o", "StrictHostKeyChecking=accept-new", "-o", "ConnectTimeout=10",
+         "-i", str(ssh_key), f"root@{tailscale_ip}", *remote_cmd],
+        capture_output=True, text=True, timeout=15,
+    )
+    return proc.returncode, proc.stdout, proc.stderr
+
+
+def remote_node_probe(node_name: str) -> dict:
+    """_probe_hardware_over_ssh() for an already-registered node -- looks
+    up its tailscale_ip from registry.yaml and always uses
+    REMOTE_DEPLOY_KEY, the one key every registered node accepts. Shared by
+    two callers: watchdog.py's periodic refresh of non-local nodes'
+    nodes/<name>.yaml, and (indirectly, via _probe_hardware_over_ssh)
+    propose_node()'s one-off pre-registration capability report."""
+    node = node_config(node_name)
+    tailscale_ip = node.get("tailscale_ip")
+    if not tailscale_ip:
+        raise RuntimeError(f"{node_name!r} has no tailscale_ip in registry.yaml -- cannot probe it remotely")
+    return _probe_hardware_over_ssh(tailscale_ip, REMOTE_DEPLOY_KEY)
+
+
+CANDIDATES_PATH = ZORC_DIR / "nodes" / "candidates.yaml"
+
+
+def load_candidates() -> list[dict]:
+    if not CANDIDATES_PATH.exists():
+        return []
+    return (yaml.safe_load(CANDIDATES_PATH.read_text()) or {}).get("candidates", [])
+
+
+def propose_node(hostname: str) -> dict:
+    """Read-only capability report for a node NOT yet in registry.yaml --
+    the guarded, human-gated alternative to a one-shot autonomous
+    "register_node()" (deliberately never built -- node registration is a
+    new trust boundary and stays human-confirmed, same principle already
+    applied to DNS record creation elsewhere in this MCP server).
+
+    Refuses anything not already listed in nodes/candidates.yaml, a small
+    human-maintained allowlist -- being listed there only authorizes
+    read-only inspection, it is NOT registration, and there is no way to
+    reach an arbitrary caller-supplied host through this function. Never
+    stages anything, never installs anything, never writes to
+    registry.yaml. Actual onboarding stays a human-reviewed registry.yaml
+    edit, guided by this report."""
+    match = next((c for c in load_candidates() if c["hostname"] == hostname), None)
+    if not match:
+        known = [c["hostname"] for c in load_candidates()]
+        return {
+            "status": "refused",
+            "reason": (
+                f"{hostname!r} is not in nodes/candidates.yaml -- propose_node() only inspects "
+                f"pre-approved candidates, never an arbitrary host a caller names. "
+                f"Known candidates: {known or '(none yet)'}. A human needs to add it there first."
+            ),
+        }
+
+    tailscale_ip = match["tailscale_ip"]
+    ssh_key = ZORC_DIR / match["ssh_key"]
+
+    try:
+        hardware = _probe_hardware_over_ssh(tailscale_ip, ssh_key)
+    except Exception as e:
+        return {"status": "unreachable", "hostname": hostname, "reason": str(e)}
+
+    docker_rc, _, _ = _ssh_run(tailscale_ip, ssh_key, ["docker", "--version"])
+    coolify_rc, _, _ = _ssh_run(tailscale_ip, ssh_key, ["test", "-d", "/data/coolify"])
+    has_docker = docker_rc == 0
+    has_coolify = coolify_rc == 0
+
+    if has_docker and has_coolify:
+        suggested_backend = "coolify"
+    elif has_docker:
+        suggested_backend = "zorc-agent"  # not yet implemented -- see registry.yaml's node schema comment
+    else:
+        suggested_backend = None  # neither present; needs a human decision, not a guess
+
+    return {
+        "status": "ready_for_review",
+        "hostname": hostname,
+        "hardware": hardware,
+        "has_docker": has_docker,
+        "has_coolify": has_coolify,
+        "suggested_backend": suggested_backend,
+        "suggested_is_control_plane": False,  # never auto-suggest true -- control-plane trust is always a deliberate human call
+        "note": (
+            "Read-only report. Nothing was staged or installed on this host. To actually onboard: run "
+            "the appropriate process yourself (bootstrap/*.sh for a new control-plane-capable node, or "
+            "Coolify's own server-add flow for a lighter worker node -- see hostinger-vps's onboarding "
+            "as precedent), then add this node to registry.yaml's `nodes:` section yourself (or ask for "
+            "that specific, reviewed edit)."
+        ),
+    }
 
 
 def budget_headroom_mb(node_name: str = "servingz") -> float:

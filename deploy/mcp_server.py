@@ -208,10 +208,31 @@ def list_nodes() -> list[dict]:
             "static_headroom_mb": round(static_headroom),
             "live_headroom_mb": round(live_headroom) if live_headroom is not None else None,
             "has_public_ip": bool(node.get("has_public_ip", False)),
+            "backend": node.get("backend"),
+            "is_control_plane": bool(node.get("is_control_plane", False)),
             "provider": node.get("provider"),
             "app_count": app_count,
         })
     return out
+
+
+@mcp.tool()
+def propose_node(hostname: str) -> dict:
+    """Read-only capability report for a node that is NOT yet part of this
+    platform -- reachability, hardware (arch/cpu/ram/power/accelerator,
+    auto-detected the same way an already-registered node self-reports),
+    and whether Docker/Coolify are already present there.
+
+    This is deliberately NOT a registration tool -- it never writes to
+    registry.yaml, never stages or installs anything on the target. And it
+    is NOT a general-purpose "probe any host" tool either: it only
+    inspects hosts a human has already added to nodes/candidates.yaml.
+    Calling this on a hostname not listed there returns a refusal, not an
+    attempt to reach it -- same reasoning as this server never accepting
+    an arbitrary Cloudflare zone/record from a caller. A new node is a new
+    trust boundary; adding one always requires an explicit, reviewed
+    registry.yaml edit by a human afterward, guided by this report."""
+    return agent.propose_node(hostname)
 
 
 @mcp.tool()

@@ -1,0 +1,10 @@
+# nodes/candidates.yaml -- human-maintained allowlist for propose_node().
+#
+# Listing a host here authorizes READ-ONLY inspection only. It is NOT
+# registration -- propose_node() never writes to registry.yaml, never
+# stages anything, never installs anything. Actual fleet membership always
+# requires a separate, human-reviewed registry.yaml edit.
+#
+# ssh_key is relative to the zorc repo root.
+
+candidates: []
