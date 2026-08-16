@@ -9,6 +9,18 @@
 # name one of these keys (or the literal "pages" for the static-site edge
 # target, which isn't a node at all). Budget is enforced separately PER
 # NODE — an app on hostinger-vps has zero effect on servingz's headroom.
+#
+# `backend` and `is_control_plane` are policy, set by a human here --
+# NEVER derived from or overridden by a node's own self-reported
+# nodes/<name>.yaml (see monitoring/watchdog.py). A node claiming
+# "capabilities: [orchestrator]" about itself must never be sufficient to
+# make it control-plane-eligible; self-reported telemetry informs
+# placement fitness scoring only, never trust or role.
+#   backend: coolify   -> deploy() uses Coolify's API (every node today)
+#            zorc-agent -> not yet implemented; reserved for lightweight
+#                          devices (RPi/Jetson) that can't run full Coolify
+#   is_control_plane: whether shared Postgres/Redis/Traefik and
+#            Traefik-fronted apps are allowed on this node
 nodes:
   servingz:
     total_memory_mb: 32000
@@ -18,6 +30,8 @@ nodes:
     server_uuid: ynlpfb7qft2ld6a0coagy5nm   # Coolify server UUID ("localhost")
     has_public_ip: false     # home network, reachable only via Cloudflare Tunnel
     provider: self-hosted
+    backend: coolify
+    is_control_plane: true
 
   hostinger-vps:
     total_memory_mb: 7800
@@ -32,6 +46,8 @@ nodes:
     ip: 2.25.105.110
     tailscale_ip: 100.112.175.41   # used for live cross-node resource checks (deploy/agent.py live_headroom_mb)
     provider: hostinger
+    backend: coolify
+    is_control_plane: false
 
 domains:
   root: zaindroid.me
