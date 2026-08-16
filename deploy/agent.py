@@ -246,13 +246,16 @@ def live_headroom_mb(node_name: str) -> float:
     return available_mb
 
 
-def _probe_hardware_over_ssh(tailscale_ip: str, ssh_key: Path) -> dict:
+def _probe_hardware_over_ssh(tailscale_ip: str, ssh_key: Path, user: str = "root") -> dict:
     """Runs the same arch/cpu/ram/power/accelerator detection
     monitoring/checks.py's gather_node_info() uses locally, but over SSH
     against a remote host, using an explicit key -- the shared primitive
     both remote_node_probe() (an already-registered node, always
-    REMOTE_DEPLOY_KEY) and propose_node() (a not-yet-registered candidate,
-    whatever key nodes/candidates.yaml says for it) build on.
+    REMOTE_DEPLOY_KEY as root) and propose_node() (a not-yet-registered
+    candidate, whatever key and user nodes/candidates.yaml says for it --
+    a shared/partial machine may only grant a non-root user) build on.
+    None of this probe's commands (uname, /proc, /sys reads, nvidia-smi)
+    need root, so a limited user works fine here.
 
     Ships the ACTUAL function source from checks.py (via inspect.getsource)
     rather than a hand-copied duplicate, so a future fix to arch/GPU/power
@@ -293,7 +296,7 @@ print(json.dumps({{
 '''
     proc = subprocess.run(
         ["ssh", "-o", "StrictHostKeyChecking=accept-new", "-o", "ConnectTimeout=10",
-         "-i", str(ssh_key), f"root@{tailscale_ip}", "python3", "-"],
+         "-i", str(ssh_key), f"{user}@{tailscale_ip}", "python3", "-"],
         input=probe_script, capture_output=True, text=True, timeout=20,
     )
     if proc.returncode != 0:
@@ -301,13 +304,13 @@ print(json.dumps({{
     return json.loads(proc.stdout)
 
 
-def _ssh_run(tailscale_ip: str, ssh_key: Path, remote_cmd: list[str]) -> tuple[int, str, str]:
+def _ssh_run(tailscale_ip: str, ssh_key: Path, remote_cmd: list[str], user: str = "root") -> tuple[int, str, str]:
     """One-off remote command, same connection conventions as
     _probe_hardware_over_ssh -- used for the small existing-software checks
     (docker, coolify) propose_node() runs alongside the hardware probe."""
     proc = subprocess.run(
         ["ssh", "-o", "StrictHostKeyChecking=accept-new", "-o", "ConnectTimeout=10",
-         "-i", str(ssh_key), f"root@{tailscale_ip}", *remote_cmd],
+         "-i", str(ssh_key), f"{user}@{tailscale_ip}", *remote_cmd],
         capture_output=True, text=True, timeout=15,
     )
     return proc.returncode, proc.stdout, proc.stderr
@@ -364,16 +367,22 @@ def propose_node(hostname: str) -> dict:
 
     tailscale_ip = match["tailscale_ip"]
     ssh_key = ZORC_DIR / match["ssh_key"]
+    user = match.get("user", "root")
 
     try:
-        hardware = _probe_hardware_over_ssh(tailscale_ip, ssh_key)
+        hardware = _probe_hardware_over_ssh(tailscale_ip, ssh_key, user)
     except Exception as e:
         return {"status": "unreachable", "hostname": hostname, "reason": str(e)}
 
-    docker_rc, _, _ = _ssh_run(tailscale_ip, ssh_key, ["docker", "--version"])
-    coolify_rc, _, _ = _ssh_run(tailscale_ip, ssh_key, ["test", "-d", "/data/coolify"])
+    docker_rc, _, _ = _ssh_run(tailscale_ip, ssh_key, ["docker", "--version"], user)
+    coolify_rc, _, _ = _ssh_run(tailscale_ip, ssh_key, ["test", "-d", "/data/coolify"], user)
     has_docker = docker_rc == 0
     has_coolify = coolify_rc == 0
+    coolify_check_note = (
+        None if user == "root" else
+        "checked as a non-root user -- a false negative is possible if /data/coolify exists "
+        "but isn't readable by this account"
+    )
 
     if has_docker and has_coolify:
         suggested_backend = "coolify"
@@ -388,6 +397,7 @@ def propose_node(hostname: str) -> dict:
         "hardware": hardware,
         "has_docker": has_docker,
         "has_coolify": has_coolify,
+        "coolify_check_note": coolify_check_note,
         "suggested_backend": suggested_backend,
         "suggested_is_control_plane": False,  # never auto-suggest true -- control-plane trust is always a deliberate human call
         "note": (

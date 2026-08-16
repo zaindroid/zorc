@@ -5,6 +5,17 @@
 # stages anything, never installs anything. Actual fleet membership always
 # requires a separate, human-reviewed registry.yaml edit.
 #
-# ssh_key is relative to the zorc repo root.
+# ssh_key is relative to the zorc repo root. user defaults to root if
+# omitted -- set explicitly for a shared/partial machine where only a
+# limited account was granted.
 
-candidates: []
+candidates:
+  - hostname: rtx5090
+    tailscale_ip: 100.124.93.99
+    ssh_key: deploy/secrets/rtx5090_deploy_key
+    user: zulhaq
+    note: >
+      Personal workstation, RTX 5090, already running other Docker
+      services -- shared/partial node, not fully zorc-owned. Reachable
+      over Tailscale only (no public IP); intended for GPU-based apps/APIs,
+      exposed via Cloudflare Tunnel if/when needed for AI workflows.
