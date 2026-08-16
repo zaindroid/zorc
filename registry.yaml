@@ -21,9 +21,12 @@ nodes:
 
   hostinger-vps:
     total_memory_mb: 7800
-    reserved_mb: 1200        # Docker + Traefik + OS -- no shared Postgres/Redis here
-    usable_mb: 6600
-    max_utilisation: 0.80    # never allocate beyond ~5280 MB
+    reserved_mb: 1350        # Docker + Traefik + OS + dedicated blylinks-crm-postgres
+                             # (~43MB observed live, budgeted to 150MB for connection/buffer growth --
+                             # this is a per-app dedicated instance, not a shared one like servingz's,
+                             # so it isn't tracked in the `infrastructure:` section below)
+    usable_mb: 6450
+    max_utilisation: 0.80    # never allocate beyond ~5160 MB
     server_uuid: tbzuopqpb0hcwx4uheyxqz1t
     has_public_ip: true      # real public IPv4 -- can take direct ingress
     ip: 2.25.105.110
