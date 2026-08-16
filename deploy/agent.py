@@ -223,12 +223,15 @@ LOCAL_NODE = "servingz"
 REMOTE_DEPLOY_KEY = SECRETS / "hostinger_vps_deploy_key"
 
 
-def _remote_host_memory_mb(tailscale_ip: str) -> tuple[float, float]:
+def _remote_host_memory_mb(tailscale_ip: str, ssh_key: Path = REMOTE_DEPLOY_KEY, user: str = "root") -> tuple[float, float]:
     """Same as _host_memory_mb() (defined further down) but for a node
-    this process isn't running on, over SSH via the dedicated deploy key."""
+    this process isn't running on, over SSH. Defaults match every
+    backend: coolify node (root, the shared deploy key) -- a backend:
+    zorc-agent node on a shared/partial machine (e.g. rtx5090) passes its
+    own non-root ssh_key/ssh_user instead, since that's all it has."""
     result = subprocess.run(
         ["ssh", "-o", "StrictHostKeyChecking=accept-new", "-o", "ConnectTimeout=10",
-         "-i", str(REMOTE_DEPLOY_KEY), f"root@{tailscale_ip}", "cat", "/proc/meminfo"],
+         "-i", str(ssh_key), f"{user}@{tailscale_ip}", "cat", "/proc/meminfo"],
         capture_output=True, text=True, timeout=15, check=True,
     )
     info = {}
@@ -243,8 +246,16 @@ def live_headroom_mb(node_name: str) -> float:
     """Real, right-now available memory on the target node -- independent
     of registry.yaml's static budget, so it catches drift from something
     already eating memory *right now* that the static number alone can't
-    see. A second, live check used immediately before create_coolify_app,
-    alongside (never instead of) the static budget_headroom_mb() check."""
+    see. A second, live check used immediately before create_coolify_app
+    (or the zorc-agent equivalent), alongside (never instead of) the
+    static budget_headroom_mb() check.
+
+    This is the ONLY thing that actually protects a shared node like
+    rtx5090 in real time -- registry.yaml's usable_mb/max_utilisation is
+    pure accounting for zorc's own declared apps and has no idea how much
+    RAM the machine's other, non-zorc containers are using at any given
+    moment. This live check does, which is exactly why it's unconditional
+    here regardless of backend."""
     node = node_config(node_name)
     if node_name == LOCAL_NODE:
         _, available_mb = _host_memory_mb()
@@ -252,7 +263,12 @@ def live_headroom_mb(node_name: str) -> float:
         tailscale_ip = node.get("tailscale_ip")
         if not tailscale_ip:
             raise RuntimeError(f"{node_name!r} has no tailscale_ip in registry.yaml -- cannot live-check it")
-        _, available_mb = _remote_host_memory_mb(tailscale_ip)
+        if node.get("backend") == "zorc-agent":
+            ssh_key = ZORC_DIR / node["ssh_key"]
+            user = node.get("ssh_user", "root")
+            _, available_mb = _remote_host_memory_mb(tailscale_ip, ssh_key, user)
+        else:
+            _, available_mb = _remote_host_memory_mb(tailscale_ip)
     return available_mb
 
 

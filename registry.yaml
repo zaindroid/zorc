@@ -16,9 +16,14 @@
 # "capabilities: [orchestrator]" about itself must never be sufficient to
 # make it control-plane-eligible; self-reported telemetry informs
 # placement fitness scoring only, never trust or role.
-#   backend: coolify   -> deploy() uses Coolify's API (every node today)
-#            zorc-agent -> not yet implemented; reserved for lightweight
-#                          devices (RPi/Jetson) that can't run full Coolify
+#   backend: coolify   -> deploy() uses Coolify's API, needs root SSH
+#            zorc-agent -> deploy() uses direct, non-root Docker over SSH
+#                          (deploy/agent.py's _deploy_zorc_agent) -- no
+#                          Traefik, no Nixpacks, Dockerfile-only, dynamic
+#                          port allocation. For nodes that can't/shouldn't
+#                          grant root (shared personal machines, small
+#                          embedded devices). REQUIRES ssh_key + ssh_user
+#                          below (ssh_key relative to this repo's root).
 #   is_control_plane: whether shared Postgres/Redis/Traefik and
 #            Traefik-fronted apps are allowed on this node
 nodes:
@@ -47,6 +52,35 @@ nodes:
     tailscale_ip: 100.112.175.41   # used for live cross-node resource checks (deploy/agent.py live_headroom_mb)
     provider: hostinger
     backend: coolify
+    is_control_plane: false
+
+  rtx5090:
+    # Personal GPU workstation, NOT zorc-owned -- already runs 40+ of the
+    # user's own containers (Supabase, n8n, Langfuse, inference services)
+    # under a non-root account. Only for AI endpoints (agents/LLMs/other AI
+    # services) that apps on servingz/hostinger-vps call over the network
+    # via Cloudflare Tunnel -- never general-purpose apps (see AGENTS.md
+    # and _deploy_zorc_agent's Dockerfile-only gate in deploy/agent.py).
+    #
+    # usable_mb/max_utilisation below are a static SANITY CEILING on zorc's
+    # OWN declared apps only -- they do not reserve or block any actual RAM
+    # from the other 40+ containers, by design (explicit user instruction:
+    # "keep it dynamic and don't block the rtx system"). The real, dynamic
+    # protection is deploy()'s live_headroom_mb() check, which reads this
+    # machine's actual free memory right before every deploy and adapts to
+    # whatever else is running at that moment -- this ceiling only guards
+    # against zorc's own bookkeeping drifting unreasonably high over time.
+    total_memory_mb: 127851
+    reserved_mb: 2000        # zorc-agent's own docker/network overhead only
+    usable_mb: 125851
+    max_utilisation: 0.50    # zorc's own declared apps capped at ~62900 MB on paper;
+                              # live_headroom_mb() is the real gate, not this number
+    has_public_ip: false     # Tailscale-only, no public IP of its own
+    tailscale_ip: 100.124.93.99
+    ssh_key: deploy/secrets/rtx5090_deploy_key
+    ssh_user: zulhaq         # non-root -- this machine's Tailscale SSH ACL blocks root entirely
+    provider: personal
+    backend: zorc-agent
     is_control_plane: false
 
 domains:
