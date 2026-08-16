@@ -150,6 +150,17 @@ infrastructure:
 # Applications. Add new entries at the end. Keep alphabetical within groups.
 # ---------------------------------------------------------------------------
 apps:
+  - name: ivay-caller-portal
+    target: hostinger-vps
+    memory_mb: 1046
+    subdomain: ivay-caller-portal
+    database: true
+    redis_db: null
+    storage_prefix: null
+    repo: "github.com/zaindroid/ivay-caller_portal"
+    critical: false
+    depends_on: []
+
   - name: iht-news-backend
     target: servingz
     memory_mb: 768
