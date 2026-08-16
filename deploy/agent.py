@@ -829,7 +829,8 @@ class DeployError(Exception):
 
 
 def deploy(*, owner_repo: str, name: str, git_branch: str = "main", target_node: str = "servingz",
-           memory_mb_override: int | None = None, env_overrides: dict[str, str] | None = None) -> dict:
+           memory_mb_override: int | None = None, env_overrides: dict[str, str] | None = None,
+           needs_gpu: bool = False) -> dict:
     """Full pipeline: clone -> classify -> budget check -> live resource
     check -> either Cloudflare Pages (static) or Coolify (real app), DNS +
     registration either way. Raises DeployError with the exact step and
@@ -866,9 +867,21 @@ def deploy(*, owner_repo: str, name: str, git_branch: str = "main", target_node:
     app.yaml declares a required var with no matching entry here, deploy()
     fails at the resolve_env_vars step, before create_coolify_app runs --
     no half-built container left crash-looping for a human to clean up.
-    Ignored for static sites (no runtime env vars to set)."""
+    Ignored for static sites (no runtime env vars to set).
+
+    needs_gpu requires target_node's backend to be "zorc-agent" -- GPU
+    passthrough isn't implemented for the Coolify path at all (checked
+    here, fails before cloning anything), regardless of whether the target
+    node happens to report some accelerator in its live telemetry."""
     log = []
     node = node_config(target_node)  # raises KeyError immediately on a bad name
+
+    if needs_gpu and node.get("backend") != "zorc-agent":
+        raise DeployError(
+            "gpu_backend_check",
+            f"{target_node!r} has backend={node.get('backend')!r} -- GPU passthrough is only implemented "
+            "for backend: zorc-agent nodes, regardless of what hardware the target reports",
+        )
 
     def step(name_, fn, *a, **kw):
         try:
@@ -891,6 +904,20 @@ def deploy(*, owner_repo: str, name: str, git_branch: str = "main", target_node:
 
     if classification["kind"] == "unknown":
         raise DeployError("classify", classification["reason"] + " — cannot proceed automatically")
+
+    # zorc-agent nodes have no Nixpacks/buildpack tooling at all (deliberately
+    # not installed -- new dependencies on these machines are exactly the
+    # footprint zorc-agent exists to avoid). A genuine new constraint versus
+    # the Coolify path, not an existing rule -- say so plainly rather than
+    # implying a missing feature.
+    if node.get("backend") == "zorc-agent" and classification["language"] != "dockerfile":
+        raise DeployError(
+            "backend_build_check",
+            f"{target_node!r} (backend: zorc-agent) only supports repos with a Dockerfile at root -- "
+            f"classify() detected {classification['kind']!r}/{classification['language']!r}, not "
+            "dockerfile. No buildpack auto-detection on this backend; add a Dockerfile or target a "
+            "backend: coolify node instead.",
+        )
 
     # Determined here (not deferred into the app.yaml env: parse further
     # down) specifically so the extra memory a dedicated Postgres needs is

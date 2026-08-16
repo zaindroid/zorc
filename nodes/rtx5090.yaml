@@ -1,0 +1,26 @@
+node: rtx5090
+tailscale_ip: 100.124.93.99
+arch: x86_64
+accelerator:
+  type: cuda
+  name: NVIDIA GeForce RTX 5090
+  vram_mb: 32607
+  driver: 580.173.02
+cpu:
+  model: AMD Ryzen 9 7900X 12-Core Processor
+  cores: 12
+  threads: 24
+ram_mb: 127851
+power:
+  source: ac
+  on_battery: false
+capabilities:
+- docker
+- zorc-agent
+- gpu
+- shared-partial
+labels:
+- personal-workstation
+- gpu-node
+status: online
+last_seen: '2026-08-16T10:02:10.000000+00:00'

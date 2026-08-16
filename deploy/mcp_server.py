@@ -296,9 +296,9 @@ def _load_node_telemetry(node_name: str) -> dict:
 
 
 def _score_node(node_name: str, node_cfg: dict, memory_mb: int,
-                 needs_public_ip: bool, required_arch: str | None) -> dict:
+                 needs_public_ip: bool, required_arch: str | None, needs_gpu: bool = False) -> dict:
     """One node's fitness for one placement request. Hard requirements
-    (public IP, budget, architecture, reachability) gate eligibility
+    (public IP, budget, architecture, GPU, reachability) gate eligibility
     outright -- scoring only orders the *remaining* eligible candidates,
     it never overrides a hard requirement to squeeze in a better score."""
     if needs_public_ip and not node_cfg.get("has_public_ip"):
@@ -314,6 +314,25 @@ def _score_node(node_name: str, node_cfg: dict, memory_mb: int,
     if required_arch and node_arch and node_arch != required_arch:
         return {"eligible": False, "score": 0.0,
                 "reasons": [f"needs {required_arch}, node reports {node_arch}"]}
+
+    # Hard gate, not a score nudge -- a GPU app placed on a node that can't
+    # actually do GPU passthrough fails deep inside deploy() instead of at
+    # placement time. Two conditions, both required: real accelerator
+    # hardware (telemetry) AND a backend that implements passthrough at all
+    # (deploy() itself enforces backend=="zorc-agent" for needs_gpu -- kept
+    # in sync here so the scorer never recommends a node deploy() would
+    # then reject, e.g. servingz's legacy GPU is real hardware but backend:
+    # coolify has no --gpus implementation). No live telemetry at all (node
+    # just added, no watchdog cycle yet) is treated as "no accelerator" --
+    # fail closed, don't guess.
+    if needs_gpu:
+        has_accelerator = bool((telemetry.get("accelerator") or {}).get("name"))
+        if not has_accelerator:
+            return {"eligible": False, "score": 0.0, "reasons": ["needs a GPU, this node has no accelerator"]}
+        if node_cfg.get("backend") != "zorc-agent":
+            return {"eligible": False, "score": 0.0,
+                    "reasons": [f"has an accelerator but backend={node_cfg.get('backend')!r} "
+                                "doesn't implement GPU passthrough"]}
 
     if telemetry.get("status") == "unreachable":
         return {"eligible": False, "score": 0.0, "reasons": ["node is currently unreachable"]}
@@ -349,16 +368,17 @@ def _score_node(node_name: str, node_cfg: dict, memory_mb: int,
     return {"eligible": True, "score": score, "reasons": reasons}
 
 
-def _recommend_placement(memory_mb: int, needs_public_ip: bool, required_arch: str | None = None) -> dict:
+def _recommend_placement(memory_mb: int, needs_public_ip: bool, required_arch: str | None = None,
+                          needs_gpu: bool = False) -> dict:
     """Scores every node in registry.yaml against this placement request,
     combining the policy layer (registry.yaml: budget, is_control_plane,
     has_public_ip) with the live layer (nodes/*.yaml: architecture,
-    reachability, telemetry freshness). Replaces the old two-node
-    hardcoded fallback -- this is meant to keep working correctly as the
-    fleet grows past two nodes, not just for today's two."""
+    accelerator, reachability, telemetry freshness). Replaces the old
+    two-node hardcoded fallback -- this is meant to keep working correctly
+    as the fleet grows past two nodes, not just for today's two."""
     reg = agent.load_registry()
     scored = {
-        node_name: _score_node(node_name, node_cfg, memory_mb, needs_public_ip, required_arch)
+        node_name: _score_node(node_name, node_cfg, memory_mb, needs_public_ip, required_arch, needs_gpu)
         for node_name, node_cfg in reg["nodes"].items()
     }
 
@@ -380,16 +400,20 @@ def _recommend_placement(memory_mb: int, needs_public_ip: bool, required_arch: s
 
 
 @mcp.tool()
-def recommend_placement(memory_mb: int, needs_public_ip: bool = False, required_arch: str | None = None) -> dict:
+def recommend_placement(memory_mb: int, needs_public_ip: bool = False, required_arch: str | None = None,
+                         needs_gpu: bool = False) -> dict:
     """Recommends which node to target by scoring every registered node
     against this request -- budget fit, public-IP requirement, optional
-    architecture match, and live reachability/telemetry freshness. Pure
-    recommendation, no side effects -- a quick preview tool that also shows
-    every node considered and why (candidates_considered), not just the
-    winner. For an actual deploy(), use analyze_deployment_requirements()
-    instead, which does this same scoring but from a properly-derived
-    memory estimate rather than a number you supply directly."""
-    return _recommend_placement(memory_mb, needs_public_ip, required_arch)
+    architecture match, GPU availability, and live reachability/telemetry
+    freshness. needs_gpu is a hard requirement, not a preference: a node
+    with no accelerator in its live telemetry is never returned, regardless
+    of how well it scores otherwise. Pure recommendation, no side effects --
+    a quick preview tool that also shows every node considered and why
+    (candidates_considered), not just the winner. For an actual deploy(),
+    use analyze_deployment_requirements() instead, which does this same
+    scoring but from a properly-derived memory estimate rather than a
+    number you supply directly."""
+    return _recommend_placement(memory_mb, needs_public_ip, required_arch, needs_gpu)
 
 
 def _estimate_memory_from_repo(repo_dir, classification: dict) -> tuple[int, list[str]]:
@@ -443,6 +467,7 @@ def analyze_deployment_requirements(
     needs_websockets: bool,
     needs_persistent_storage: bool,
     needs_public_ip: bool,
+    needs_gpu: bool,
     estimated_memory_mb: int,
     reasoning: str,
 ) -> dict:
@@ -600,7 +625,7 @@ def analyze_deployment_requirements(
             ),
         }
 
-    placement = _recommend_placement(adjusted_estimate_mb, needs_public_ip)
+    placement = _recommend_placement(adjusted_estimate_mb, needs_public_ip, needs_gpu=needs_gpu)
     if not placement["fits"]:
         return {
             "status": "blocked",
@@ -609,6 +634,7 @@ def analyze_deployment_requirements(
             "warnings": warnings,
             "env_requirements": env_requirements,
             "database_provisioned": database_requested,
+            "needs_gpu": needs_gpu,
             "reason": f"requirements are consistent, but nothing fits: {placement['reason']}",
         }
 
@@ -626,6 +652,7 @@ def analyze_deployment_requirements(
         "framework": framework,
         "env_requirements": env_requirements,
         "database_provisioned": database_requested,
+        "needs_gpu": needs_gpu,
         "status": "approved",
     }
     _approved_reports[report_id] = {"report": report, "expires_at": time.time() + REPORT_TTL_SEC}
@@ -738,7 +765,7 @@ def deploy(owner_repo: str, name: str, report_id: str, git_branch: str = "main",
     try:
         result = agent.deploy(owner_repo=owner_repo, name=name, git_branch=git_branch,
                                target_node=target_node, memory_mb_override=memory_mb_override,
-                               env_overrides=env_overrides)
+                               env_overrides=env_overrides, needs_gpu=report.get("needs_gpu", False))
         _deploy_timestamps.append(now)
         _audit("deploy", params, {"status": "deployed", "domain": result.get("domain"), "report": report})
         return result
