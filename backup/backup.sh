@@ -48,6 +48,11 @@ mkdir -p "$STAGING"
 echo "[$TS] dumping shared app postgres..."
 docker exec t5amapezxhesfta6w82ksyt0 pg_dumpall -U postgres | gzip > "$WORKDIR/app_postgres.sql.gz"
 
+echo "[$TS] dumping blylinks-crm postgres (dedicated instance on hostinger-vps)..."
+ssh -o StrictHostKeyChecking=accept-new -o ConnectTimeout=10 \
+    -i /home/zman/zorc/deploy/secrets/hostinger_vps_deploy_key root@100.112.175.41 \
+    "docker exec yxwbfp5davvvc81kz9z4htkq pg_dumpall -U postgres" | gzip > "$WORKDIR/blylinks_crm_postgres.sql.gz"
+
 echo "[$TS] dumping coolify's own postgres..."
 docker exec coolify-db pg_dumpall -U coolify | gzip > "$WORKDIR/coolify_postgres.sql.gz"
 
@@ -71,7 +76,7 @@ docker run --rm -v xqs09x5gbtz6evz7szqty7u4_n8n-data:/data -v "$WORKDIR":/backup
 
 
 ARCHIVE="$WORKDIR/backup_${TS}.tar.gz"
-tar czf "$ARCHIVE" -C "$WORKDIR" app_postgres.sql.gz coolify_postgres.sql.gz coolify_data.tar.gz cloudflared.tar.gz iht_news_automation.db.gz iht_news_typesense.tar.gz iht_news_n8n.tar.gz
+tar czf "$ARCHIVE" -C "$WORKDIR" app_postgres.sql.gz blylinks_crm_postgres.sql.gz coolify_postgres.sql.gz coolify_data.tar.gz cloudflared.tar.gz iht_news_automation.db.gz iht_news_typesense.tar.gz iht_news_n8n.tar.gz
 
 echo "[$TS] encrypting..."
 ENCRYPTED="$STAGING/backup_${TS}.tar.gz.gpg"
