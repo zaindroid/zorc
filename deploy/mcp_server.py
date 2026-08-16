@@ -102,8 +102,10 @@ mcp = MCPServer(
         "call returns -- memory and node placement come from that report, not "
         "from anything you pass directly. deploy() only ever creates a new "
         "app; it cannot touch, modify, or delete anything that already exists. "
-        "If your app needs any env var beyond DATABASE_URL/APP_ENV/LOG_LEVEL, "
-        "declare it in app.yaml's env: section (see get_platform_contract) -- "
+        "Needs a database? Set app.yaml's database: true -- a dedicated Postgres "
+        "gets provisioned and DATABASE_URL set automatically, you never handle "
+        "credentials yourself. If your app needs any other env var beyond APP_ENV/"
+        "LOG_LEVEL, declare it in app.yaml's env: section (see get_platform_contract) -- "
         "internal secrets get generated and set for you automatically; "
         "anything tied to a real external account must be passed to deploy() "
         "via env_overrides, and analyze_deployment_requirements()'s report "
@@ -119,9 +121,10 @@ def get_platform_contract() -> dict:
     this before writing any code for a new app."""
     return {
         "required_files": {
-            "app.yaml": "declares name, memory_mb, port, domains, dependencies, and "
-                        "(optional) an env: section for anything beyond the three "
-                        "auto-provided vars -- see env_vars_beyond_defaults below",
+            "app.yaml": "declares name, memory_mb, port, domains, dependencies, an "
+                        "(optional) database: true flag -- see database_provisioning "
+                        "below -- and an (optional) env: section for anything beyond "
+                        "the auto-provided vars -- see env_vars_beyond_defaults below",
             "Dockerfile": "only if your stack needs something build-autodetection "
                            "can't handle; otherwise a standard manifest "
                            "(package.json / requirements.txt / go.mod / etc) is enough",
@@ -134,7 +137,16 @@ def get_platform_contract() -> dict:
             "GET /version": "{'sha':..., 'built':...}",
             "GET /openapi.json": "your API spec",
         },
-        "env_vars_provided_at_deploy": ["DATABASE_URL", "APP_ENV", "LOG_LEVEL"],
+        "env_vars_provided_at_deploy": ["APP_ENV", "LOG_LEVEL"],
+        "database_provisioning": (
+            "DATABASE_URL is NOT provided unconditionally -- set app.yaml's top-level "
+            "database: true and deploy() provisions a real, dedicated Postgres instance "
+            "for your app, creates a scoped role+database on it, and sets DATABASE_URL "
+            "before your container's first real start (same generate-and-set pattern as "
+            "env:'s generate: hex secrets -- you never see or handle the credentials). "
+            "Omit database: true (or set it false) if your app has no database -- "
+            "nothing gets provisioned and DATABASE_URL is simply not set."
+        ),
         "env_vars_beyond_defaults": (
             "If your app needs any env var other than the three above (a JWT/session "
             "signing secret, a third-party API key, anything your code reads at "
@@ -412,9 +424,11 @@ def analyze_deployment_requirements(
                     "reason": classification["reason"] + " -- cannot analyze an unrecognized repo"}
 
         try:
-            declared_env = agent.parse_app_yaml(repo_dir)["env"]
+            parsed_app_yaml = agent.parse_app_yaml(repo_dir)
         except ValueError as e:
             return {"status": "rejected", "reason": f"app.yaml is malformed: {e}"}
+        declared_env = parsed_app_yaml["env"]
+        database_requested = parsed_app_yaml["database"]
         env_requirements = {
             "generated_internally": sorted(k for k, spec in declared_env.items() if "generate" in spec),
             "required_from_caller": sorted(k for k, spec in declared_env.items() if "required" in spec),
@@ -473,6 +487,7 @@ def analyze_deployment_requirements(
             "signals": signals,
             "warnings": warnings,
             "env_requirements": env_requirements,
+            "database_provisioned": database_requested,
             "concurrency_adjusted_estimate_mb": adjusted_estimate_mb,
             "self_reported_mb": estimated_memory_mb,
             "reason": (
@@ -495,6 +510,7 @@ def analyze_deployment_requirements(
             "concurrency_adjusted_estimate_mb": adjusted_estimate_mb,
             "warnings": warnings,
             "env_requirements": env_requirements,
+            "database_provisioned": database_requested,
             "reason": f"requirements are consistent, but nothing fits: {placement['reason']}",
         }
 
@@ -511,6 +527,7 @@ def analyze_deployment_requirements(
         "app_kind": app_kind,
         "framework": framework,
         "env_requirements": env_requirements,
+        "database_provisioned": database_requested,
         "status": "approved",
     }
     _approved_reports[report_id] = {"report": report, "expires_at": time.time() + REPORT_TTL_SEC}
