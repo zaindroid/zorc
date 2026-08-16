@@ -83,6 +83,35 @@ nodes:
     backend: zorc-agent
     is_control_plane: false
 
+  jetson-thor:
+    # NVIDIA Jetson AGX Thor edge device, NOT zorc-owned -- the user's own
+    # test bench for AI-workflow POCs. Its existing containers (15 at
+    # registration time) are explicitly transient/disposable test services,
+    # not permanent infrastructure -- expect this machine's real free
+    # memory to fluctuate a lot more than rtx5090's. zorc treats it the
+    # same way: a second test bench, not a production target.
+    #
+    # Same dynamic model as rtx5090 (see its comment above) -- usable_mb/
+    # max_utilisation is a static sanity ceiling on zorc's own declared
+    # apps only, NOT a reservation. live_headroom_mb() is the real,
+    # real-time gate and will correctly refuse a deploy when the user's
+    # own test workloads have it genuinely full (observed as low as ~8GB
+    # free out of 123GB at registration time -- don't be surprised if
+    # deploys here fail on live_resource_check more often than rtx5090's).
+    total_memory_mb: 125771
+    reserved_mb: 2000        # zorc-agent's own docker/network overhead only
+    usable_mb: 123771
+    max_utilisation: 0.50    # zorc's own declared apps capped at ~61900 MB on paper;
+                              # live_headroom_mb() is the real gate, not this number
+    has_public_ip: false     # Tailscale-only, no public IP of its own
+    tailscale_ip: 100.119.248.100
+    ssh_key: deploy/secrets/jetson-thor_deploy_key
+    ssh_user: zain           # non-root -- SSH reaches this device via Tailscale SSH's own
+                              # interception (same as rtx5090's root block), not authorized_keys
+    provider: personal
+    backend: zorc-agent
+    is_control_plane: false
+
 domains:
   root: zaindroid.me
   # NOTE: staging_suffix is concatenated as <app>{staging_suffix}.{root},

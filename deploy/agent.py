@@ -347,15 +347,29 @@ def _ssh_run(tailscale_ip: str, ssh_key: Path, remote_cmd: list[str], user: str 
 
 def remote_node_probe(node_name: str) -> dict:
     """_probe_hardware_over_ssh() for an already-registered node -- looks
-    up its tailscale_ip from registry.yaml and always uses
-    REMOTE_DEPLOY_KEY, the one key every registered node accepts. Shared by
-    two callers: watchdog.py's periodic refresh of non-local nodes'
-    nodes/<name>.yaml, and (indirectly, via _probe_hardware_over_ssh)
-    propose_node()'s one-off pre-registration capability report."""
+    up its tailscale_ip from registry.yaml, using REMOTE_DEPLOY_KEY as root
+    for every backend: coolify node (the one key those all accept) or the
+    node's own ssh_key/ssh_user for a backend: zorc-agent node, which may
+    have no root access at all. Shared by two callers: watchdog.py's
+    periodic refresh of non-local nodes' nodes/<name>.yaml, and
+    (indirectly, via _probe_hardware_over_ssh) propose_node()'s one-off
+    pre-registration capability report.
+
+    Real bug found live: this always used REMOTE_DEPLOY_KEY as root,
+    exactly like live_headroom_mb() before its own fix -- broke the
+    watchdog's periodic refresh for both zorc-agent nodes the moment they
+    were registered (rtx5090's nodes/rtx5090.yaml silently flipped to
+    status: unreachable, jetson-thor's was reduced to a bare stub), since
+    root SSH is blocked on both by Tailscale ACL policy. Same fix as
+    live_headroom_mb(): use the node's own credentials when it has them."""
     node = node_config(node_name)
     tailscale_ip = node.get("tailscale_ip")
     if not tailscale_ip:
         raise RuntimeError(f"{node_name!r} has no tailscale_ip in registry.yaml -- cannot probe it remotely")
+    if node.get("backend") == "zorc-agent":
+        ssh_key = ZORC_DIR / node["ssh_key"]
+        user = node.get("ssh_user", "root")
+        return _probe_hardware_over_ssh(tailscale_ip, ssh_key, user)
     return _probe_hardware_over_ssh(tailscale_ip, REMOTE_DEPLOY_KEY)
 
 

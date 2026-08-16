@@ -19,3 +19,14 @@ candidates:
       services -- shared/partial node, not fully zorc-owned. Reachable
       over Tailscale only (no public IP); intended for GPU-based apps/APIs,
       exposed via Cloudflare Tunnel if/when needed for AI workflows.
+
+  - hostname: jetson-thor
+    tailscale_ip: 100.119.248.100
+    ssh_key: deploy/secrets/jetson-thor_deploy_key
+    user: zain
+    note: >
+      NVIDIA Jetson AGX Thor edge device. Reachable over Tailscale only
+      (no public IP). SSH connects via Tailscale SSH's own interception
+      (same mechanism that blocks root on rtx5090) rather than plain
+      authorized_keys -- confirm the actual trust boundary before
+      registering anything privileged.
