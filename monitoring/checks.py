@@ -8,6 +8,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import platform
 import shutil
 import subprocess
 import sys
@@ -298,46 +299,89 @@ def docker_user_port_block(cfg: dict) -> dict:
 # Node self-registration data (feeds nodes/servingz.yaml, see watchdog.py)
 # ---------------------------------------------------------------------------
 
-def gather_node_info(cfg: dict, gpu_check_result: dict, cpu_check_result: dict) -> dict:
-    """Reuses already-computed gpu/cpu check results to avoid double-probing."""
+def _detect_accelerator() -> dict | None:
+    """NVIDIA discrete GPU (desktop/server, via nvidia-smi) first, then a
+    Jetson-style SoC accelerator (no nvidia-smi there -- VRAM is shared
+    system RAM, detected instead via the device-tree model string every
+    Jetson exposes). Real gap this replaces: the old version only ever
+    checked nvidia-smi, so a Jetson board silently reported no accelerator
+    at all."""
     rc, out, _ = _run(["nvidia-smi", "--query-gpu=name,driver_version,memory.total", "--format=csv,noheader"])
-    accel = None
     if rc == 0 and out.strip():
         try:
             name, driver, vram_s = [x.strip() for x in out.strip().split(",")]
             vram_mb = int(vram_s.replace(" MiB", "").strip())
-            accel = {"type": "cuda", "name": name, "vram_mb": vram_mb, "driver": driver}
+            return {"type": "cuda", "name": name, "vram_mb": vram_mb, "driver": driver}
         except ValueError:
             pass
 
+    try:
+        model = Path("/proc/device-tree/model").read_text(errors="replace").strip("\x00").strip()
+    except OSError:
+        model = ""
+    if "jetson" in model.lower():
+        return {"type": "tegra", "name": model, "vram_mb": None, "driver": None}
+
+    return None
+
+
+def _detect_power_source() -> dict:
+    """Tries every /sys/class/power_supply/*/online path rather than one
+    hardcoded name (AC vs ACAD vs AC0 varies by machine) -- and, real gap
+    this replaces: the old version raised on any node without one at all
+    (most VPS/cloud/desktop nodes have no battery subsystem whatsoever),
+    which meant this silently broke self-registration on hostinger-vps. No
+    power_supply entries at all is treated as "always-on mains power," the
+    correct read for that case, not an error."""
+    power_supply_dir = Path("/sys/class/power_supply")
+    if not power_supply_dir.is_dir():
+        return {"source": "ac", "on_battery": False}
+    for entry in power_supply_dir.iterdir():
+        online_path = entry / "online"
+        if not online_path.exists():
+            continue
+        try:
+            on_ac = online_path.read_text().strip() == "1"
+            return {"source": "ac" if on_ac else "battery", "on_battery": not on_ac}
+        except OSError:
+            continue
+    return {"source": "ac", "on_battery": False}
+
+
+def _detect_cpu() -> dict:
     cpu_model = "unknown"
+    core_ids: set[str] = set()
     try:
         with open("/proc/cpuinfo") as f:
             for line in f:
-                if line.startswith("model name"):
+                if line.startswith("model name") and cpu_model == "unknown":
                     cpu_model = line.split(":", 1)[1].strip()
-                    break
+                elif line.startswith("core id"):
+                    core_ids.add(line.split(":", 1)[1].strip())
     except OSError:
         pass
+    return {"model": cpu_model, "cores": len(core_ids) or None, "threads": os.cpu_count()}
 
+
+def gather_node_info(cfg: dict, gpu_check_result: dict, cpu_check_result: dict) -> dict:
+    """Reuses already-computed gpu/cpu check results to avoid double-probing.
+
+    arch/cpu/ram/power/accelerator below are auto-probed every run;
+    capabilities/labels are hand-maintained in this node's config.json --
+    kept manual deliberately (what a node is *allowed* to do is a policy
+    decision, not something to infer from what hardware happens to be
+    present)."""
     info = _read_meminfo()
     ram_mb = info["MemTotal"] // 1024
-
-    with open("/sys/class/power_supply/AC/online") as f:
-        on_ac = f.read().strip() == "1"
-
-    import os as _os
-    physical_cores = len({l.split(":")[1].strip() for l in open("/proc/cpuinfo") if l.startswith("core id")}) or None
-    threads = _os.cpu_count()
 
     return {
         "node": cfg["node"]["name"],
         "tailscale_ip": cfg["node"]["tailscale_ip"],
-        "arch": "x86_64",
-        "accelerator": accel,
-        "cpu": {"model": cpu_model, "cores": physical_cores, "threads": threads},
+        "arch": platform.machine(),
+        "accelerator": _detect_accelerator(),
+        "cpu": _detect_cpu(),
         "ram_mb": ram_mb,
-        "power": {"source": "ac" if on_ac else "battery", "on_battery": not on_ac},
+        "power": _detect_power_source(),
         "capabilities": cfg["node"]["capabilities"],
         "labels": cfg["node"]["labels"],
     }
