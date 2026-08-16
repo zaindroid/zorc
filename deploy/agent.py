@@ -40,19 +40,29 @@ def _load_resource_map() -> dict:
 
 
 def record_resource(name: str, *, kind: str, coolify_uuid: str | None = None,
-                     domains: list[str] | None = None, coolify_postgres_uuid: str | None = None) -> None:
-    """kind: 'coolify' | 'coolify-service' | 'pages'. domains is only
+                     domains: list[str] | None = None, coolify_postgres_uuid: str | None = None,
+                     container_name: str | None = None, postgres_container_name: str | None = None,
+                     node: str | None = None) -> None:
+    """kind: 'coolify' | 'coolify-service' | 'pages' | 'zorc-agent'. domains is only
     needed for 'coolify-service' -- a docker-compose stack can expose
     several subdomains that don't derive from `name` the way a normal
     app's single hostname does, so delete_app needs them listed explicitly
     to clean DNS up properly. coolify_postgres_uuid is set when
     provision_dedicated_postgres() created a database for this app --
     kept alongside so a future teardown/backup step can find it without
-    re-deriving the name."""
+    re-deriving the name. container_name/postgres_container_name/node are
+    the zorc-agent equivalents -- no UUIDs exist on that backend, teardown
+    needs the container name plus which node it's actually on."""
     m = _load_resource_map()
     entry = {"kind": kind, "coolify_uuid": coolify_uuid, "domains": domains or []}
     if coolify_postgres_uuid:
         entry["coolify_postgres_uuid"] = coolify_postgres_uuid
+    if container_name:
+        entry["container_name"] = container_name
+    if postgres_container_name:
+        entry["postgres_container_name"] = postgres_container_name
+    if node:
+        entry["node"] = node
     m[name] = entry
     RESOURCE_MAP_PATH.write_text(json.dumps(m, indent=2))
 
@@ -595,19 +605,13 @@ def resolve_env_vars(repo_dir: Path, env_overrides: dict[str, str] | None) -> tu
 DEDICATED_POSTGRES_MEMORY_MB = 150
 
 
-def provision_dedicated_postgres(app_name: str, target_node: str) -> tuple[str, str]:
-    """Creates a new, single-app-dedicated Postgres instance on target_node
-    via Coolify, waits (bounded, 90s) for it to report healthy, creates a
-    role+database scoped to app_name, and returns (coolify_postgres_uuid,
-    database_url). The instance's own superuser credentials never leave
-    this function -- not returned, not logged, not passed to the caller --
-    only the freshly-generated app-scoped role's connection string is.
-
-    Built after discovering DATABASE_URL provisioning was entirely
-    unimplemented despite being a documented part of the platform contract
-    -- blylinks-crm needed this done by hand once; this is that process
-    turned into reusable, repeatable code."""
-    node = node_config(target_node)
+def _provision_postgres_coolify(app_name: str, node: dict, target_node: str) -> tuple[str, list[str]]:
+    """Backend-specific head #1: creates a Coolify-managed dedicated
+    Postgres, waits (bounded, 90s) for it to report healthy. Returns
+    (container_name, exec_cmd_prefix) -- exec_cmd_prefix is how the shared
+    tail below reaches it: plain `docker exec` if this process already
+    runs on the target (servingz), SSH with the standard REMOTE_DEPLOY_KEY
+    otherwise."""
     with httpx.Client(timeout=30) as client:
         r = client.post(f"{COOLIFY_URL}/databases/postgresql", headers=_coolify_headers(), json={
             "project_uuid": COOLIFY_PROJECT_UUID,
@@ -639,26 +643,98 @@ def provision_dedicated_postgres(app_name: str, target_node: str) -> tuple[str, 
     # its own UUID -- confirmed live (matches every other database on this
     # platform, e.g. the shared servingz instance).
     container_name = db_uuid
+    if target_node == LOCAL_NODE:
+        exec_prefix = ["docker", "exec", "-i", container_name, "psql", "-U", "postgres"]
+    else:
+        tailscale_ip = node.get("tailscale_ip")
+        if not tailscale_ip:
+            raise RuntimeError("node has no tailscale_ip in registry.yaml -- cannot reach it")
+        exec_prefix = ["ssh", "-o", "StrictHostKeyChecking=accept-new", "-o", "ConnectTimeout=10",
+                        "-i", str(REMOTE_DEPLOY_KEY), f"root@{tailscale_ip}",
+                        "docker", "exec", "-i", container_name, "psql", "-U", "postgres"]
+    return container_name, exec_prefix
+
+
+def _provision_postgres_zorc_agent(app_name: str, node: dict) -> tuple[str, list[str]]:
+    """Backend-specific head #2: a direct `docker run` on the zorc-agent
+    network -- no Coolify API involved at all, matches everything else
+    this backend does. Superuser password generated here, used only for
+    the one connection the shared tail makes immediately after, never
+    returned or logged. Returns (container_name, exec_cmd_prefix), same
+    shape as the Coolify head."""
+    tailscale_ip = node.get("tailscale_ip")
+    if not tailscale_ip:
+        raise RuntimeError("node has no tailscale_ip in registry.yaml -- cannot reach it")
+    ssh_key = ZORC_DIR / node["ssh_key"]
+    user = node.get("ssh_user", "root")
+
+    _zorc_agent_ensure_network(tailscale_ip, ssh_key, user)
+    container_name = f"{app_name}-postgres"
+    superuser_password = secrets.token_hex(24)
+    rc, out, err = _ssh_run(
+        tailscale_ip, ssh_key,
+        ["docker", "run", "-d", "--name", container_name, "--network", ZORC_AGENT_NETWORK,
+         "--restart", "unless-stopped", "--label", "managed-by=zorc", "--label", f"zorc-app={app_name}",
+         "-e", f"POSTGRES_PASSWORD={superuser_password}", "postgres:18-alpine"],
+        user, timeout=30,
+    )
+    if rc != 0:
+        raise RuntimeError(f"failed to start dedicated postgres for {app_name!r}: {err[-500:]}")
+    container_id = out.strip()
+    _zorc_agent_wait_healthy(tailscale_ip, ssh_key, user, container_id, timeout_sec=60)
+
+    # Container-running is not the same as Postgres-accepting-connections
+    # (it takes a few seconds to init even after the process starts) --
+    # wait for pg_isready specifically before handing off to the shared
+    # SQL tail, which would otherwise hit a connection-refused race.
+    ready_deadline = time.time() + 30
+    ready = False
+    while time.time() < ready_deadline:
+        rc, _, _ = _ssh_run(tailscale_ip, ssh_key,
+                             ["docker", "exec", container_name, "pg_isready", "-U", "postgres"], user)
+        if rc == 0:
+            ready = True
+            break
+        time.sleep(2)
+    if not ready:
+        raise RuntimeError(f"dedicated postgres for {app_name!r} did not become ready within 30s")
+
+    exec_prefix = ["ssh", "-o", "StrictHostKeyChecking=accept-new", "-o", "ConnectTimeout=10",
+                    "-i", str(ssh_key), f"{user}@{tailscale_ip}",
+                    "docker", "exec", "-i", container_name, "psql", "-U", "postgres"]
+    return container_name, exec_prefix
+
+
+def provision_dedicated_postgres(app_name: str, target_node: str) -> tuple[str, str]:
+    """Creates a new, single-app-dedicated Postgres instance on target_node
+    -- via Coolify's API for backend: coolify nodes, or a direct `docker
+    run` for backend: zorc-agent nodes (see the two heads above) -- then
+    runs the same role+database creation SQL either way (this tail), and
+    returns (container_identifier, database_url). The instance's own
+    superuser credentials never leave this function -- not returned, not
+    logged, not passed to the caller -- only the freshly-generated
+    app-scoped role's connection string is.
+
+    Built after discovering DATABASE_URL provisioning was entirely
+    unimplemented despite being a documented part of the platform contract
+    -- blylinks-crm needed this done by hand once; this is that process
+    turned into reusable, repeatable code."""
+    node = node_config(target_node)
+    if node.get("backend") == "zorc-agent":
+        container_name, exec_prefix = _provision_postgres_zorc_agent(app_name, node)
+    else:
+        container_name, exec_prefix = _provision_postgres_coolify(app_name, node, target_node)
+
     db_role = re.sub(r"[^a-z0-9_]", "_", app_name.lower())
     db_password = secrets.token_hex(24)
     sql = f"CREATE ROLE {db_role} WITH LOGIN PASSWORD '{db_password}'; CREATE DATABASE {db_role} OWNER {db_role};"
 
-    if target_node == LOCAL_NODE:
-        cmd = ["docker", "exec", "-i", container_name, "psql", "-U", "postgres"]
-    else:
-        tailscale_ip = node.get("tailscale_ip")
-        if not tailscale_ip:
-            raise RuntimeError(f"{target_node!r} has no tailscale_ip in registry.yaml -- cannot reach it")
-        cmd = ["ssh", "-o", "StrictHostKeyChecking=accept-new", "-o", "ConnectTimeout=10",
-               "-i", str(REMOTE_DEPLOY_KEY), f"root@{tailscale_ip}",
-               "docker", "exec", "-i", container_name, "psql", "-U", "postgres"]
-
-    proc = subprocess.run(cmd, input=sql, capture_output=True, text=True, timeout=20)
+    proc = subprocess.run(exec_prefix, input=sql, capture_output=True, text=True, timeout=20)
     if proc.returncode != 0:
         raise RuntimeError(f"failed to create role/database for {app_name!r}: {proc.stderr[-500:]}")
 
     database_url = f"postgres://{db_role}:{db_password}@{container_name}:5432/{db_role}"
-    return db_uuid, database_url
+    return container_name, database_url
 
 
 def check_deploy_budget(name: str, memory_mb: int, node_name: str = "servingz") -> tuple[bool, str]:
@@ -970,11 +1046,18 @@ def register_app(*, name: str, memory_mb: int, subdomain: str, repo: str, target
     REGISTRY_PATH.write_text(text)
 
 
-def add_tunnel_route(hostname: str) -> None:
+def add_tunnel_route(hostname: str, service: str = "https://localhost:443") -> None:
     """Every Coolify-managed app routes through the same Traefik hop --
     Traefik dispatches to the right container by Host() header, using the
     domains we set on the Coolify app resource. Same pattern as every
     existing app entry (hello.zaindroid.me, hello-staging.zaindroid.me).
+    Default `service` is unchanged for these callers.
+
+    zorc-agent apps have no Traefik hop and no TLS of their own -- cloudflared
+    on servingz reaches the target node directly over Tailscale, so callers
+    pass service="http://<tailscale_ip>:<port>" instead. Plain HTTP, no
+    originRequest override needed (that only exists to skip verifying
+    Traefik's self-signed origin cert, which doesn't apply here).
 
     Real bug found live: the idempotency check used to read the REPO copy
     of cloudflared's config, not the live one at /etc/cloudflared. A first
@@ -1000,11 +1083,9 @@ def add_tunnel_route(hostname: str) -> None:
 
     cfg = yaml.safe_load(repo_config_path.read_text())
     if not any(r.get("hostname") == hostname for r in cfg["ingress"]):
-        new_rule = {
-            "hostname": hostname,
-            "service": "https://localhost:443",
-            "originRequest": {"noTLSVerify": True},
-        }
+        new_rule = {"hostname": hostname, "service": service}
+        if service.startswith("https://"):
+            new_rule["originRequest"] = {"noTLSVerify": True}
         cfg["ingress"].insert(-1, new_rule)  # keep the catch-all 404 rule last
         repo_config_path.write_text(yaml.dump(cfg, sort_keys=False))
     # Always push to live + reload from here, even if the repo file already
@@ -1018,6 +1099,77 @@ def git_commit_and_push(message: str) -> None:
     subprocess.run(["git", "-C", str(ZORC_DIR), "add", "registry.yaml", "cloudflared/config.yml"], check=True)
     subprocess.run(["git", "-C", str(ZORC_DIR), "commit", "-m", message], check=True)
     subprocess.run(["git", "-C", str(ZORC_DIR), "push", "origin", "main"], check=True)
+
+
+def _deploy_zorc_agent(*, step, log: list, node: dict, target_node: str, name: str, owner_repo: str,
+                        repo_dir: Path, classification: dict, memory_mb: int, env_vars_to_set: dict[str, str],
+                        needs_gpu: bool, needs_database: bool, postgres_container_name: str | None,
+                        domain: str) -> dict:
+    """The zorc-agent equivalent of deploy()'s Coolify branch below --
+    everything from here down runs entirely over SSH against a non-root
+    Docker daemon, no Coolify API involved. Called from deploy() once the
+    shared clone/classify/budget/env/database/live-headroom steps have all
+    passed -- those steps are backend-agnostic and stay in deploy() itself."""
+    tailscale_ip = node["tailscale_ip"]
+    ssh_key = ZORC_DIR / node["ssh_key"]
+    user = node.get("ssh_user", "root")
+
+    step("ensure_network", _zorc_agent_ensure_network, tailscale_ip, ssh_key, user)
+    port = step("allocate_port", _zorc_agent_allocate_port, tailscale_ip, ssh_key, user)
+
+    remote_dir = f"/home/{user}/zorc-agent-apps/{name}"
+    step("upload_repo", _zorc_agent_upload_repo, tailscale_ip, ssh_key, user, repo_dir, remote_dir)
+
+    image_tag = f"zorc-{name}:latest"
+    step("build_image", _zorc_agent_build_image, tailscale_ip, ssh_key, user, remote_dir, image_tag)
+
+    if needs_gpu:
+        step("preflight_gpu", _zorc_agent_preflight_gpu, tailscale_ip, ssh_key, user)
+
+    container_id = step(
+        "run_container", _zorc_agent_run_container, tailscale_ip, ssh_key, user,
+        name=name, image_tag=image_tag, port=port, memory_mb=memory_mb,
+        env_vars=env_vars_to_set, needs_gpu=needs_gpu,
+    )
+
+    try:
+        step("wait_healthy", _zorc_agent_wait_healthy, tailscale_ip, ssh_key, user, container_id)
+
+        # No Traefik/public IP on this backend -- cloudflared on servingz
+        # reaches the target node directly over Tailscale instead.
+        service_url = f"http://{tailscale_ip}:{port}"
+        step("create_dns_record", create_dns_record, name)
+        step("add_tunnel_route", add_tunnel_route, domain, service=service_url)
+
+        step("register_app", register_app, name=name, memory_mb=memory_mb, subdomain=name,
+             repo=f"github.com/{owner_repo}", target=target_node, database=needs_database)
+        step("record_resource", record_resource, name, kind="zorc-agent", container_name=name,
+             postgres_container_name=postgres_container_name, node=target_node)
+        step("commit_and_push", git_commit_and_push, f"registry: add {name} (deployed via zorc-agent)")
+    except DeployError:
+        # container/database creation already succeeded above -- clean up
+        # anything zorc actually created (label-verified, never touches the
+        # machine's other 40+ pre-existing containers) rather than leaving
+        # a half-registered app running unattended.
+        rollback_targets = [name]
+        if postgres_container_name:
+            rollback_targets.append(postgres_container_name)
+        rollback_results = _zorc_agent_rollback(tailscale_ip, ssh_key, user, rollback_targets)
+        log.append({"step": "rollback_zorc_agent", "ok": all(r["ok"] for r in rollback_results),
+                    "detail": rollback_results})
+        raise
+
+    return {
+        "log": log,
+        "classification": classification,
+        "status": "deployed",
+        "domain": domain,
+        "target_node": target_node,
+        "container_name": name,
+        "postgres_container_name": postgres_container_name,
+        "message": f"{name} created on {target_node} (zorc-agent) at port {port}, routed at "
+                    f"https://{domain} via Cloudflare Tunnel, registered in registry.yaml.",
+    }
 
 
 class DeployError(Exception):
@@ -1185,6 +1337,14 @@ def deploy(*, owner_repo: str, name: str, git_branch: str = "main", target_node:
                 f"something is using more memory than registry.yaml accounts for)"
             )
     step("live_resource_check", _check_live_headroom)
+
+    if node.get("backend") == "zorc-agent":
+        return _deploy_zorc_agent(
+            step=step, log=log, node=node, target_node=target_node, name=name, owner_repo=owner_repo,
+            repo_dir=repo_dir, classification=classification, memory_mb=memory_mb,
+            env_vars_to_set=env_vars_to_set, needs_gpu=needs_gpu, needs_database=needs_database,
+            postgres_container_name=postgres_uuid, domain=domain,
+        )
 
     coolify_result = step(
         "create_coolify_app", create_coolify_app,
