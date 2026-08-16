@@ -27,8 +27,7 @@
     "coolify-db",
     "coolify-redis",
     "coolify-realtime",
-    "coolify-proxy",
-    "coolify-sentinel"
+    "coolify-proxy"
   ],
   "mounts": ["/mnt/fast", "/mnt/data"],
   "docker_user_block_ports": [8000, 80, 443],

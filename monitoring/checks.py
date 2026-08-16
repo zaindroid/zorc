@@ -269,7 +269,11 @@ def cloudflared(cfg: dict) -> dict:
 
 
 def systemd_failed(cfg: dict) -> dict:
-    rc, out, err = _run(["systemctl", "--failed", "--no-legend"])
+    # --plain drops the leading state-dot column ("●") that --no-legend
+    # alone doesn't remove -- real bug found live: line.split()[0] was
+    # picking up that dot instead of the unit name, so a genuine failure
+    # (logrotate.service) displayed on the status page as just "●".
+    rc, out, err = _run(["systemctl", "--failed", "--no-legend", "--plain"])
     failed_units = [line.split()[0] for line in out.strip().splitlines() if line.strip()]
     if failed_units:
         return {"status": CRIT, "value": failed_units, "message": f"failed units: {', '.join(failed_units)}"}
