@@ -454,13 +454,24 @@ def name_taken(name: str) -> bool:
     return any(a["name"] == name for a in reg.get("apps", []))
 
 
-def clone_repo(owner_repo: str) -> Path:
+def clone_repo(owner_repo: str, git_branch: str = "main") -> Path:
     """owner_repo like 'zaindroid/hello-app'. Uses gh CLI (already
     authenticated on this host) so it works for private repos too, not
-    just public ones."""
+    just public ones.
+
+    Real bug found live: this used to ignore git_branch entirely, always
+    cloning the default branch -- harmless-looking for the Coolify path
+    (Coolify does its own separate remote clone of the real git_branch for
+    the actual build, so only classify()/parse_app_yaml()/resolve_env_vars()
+    were silently reading the wrong branch's files), but a real correctness
+    bug for zorc-agent, which has no second remote clone step at all --
+    _deploy_zorc_agent uploads and builds this exact repo_dir, so deploying
+    a non-default branch silently built and shipped the default branch's
+    code instead, with no error. Caught because a deploy from a test branch
+    that added `database: true` came back with no database provisioned."""
     workdir = Path(tempfile.mkdtemp(prefix="deploy-"))
     subprocess.run(
-        ["gh", "repo", "clone", owner_repo, str(workdir), "--", "--depth", "1"],
+        ["gh", "repo", "clone", owner_repo, str(workdir), "--", "--depth", "1", "--branch", git_branch],
         check=True, capture_output=True, timeout=60,
     )
     return workdir
@@ -938,12 +949,25 @@ def _zorc_agent_build_image(tailscale_ip: str, ssh_key: Path, user: str, remote_
 def _zorc_agent_preflight_gpu(tailscale_ip: str, ssh_key: Path, user: str) -> None:
     """Checked before attempting --gpus all, so a missing nvidia runtime
     surfaces as a clear rejection here rather than an opaque docker error
-    after the image is already built."""
-    rc, out, _ = _ssh_run(tailscale_ip, ssh_key, ["docker", "info", "--format", "{{json .Runtimes}}"], user)
-    if rc != 0 or "nvidia" not in out:
+    after the image is already built.
+
+    Real bug found live, same class as the other two this session: a Go
+    template with an embedded space ("--format", "{{json .Runtimes}}")
+    does not survive the local-shell -> ssh-argument-reconstruction ->
+    remote-shell round trip -- the space inside that single argv element
+    splits into two words once ssh joins argv with spaces and the remote
+    shell re-tokenizes, so `docker info` received `--format {{json` (one
+    stray extra word `.Runtimes}}`) and errored out; a real nvidia runtime
+    on the target was invisible to this check and would have wrongly
+    blocked every needs_gpu=True deploy. Fixed by dropping --format
+    entirely and reading the plain-text "Runtimes:" line instead -- no
+    embedded spaces, nothing to reconstruct incorrectly."""
+    rc, out, _ = _ssh_run(tailscale_ip, ssh_key, ["docker", "info"], user)
+    runtimes_line = next((line for line in out.splitlines() if line.strip().startswith("Runtimes:")), "")
+    if rc != 0 or "nvidia" not in runtimes_line:
         raise RuntimeError(
             f"needs_gpu=True but {tailscale_ip!r} has no 'nvidia' Docker runtime configured "
-            f"(docker info runtimes: {out.strip() or '(unavailable)'})"
+            f"(docker info Runtimes line: {runtimes_line.strip() or '(unavailable)'})"
         )
 
 
@@ -1266,7 +1290,7 @@ def deploy(*, owner_repo: str, name: str, git_branch: str = "main", target_node:
             log.append({"step": name_, "ok": False, "error": str(e)})
             raise DeployError(name_, str(e)) from e
 
-    repo_dir = step("clone", clone_repo, owner_repo)
+    repo_dir = step("clone", clone_repo, owner_repo, git_branch)
     classification = step("classify", classify, repo_dir)
 
     if classification["kind"] == "unknown":
@@ -1739,6 +1763,46 @@ def delete_app(name: str) -> dict:
     mapped = _load_resource_map().get(name, {})
     kind = mapped.get("kind") or ("pages" if reg_entry.get("target") == "pages" else "coolify")
     hostname = f"{name}.{PLATFORM_ROOT_DOMAIN}"
+
+    if kind == "zorc-agent":
+        # No Coolify resource, no Traefik -- self-contained like the
+        # coolify-service branch below: real docker containers over SSH,
+        # then the same DNS + tunnel-ingress + resource_map + registry
+        # cleanup every other kind does.
+        target_node = mapped.get("node") or reg_entry.get("target")
+        node = node_config(target_node)
+        tailscale_ip = node["tailscale_ip"]
+        ssh_key = ZORC_DIR / node["ssh_key"]
+        user = node.get("ssh_user", "root")
+
+        rollback_targets = [mapped.get("container_name") or name]
+        if mapped.get("postgres_container_name"):
+            rollback_targets.append(mapped["postgres_container_name"])
+        rollback_results = _zorc_agent_rollback(tailscale_ip, ssh_key, user, rollback_targets)
+
+        repo_config_path = ZORC_DIR / "cloudflared" / "config.yml"
+        cfg = yaml.safe_load(repo_config_path.read_text())
+        cfg["ingress"] = [r_ for r_ in cfg["ingress"] if r_.get("hostname") != hostname]
+        repo_config_path.write_text(yaml.dump(cfg, sort_keys=False))
+        subprocess.run(["sudo", "cp", str(repo_config_path), "/etc/cloudflared/config.yml"], check=True)
+        subprocess.run(["sudo", "systemctl", "reload-or-restart", "cloudflared"], check=True)
+
+        with httpx.Client(timeout=15) as client:
+            existing = client.get(
+                f"{CLOUDFLARE_API}/zones/{CLOUDFLARE_ZONE_ID}/dns_records",
+                headers=_cloudflare_headers(), params={"name": hostname},
+            )
+            existing.raise_for_status()
+            for rec in existing.json()["result"]:
+                client.delete(f"{CLOUDFLARE_API}/zones/{CLOUDFLARE_ZONE_ID}/dns_records/{rec['id']}",
+                               headers=_cloudflare_headers())
+
+        m = _load_resource_map()
+        m.pop(name, None)
+        RESOURCE_MAP_PATH.write_text(json.dumps(m, indent=2))
+        remove_registry_entry(name)
+        git_commit_and_push(f"registry: remove {name} (deleted via deploy agent)")
+        return {"deleted": name, "kind": kind, "rollback": rollback_results}
 
     if kind == "coolify-service":
         service_uuid = mapped.get("coolify_uuid")
