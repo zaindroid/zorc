@@ -121,6 +121,17 @@ infrastructure:
 # Applications. Add new entries at the end. Keep alphabetical within groups.
 # ---------------------------------------------------------------------------
 apps:
+  - name: hello-rtx-test
+    target: rtx5090
+    memory_mb: 534
+    subdomain: hello-rtx-test
+    database: true
+    redis_db: null
+    storage_prefix: null
+    repo: "github.com/zaindroid/hello-app"
+    critical: false
+    depends_on: []
+
   - name: iht-news-backend
     target: servingz
     memory_mb: 768
