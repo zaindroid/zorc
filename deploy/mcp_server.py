@@ -17,10 +17,12 @@ import secrets as secrets_module
 import shutil
 import time
 from collections import deque
+from datetime import datetime
 from pathlib import Path
 from typing import Literal
 
 import uvicorn
+import yaml
 from mcp.server.mcpserver import MCPServer
 from mcp.server.transport_security import TransportSecuritySettings
 from starlette.applications import Starlette
@@ -248,50 +250,125 @@ def classify_repo(owner_repo: str) -> dict:
         shutil.rmtree(repo_dir, ignore_errors=True)
 
 
-def _recommend_placement(memory_mb: int, needs_public_ip: bool) -> dict:
-    """AGENTS.md's written decision procedure, as code: default to
-    servingz; move to hostinger-vps only if direct public-IP ingress is
-    needed or servingz doesn't have headroom."""
+NODES_DIR = agent.ZORC_DIR / "nodes"
+
+# Live telemetry older than this is treated as "this node might not
+# actually be reachable right now" rather than trusted at face value --
+# only meaningful now that every node is wired into periodic self-
+# registration (see monitoring/watchdog.py's refresh_remote_nodes()).
+NODE_TELEMETRY_STALE_SEC = 3600
+
+
+def _load_node_telemetry(node_name: str) -> dict:
+    """nodes/<name>.yaml -- live, self-reported hardware/health data, kept
+    deliberately separate from registry.yaml's human-set policy layer (see
+    that file's own comment on why). Missing (e.g. a node just added to
+    registry.yaml before its first watchdog cycle) is not an error --
+    scoring just falls back to policy-only for that node."""
+    path = NODES_DIR / f"{node_name}.yaml"
+    if not path.exists():
+        return {}
+    try:
+        return yaml.safe_load(path.read_text()) or {}
+    except yaml.YAMLError:
+        return {}
+
+
+def _score_node(node_name: str, node_cfg: dict, memory_mb: int,
+                 needs_public_ip: bool, required_arch: str | None) -> dict:
+    """One node's fitness for one placement request. Hard requirements
+    (public IP, budget, architecture, reachability) gate eligibility
+    outright -- scoring only orders the *remaining* eligible candidates,
+    it never overrides a hard requirement to squeeze in a better score."""
+    if needs_public_ip and not node_cfg.get("has_public_ip"):
+        return {"eligible": False, "score": 0.0, "reasons": ["needs a public IP, this node doesn't have one"]}
+
+    headroom = agent.budget_headroom_mb(node_name)
+    if memory_mb > headroom:
+        return {"eligible": False, "score": 0.0,
+                "reasons": [f"needs {memory_mb}MB, only {headroom:.0f}MB headroom"]}
+
+    telemetry = _load_node_telemetry(node_name)
+    node_arch = telemetry.get("arch")
+    if required_arch and node_arch and node_arch != required_arch:
+        return {"eligible": False, "score": 0.0,
+                "reasons": [f"needs {required_arch}, node reports {node_arch}"]}
+
+    if telemetry.get("status") == "unreachable":
+        return {"eligible": False, "score": 0.0, "reasons": ["node is currently unreachable"]}
+
+    reasons = [f"{headroom:.0f}MB headroom after fit"]
+    # More headroom left over scores higher -- spreads load across the
+    # fleet rather than always cramming onto the tightest fit.
+    score = min(headroom / max(memory_mb, 1), 10.0)
+
+    last_seen = telemetry.get("last_seen")
+    if last_seen:
+        try:
+            age_sec = time.time() - datetime.fromisoformat(last_seen).timestamp()
+            if age_sec < 600:
+                score += 2.0
+                reasons.append("live telemetry fresh (<10min)")
+            elif age_sec > NODE_TELEMETRY_STALE_SEC:
+                score -= 3.0
+                reasons.append(f"live telemetry stale ({age_sec / 3600:.1f}h old)")
+        except ValueError:
+            pass
+    else:
+        reasons.append("no live telemetry yet")
+
+    # AGENTS.md's existing "default to servingz" policy, expressed as a
+    # score nudge toward control-plane nodes rather than a hardcoded node
+    # name -- so a third node dropped into registry.yaml later needs no
+    # new special-casing here.
+    if node_cfg.get("is_control_plane") and not needs_public_ip:
+        score += 1.0
+        reasons.append("control-plane node preferred by default")
+
+    return {"eligible": True, "score": score, "reasons": reasons}
+
+
+def _recommend_placement(memory_mb: int, needs_public_ip: bool, required_arch: str | None = None) -> dict:
+    """Scores every node in registry.yaml against this placement request,
+    combining the policy layer (registry.yaml: budget, is_control_plane,
+    has_public_ip) with the live layer (nodes/*.yaml: architecture,
+    reachability, telemetry freshness). Replaces the old two-node
+    hardcoded fallback -- this is meant to keep working correctly as the
+    fleet grows past two nodes, not just for today's two."""
     reg = agent.load_registry()
-    nodes = reg["nodes"]
+    scored = {
+        node_name: _score_node(node_name, node_cfg, memory_mb, needs_public_ip, required_arch)
+        for node_name, node_cfg in reg["nodes"].items()
+    }
 
-    if needs_public_ip:
-        candidates = [n for n, cfg in nodes.items() if cfg.get("has_public_ip")]
-        if not candidates:
-            return {"recommended_node": None, "fits": False, "reason": "no node with a public IP exists"}
-        node = candidates[0]
-        headroom = agent.budget_headroom_mb(node)
-        fits = memory_mb <= headroom
-        return {
-            "recommended_node": node if fits else None, "fits": fits,
-            "reason": f"only node with a public IP; headroom {headroom:.0f}MB, needs {memory_mb}MB",
-        }
+    eligible = {n: s for n, s in scored.items() if s["eligible"]}
+    if not eligible:
+        detail = "; ".join(f"{n}: {', '.join(s['reasons'])}" for n, s in scored.items())
+        return {"recommended_node": None, "fits": False, "reason": f"no eligible node -- {detail}"}
 
-    servingz_headroom = agent.budget_headroom_mb("servingz")
-    if memory_mb <= servingz_headroom:
-        return {"recommended_node": "servingz", "fits": True,
-                "reason": f"default node, fits ({servingz_headroom:.0f}MB headroom)"}
-    for node_name in nodes:
-        if node_name == "servingz":
-            continue
-        headroom = agent.budget_headroom_mb(node_name)
-        if memory_mb <= headroom:
-            return {"recommended_node": node_name, "fits": True,
-                    "reason": f"servingz doesn't have headroom ({servingz_headroom:.0f}MB); "
-                              f"{node_name} does ({headroom:.0f}MB)"}
-    return {"recommended_node": None, "fits": False,
-            "reason": f"doesn't fit on any node (needs {memory_mb}MB, servingz has {servingz_headroom:.0f}MB)"}
+    best_name = max(eligible, key=lambda n: eligible[n]["score"])
+    best = eligible[best_name]
+    return {
+        "recommended_node": best_name,
+        "fits": True,
+        "reason": "; ".join(best["reasons"]),
+        "candidates_considered": {
+            n: {"eligible": s["eligible"], "score": round(s["score"], 2)} for n, s in scored.items()
+        },
+    }
 
 
 @mcp.tool()
-def recommend_placement(memory_mb: int, needs_public_ip: bool = False) -> dict:
-    """Recommends which node to target, implementing AGENTS.md's written
-    decision procedure. Pure recommendation, no side effects -- a quick
-    preview tool. For an actual deploy(), use
-    analyze_deployment_requirements() instead, which does this same
-    placement step but from a properly-derived memory estimate rather
-    than a number you supply directly."""
-    return _recommend_placement(memory_mb, needs_public_ip)
+def recommend_placement(memory_mb: int, needs_public_ip: bool = False, required_arch: str | None = None) -> dict:
+    """Recommends which node to target by scoring every registered node
+    against this request -- budget fit, public-IP requirement, optional
+    architecture match, and live reachability/telemetry freshness. Pure
+    recommendation, no side effects -- a quick preview tool that also shows
+    every node considered and why (candidates_considered), not just the
+    winner. For an actual deploy(), use analyze_deployment_requirements()
+    instead, which does this same scoring but from a properly-derived
+    memory estimate rather than a number you supply directly."""
+    return _recommend_placement(memory_mb, needs_public_ip, required_arch)
 
 
 def _estimate_memory_from_repo(repo_dir, classification: dict) -> tuple[int, list[str]]:
