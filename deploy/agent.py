@@ -12,6 +12,7 @@ import re
 import secrets
 import subprocess
 import tempfile
+import time
 import uuid
 from pathlib import Path
 
@@ -39,14 +40,20 @@ def _load_resource_map() -> dict:
 
 
 def record_resource(name: str, *, kind: str, coolify_uuid: str | None = None,
-                     domains: list[str] | None = None) -> None:
+                     domains: list[str] | None = None, coolify_postgres_uuid: str | None = None) -> None:
     """kind: 'coolify' | 'coolify-service' | 'pages'. domains is only
     needed for 'coolify-service' -- a docker-compose stack can expose
     several subdomains that don't derive from `name` the way a normal
     app's single hostname does, so delete_app needs them listed explicitly
-    to clean DNS up properly."""
+    to clean DNS up properly. coolify_postgres_uuid is set when
+    provision_dedicated_postgres() created a database for this app --
+    kept alongside so a future teardown/backup step can find it without
+    re-deriving the name."""
     m = _load_resource_map()
-    m[name] = {"kind": kind, "coolify_uuid": coolify_uuid, "domains": domains or []}
+    entry = {"kind": kind, "coolify_uuid": coolify_uuid, "domains": domains or []}
+    if coolify_postgres_uuid:
+        entry["coolify_postgres_uuid"] = coolify_postgres_uuid
+    m[name] = entry
     RESOURCE_MAP_PATH.write_text(json.dumps(m, indent=2))
 
 # Stable platform config (not secrets) -- the "labs" project every app
@@ -290,8 +297,29 @@ def classify(repo_dir: Path) -> dict:
             return {"kind": "static", "language": "node", "memory_mb": 0,
                     "build_command": scripts["build"],
                     "reason": "frontend build tool present, no start script — static site"}
-        return {"kind": "app", "language": "node", "memory_mb": FRAMEWORK_MEMORY_MB["node"],
-                "reason": "package.json with a server script"}
+
+        result = {"kind": "app", "language": "node", "memory_mb": FRAMEWORK_MEMORY_MB["node"],
+                  "reason": "package.json with a server script"}
+
+        # Real bug found live (blylinks-crm): Nixpacks' own build-pack
+        # auto-detection can independently decide a repo is a static site
+        # even when classify() correctly says "app" -- specifically when a
+        # frontend build tool (vite.config.js etc) sits alongside a real
+        # server script. Nixpacks doesn't know what classify() knows here;
+        # left to guess, it built and served the static SPA shell via Caddy
+        # instead of running the actual server (confirmed live: /health
+        # returned the SPA's index.html, no X-Powered-By: Express header).
+        # Passing explicit commands removes the ambiguity Nixpacks was
+        # guessing on, instead of leaving deploy() to discover a broken
+        # deploy after the fact.
+        has_frontend_tooling = any(fw in deps for fw in FRONTEND_ONLY_DEPS)
+        if has_frontend_tooling and "start" in scripts:
+            result["start_command"] = "npm start"
+            if "build" in scripts:
+                result["build_command"] = "npm run build"
+            result["reason"] += (" (frontend build tool + server script both present -- explicit "
+                                  "build/start commands set to avoid Nixpacks static-site misdetection)")
+        return result
 
     if "requirements.txt" in files or "pyproject.toml" in files:
         return {"kind": "app", "language": "python", "memory_mb": FRAMEWORK_MEMORY_MB["python"],
@@ -318,8 +346,16 @@ _ENV_GENERATE_STRATEGIES = {"hex": lambda: secrets.token_hex(32)}
 
 
 def parse_app_yaml(repo_dir: Path) -> dict:
-    """Reads app.yaml's optional `env:` section, if present. Format:
+    """Reads app.yaml's optional `env:` section and `database:` flag, if
+    present. Format:
 
+        database: true          # provisions a dedicated Postgres instance
+                                 # for this app -- zorc creates it, creates
+                                 # a scoped role+database on it, and sets
+                                 # DATABASE_URL itself (see
+                                 # provision_dedicated_postgres()). The
+                                 # instance's own superuser credentials are
+                                 # never exposed to the app or the caller.
         env:
           JWT_SECRET:
             generate: hex        # zorc generates a random value itself,
@@ -331,12 +367,15 @@ def parse_app_yaml(repo_dir: Path) -> dict:
                                   # deploy() fails loudly (before creating
                                   # anything) if it's missing.
 
-    Missing app.yaml or a missing/empty env: section is not an error --
-    most apps only need the platform-provided DATABASE_URL/APP_ENV/
-    LOG_LEVEL and declare nothing here."""
+    Missing app.yaml, or a missing/empty env: section, or no database:
+    flag, is not an error -- most apps only need the platform-provided
+    APP_ENV/LOG_LEVEL and declare nothing here. This function was written
+    after blylinks-crm's DATABASE_URL was discovered to be entirely
+    unimplemented despite get_platform_contract() promising it -- database:
+    true is what actually makes that promise real."""
     app_yaml_path = repo_dir / "app.yaml"
     if not app_yaml_path.exists():
-        return {"env": {}}
+        return {"env": {}, "database": False}
     try:
         parsed = yaml.safe_load(app_yaml_path.read_text()) or {}
     except yaml.YAMLError as e:
@@ -352,7 +391,10 @@ def parse_app_yaml(repo_dir: Path) -> dict:
                 f"app.yaml env.{key}.generate={spec['generate']!r} is not supported "
                 f"(supported: {sorted(_ENV_GENERATE_STRATEGIES)})"
             )
-    return {"env": env}
+    database = parsed.get("database", False)
+    if not isinstance(database, bool):
+        raise ValueError(f"app.yaml database must be true or false, got {database!r}")
+    return {"env": env, "database": database}
 
 
 def resolve_env_vars(repo_dir: Path, env_overrides: dict[str, str] | None) -> tuple[dict[str, str], list[str]]:
@@ -377,6 +419,81 @@ def resolve_env_vars(repo_dir: Path, env_overrides: dict[str, str] | None) -> tu
     return vars_to_set, missing_required
 
 
+# Extra memory to add to an app's own registry.yaml memory_mb when it gets
+# a dedicated Postgres via provision_dedicated_postgres(), so the existing
+# per-node budget math (budget_headroom_mb, which only sums apps: memory_mb)
+# accounts for it without needing a separate tracked-infrastructure entry.
+# Based on a real dedicated instance's observed baseline (~43MB on
+# blylinks-crm-postgres) padded for connection/buffer growth under load.
+DEDICATED_POSTGRES_MEMORY_MB = 150
+
+
+def provision_dedicated_postgres(app_name: str, target_node: str) -> tuple[str, str]:
+    """Creates a new, single-app-dedicated Postgres instance on target_node
+    via Coolify, waits (bounded, 90s) for it to report healthy, creates a
+    role+database scoped to app_name, and returns (coolify_postgres_uuid,
+    database_url). The instance's own superuser credentials never leave
+    this function -- not returned, not logged, not passed to the caller --
+    only the freshly-generated app-scoped role's connection string is.
+
+    Built after discovering DATABASE_URL provisioning was entirely
+    unimplemented despite being a documented part of the platform contract
+    -- blylinks-crm needed this done by hand once; this is that process
+    turned into reusable, repeatable code."""
+    node = node_config(target_node)
+    with httpx.Client(timeout=30) as client:
+        r = client.post(f"{COOLIFY_URL}/databases/postgresql", headers=_coolify_headers(), json={
+            "project_uuid": COOLIFY_PROJECT_UUID,
+            "server_uuid": node["server_uuid"],
+            "environment_name": COOLIFY_ENVIRONMENT_NAME,
+            "name": f"{app_name}-postgres",
+            "image": "postgres:18-alpine",
+        })
+        r.raise_for_status()
+        db_uuid = r.json()["uuid"]
+
+        r = client.get(f"{COOLIFY_URL}/databases/{db_uuid}/start", headers=_coolify_headers())
+        r.raise_for_status()
+
+    deadline = time.time() + 90
+    healthy = False
+    while time.time() < deadline:
+        with httpx.Client(timeout=15) as client:
+            r = client.get(f"{COOLIFY_URL}/databases/{db_uuid}", headers=_coolify_headers())
+            r.raise_for_status()
+            if r.json().get("status") == "running:healthy":
+                healthy = True
+                break
+        time.sleep(5)
+    if not healthy:
+        raise RuntimeError(f"dedicated postgres {db_uuid} for {app_name!r} did not become healthy within 90s")
+
+    # Coolify's internal Docker-network hostname for a database resource is
+    # its own UUID -- confirmed live (matches every other database on this
+    # platform, e.g. the shared servingz instance).
+    container_name = db_uuid
+    db_role = re.sub(r"[^a-z0-9_]", "_", app_name.lower())
+    db_password = secrets.token_hex(24)
+    sql = f"CREATE ROLE {db_role} WITH LOGIN PASSWORD '{db_password}'; CREATE DATABASE {db_role} OWNER {db_role};"
+
+    if target_node == LOCAL_NODE:
+        cmd = ["docker", "exec", "-i", container_name, "psql", "-U", "postgres"]
+    else:
+        tailscale_ip = node.get("tailscale_ip")
+        if not tailscale_ip:
+            raise RuntimeError(f"{target_node!r} has no tailscale_ip in registry.yaml -- cannot reach it")
+        cmd = ["ssh", "-o", "StrictHostKeyChecking=accept-new", "-o", "ConnectTimeout=10",
+               "-i", str(REMOTE_DEPLOY_KEY), f"root@{tailscale_ip}",
+               "docker", "exec", "-i", container_name, "psql", "-U", "postgres"]
+
+    proc = subprocess.run(cmd, input=sql, capture_output=True, text=True, timeout=20)
+    if proc.returncode != 0:
+        raise RuntimeError(f"failed to create role/database for {app_name!r}: {proc.stderr[-500:]}")
+
+    database_url = f"postgres://{db_role}:{db_password}@{container_name}:5432/{db_role}"
+    return db_uuid, database_url
+
+
 def check_deploy_budget(name: str, memory_mb: int, node_name: str = "servingz") -> tuple[bool, str]:
     if name_taken(name):
         return False, f"'{name}' is already registered in registry.yaml"
@@ -393,14 +510,21 @@ def build_pack_for(language: str) -> str:
 
 def create_coolify_app(*, name: str, git_repository: str, git_branch: str,
                         build_pack: str, memory_mb: int, domain: str, server_uuid: str,
-                        instant_deploy: bool = True) -> dict:
+                        instant_deploy: bool = True, install_command: str | None = None,
+                        build_command: str | None = None, start_command: str | None = None) -> dict:
     """instant_deploy=False when the app declares env vars that must be set
     (see resolve_env_vars) -- Coolify's default behaviour builds and starts
     the container immediately on creation, before there's any chance to
     push those vars in, which is exactly how blylinks-crm crash-looped on
     JWT_SECRET. False here means "create the resource, don't start it yet";
     the caller is responsible for setting env vars and then calling
-    trigger_coolify_deploy() itself once they're in place."""
+    trigger_coolify_deploy() itself once they're in place.
+
+    install/build/start_command, when given (see classify()'s frontend-
+    tooling-plus-server-script detection), override Nixpacks' own
+    auto-detection -- left blank, Nixpacks can independently misdetect an
+    app classify() already correctly identified as a real server (see
+    create_coolify_app's docstring history / blylinks-crm)."""
     payload = {
         "project_uuid": COOLIFY_PROJECT_UUID,
         "server_uuid": server_uuid,
@@ -418,6 +542,12 @@ def create_coolify_app(*, name: str, git_repository: str, git_branch: str,
         "health_check_path": "/health",
         "instant_deploy": instant_deploy,
     }
+    if install_command:
+        payload["install_command"] = install_command
+    if build_command:
+        payload["build_command"] = build_command
+    if start_command:
+        payload["start_command"] = start_command
     with httpx.Client(timeout=30) as client:
         r = client.post(f"{COOLIFY_URL}/applications/public", headers=_coolify_headers(), json=payload)
         r.raise_for_status()
@@ -598,7 +728,16 @@ def deploy(*, owner_repo: str, name: str, git_branch: str = "main", target_node:
     if classification["kind"] == "unknown":
         raise DeployError("classify", classification["reason"] + " — cannot proceed automatically")
 
+    # Determined here (not deferred into the app.yaml env: parse further
+    # down) specifically so the extra memory a dedicated Postgres needs is
+    # already folded into memory_mb before budget_check runs -- otherwise
+    # the static budget check would pass on a number the deploy would then
+    # exceed once provision_dedicated_postgres() actually runs.
+    needs_database = classification["kind"] != "static" and parse_app_yaml(repo_dir).get("database", False)
+
     memory_mb = memory_mb_override if memory_mb_override is not None else classification["memory_mb"]
+    if needs_database:
+        memory_mb += DEDICATED_POSTGRES_MEMORY_MB
 
     ok, reason = step("budget_check", check_deploy_budget, name, memory_mb, target_node)
     if not ok:
@@ -633,6 +772,11 @@ def deploy(*, owner_repo: str, name: str, git_branch: str = "main", target_node:
             "(these are tied to an external account/service, zorc cannot generate them itself)",
         )
 
+    postgres_uuid = None
+    if needs_database:
+        postgres_uuid, database_url = step("provision_database", provision_dedicated_postgres, name, target_node)
+        env_vars_to_set["DATABASE_URL"] = database_url
+
     # Live re-check immediately before creating anything -- catches drift
     # from something already eating memory on the target node right now,
     # which the static budget_headroom_mb() check above can't see (it only
@@ -653,6 +797,8 @@ def deploy(*, owner_repo: str, name: str, git_branch: str = "main", target_node:
         name=name, git_repository=f"https://github.com/{owner_repo}",
         git_branch=git_branch, build_pack=build_pack, memory_mb=memory_mb, domain=domain,
         server_uuid=node["server_uuid"], instant_deploy=not env_vars_to_set,
+        build_command=classification.get("build_command"),
+        start_command=classification.get("start_command"),
     )
 
     try:
@@ -674,8 +820,9 @@ def deploy(*, owner_repo: str, name: str, git_branch: str = "main", target_node:
             step("add_tunnel_route", add_tunnel_route, domain)
 
         step("register_app", register_app, name=name, memory_mb=memory_mb, subdomain=name,
-             repo=f"github.com/{owner_repo}", target=target_node)
-        step("record_resource", record_resource, name, kind="coolify", coolify_uuid=coolify_result.get("uuid"))
+             repo=f"github.com/{owner_repo}", target=target_node, database=needs_database)
+        step("record_resource", record_resource, name, kind="coolify", coolify_uuid=coolify_result.get("uuid"),
+             coolify_postgres_uuid=postgres_uuid)
         step("commit_and_push", git_commit_and_push, f"registry: add {name} (deployed via deploy agent)")
     except DeployError:
         # create_coolify_app already succeeded above -- a real app now
@@ -697,6 +844,17 @@ def deploy(*, owner_repo: str, name: str, git_branch: str = "main", target_node:
                         log.append({"step": "rollback_coolify_app", "ok": True})
         except Exception as cleanup_err:
             log.append({"step": "rollback_coolify_app", "ok": False, "error": str(cleanup_err)})
+        if postgres_uuid:
+            try:
+                with httpx.Client(timeout=30) as client:
+                    r = client.delete(f"{COOLIFY_URL}/databases/{postgres_uuid}", headers=_coolify_headers())
+                    if r.status_code not in (200, 404):
+                        log.append({"step": "rollback_postgres", "ok": False,
+                                    "error": f"cleanup returned HTTP {r.status_code}"})
+                    else:
+                        log.append({"step": "rollback_postgres", "ok": True})
+            except Exception as cleanup_err:
+                log.append({"step": "rollback_postgres", "ok": False, "error": str(cleanup_err)})
         raise
 
     return {
@@ -706,6 +864,7 @@ def deploy(*, owner_repo: str, name: str, git_branch: str = "main", target_node:
         "domain": domain,
         "target_node": target_node,
         "coolify_uuid": coolify_result.get("uuid"),
+        "coolify_postgres_uuid": postgres_uuid,
         "message": f"{name} created in Coolify on {target_node}, routed at https://{domain}, "
                     f"registered in registry.yaml. First build is running in Coolify now.",
     }
