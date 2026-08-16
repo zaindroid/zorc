@@ -304,14 +304,17 @@ print(json.dumps({{
     return json.loads(proc.stdout)
 
 
-def _ssh_run(tailscale_ip: str, ssh_key: Path, remote_cmd: list[str], user: str = "root") -> tuple[int, str, str]:
+def _ssh_run(tailscale_ip: str, ssh_key: Path, remote_cmd: list[str], user: str = "root",
+              timeout: int = 15) -> tuple[int, str, str]:
     """One-off remote command, same connection conventions as
     _probe_hardware_over_ssh -- used for the small existing-software checks
-    (docker, coolify) propose_node() runs alongside the hardware probe."""
+    (docker, coolify) propose_node() runs alongside the hardware probe, and
+    (with a longer timeout) the zorc-agent backend's docker build/run/
+    inspect commands."""
     proc = subprocess.run(
         ["ssh", "-o", "StrictHostKeyChecking=accept-new", "-o", "ConnectTimeout=10",
          "-i", str(ssh_key), f"{user}@{tailscale_ip}", *remote_cmd],
-        capture_output=True, text=True, timeout=15,
+        capture_output=True, text=True, timeout=timeout,
     )
     return proc.returncode, proc.stdout, proc.stderr
 
@@ -742,6 +745,202 @@ def trigger_coolify_deploy(coolify_uuid: str) -> None:
         r.raise_for_status()
 
 
+# ---------------------------------------------------------- zorc-agent ----
+# The lightweight, non-root deploy backend for nodes that can't or
+# shouldn't run full Coolify -- built for one real case: a personal GPU
+# workstation already running 40+ of its own containers under a non-root
+# user, on a Tailscale network whose ACL policy blocks root SSH outright.
+# No Nixpacks (not installed there, and installing new tooling on a
+# machine like this is exactly the footprint this backend exists to
+# avoid) -- Dockerfile-only, built and run directly via whatever docker
+# access the deploy key's user already has (confirmed: docker-group
+# membership, no sudo needed, for the one real node this targets today).
+
+ZORC_AGENT_NETWORK = "zorc-agent"
+ZORC_AGENT_CONTAINER_PORT = 8080  # same "apps listen on 8080" convention as the Coolify path
+ZORC_AGENT_PORT_RANGE = (20000, 20100)
+
+
+def _zorc_agent_ensure_network(tailscale_ip: str, ssh_key: Path, user: str) -> None:
+    """Idempotent. Never removed by rollback -- other containers may
+    already be attached (this is a shared network across every zorc-agent
+    app on the node), and Docker refuses to remove a network still in use
+    regardless."""
+    rc, _, _ = _ssh_run(tailscale_ip, ssh_key, ["docker", "network", "inspect", ZORC_AGENT_NETWORK], user)
+    if rc == 0:
+        return
+    create_rc, _, err = _ssh_run(tailscale_ip, ssh_key, ["docker", "network", "create", ZORC_AGENT_NETWORK], user)
+    if create_rc != 0:
+        raise RuntimeError(f"failed to create {ZORC_AGENT_NETWORK!r} network: {err[-500:]}")
+
+
+def _zorc_agent_allocate_port(tailscale_ip: str, ssh_key: Path, user: str) -> int:
+    """Live-probes for the first free port in ZORC_AGENT_PORT_RANGE rather
+    than trusting a static claimed-list -- this node's other 40+ services
+    are unknown to zorc, so a stale table would drift immediately. Parses
+    the full listener list in Python rather than passing a filter
+    expression through `ss` -- that string has to survive local shell,
+    ssh's own argument reconstruction, and a remote shell, and a filter
+    expression with spaces/colons in it does not survive that trip
+    intact (confirmed live: silently matched nothing, real bug caught
+    during this build, not a hypothetical). A clean `ss -Htln`/`netstat
+    -tln` with no embedded filter avoids the whole problem. Inherently
+    TOCTOU-racy regardless (nothing stops something else binding the port
+    between this probe and the eventual `docker run -p`) -- the caller
+    must treat "address already in use" from that step as a
+    retry-next-port condition, not fatal."""
+    rc, out, err = _ssh_run(tailscale_ip, ssh_key, ["ss", "-Htln"], user)
+    if rc != 0:
+        rc, out, err = _ssh_run(tailscale_ip, ssh_key, ["netstat", "-tln"], user)
+        if rc != 0:
+            raise RuntimeError(f"could not list listening ports on {tailscale_ip!r} "
+                                f"(neither ss nor netstat available): {err[-300:]}")
+
+    used_ports = set()
+    for line in out.splitlines():
+        cols = line.split()
+        if len(cols) < 4:
+            continue
+        local_addr = cols[3]  # State Recv-Q Send-Q <Local Address:Port> Peer...
+        if ":" in local_addr:
+            port_str = local_addr.rsplit(":", 1)[-1]
+            if port_str.isdigit():
+                used_ports.add(int(port_str))
+
+    for port in range(*ZORC_AGENT_PORT_RANGE):
+        if port not in used_ports:
+            return port
+    raise RuntimeError(f"no free port in {ZORC_AGENT_PORT_RANGE[0]}-{ZORC_AGENT_PORT_RANGE[1]} on {tailscale_ip!r}")
+
+
+def _zorc_agent_upload_repo(tailscale_ip: str, ssh_key: Path, user: str, repo_dir: Path, remote_dir: str) -> None:
+    """Copies repo_dir's contents to remote_dir on the target via a tar
+    pipe over SSH -- no rsync/scp availability assumptions on a machine
+    zorc doesn't control the software inventory of, just tar (universal)
+    and the SSH connection every other zorc-agent operation already uses."""
+    mkdir_rc, _, mkdir_err = _ssh_run(tailscale_ip, ssh_key, ["mkdir", "-p", remote_dir], user)
+    if mkdir_rc != 0:
+        raise RuntimeError(f"failed to create {remote_dir!r} on target: {mkdir_err[-300:]}")
+
+    tar_proc = subprocess.Popen(["tar", "czf", "-", "-C", str(repo_dir), "."], stdout=subprocess.PIPE)
+    try:
+        ssh_proc = subprocess.run(
+            ["ssh", "-o", "StrictHostKeyChecking=accept-new", "-o", "ConnectTimeout=10",
+             "-i", str(ssh_key), f"{user}@{tailscale_ip}", "tar", "xzf", "-", "-C", remote_dir],
+            stdin=tar_proc.stdout, capture_output=True, text=True, timeout=120,
+        )
+    finally:
+        tar_proc.stdout.close()
+        tar_proc.wait()
+    if ssh_proc.returncode != 0:
+        raise RuntimeError(f"failed to upload repo to {remote_dir!r}: {(ssh_proc.stderr or ssh_proc.stdout)[-500:]}")
+
+
+def _zorc_agent_build_image(tailscale_ip: str, ssh_key: Path, user: str, remote_dir: str, image_tag: str) -> None:
+    rc, _, err = _ssh_run(tailscale_ip, ssh_key, ["docker", "build", "-t", image_tag, remote_dir],
+                           user, timeout=600)
+    if rc != 0:
+        raise RuntimeError(f"docker build failed: {err[-1500:]}")
+
+
+def _zorc_agent_preflight_gpu(tailscale_ip: str, ssh_key: Path, user: str) -> None:
+    """Checked before attempting --gpus all, so a missing nvidia runtime
+    surfaces as a clear rejection here rather than an opaque docker error
+    after the image is already built."""
+    rc, out, _ = _ssh_run(tailscale_ip, ssh_key, ["docker", "info", "--format", "{{json .Runtimes}}"], user)
+    if rc != 0 or "nvidia" not in out:
+        raise RuntimeError(
+            f"needs_gpu=True but {tailscale_ip!r} has no 'nvidia' Docker runtime configured "
+            f"(docker info runtimes: {out.strip() or '(unavailable)'})"
+        )
+
+
+def _zorc_agent_run_container(tailscale_ip: str, ssh_key: Path, user: str, *, name: str, image_tag: str,
+                               port: int, memory_mb: int, env_vars: dict[str, str], needs_gpu: bool) -> str:
+    """Starts the container, labeled for safe rollback identification.
+    Returns the container ID. Does not itself verify health -- see
+    _zorc_agent_wait_healthy()."""
+    cmd = [
+        "docker", "run", "-d",
+        "--name", name,
+        "--network", ZORC_AGENT_NETWORK,
+        "--memory", f"{memory_mb}m",
+        "--restart", "unless-stopped",
+        "--label", "managed-by=zorc",
+        "--label", f"zorc-app={name}",
+        "-p", f"{port}:{ZORC_AGENT_CONTAINER_PORT}",
+    ]
+    if needs_gpu:
+        cmd += ["--gpus", "all"]
+    for key, value in env_vars.items():
+        cmd += ["-e", f"{key}={value}"]
+    cmd.append(image_tag)
+
+    rc, out, err = _ssh_run(tailscale_ip, ssh_key, cmd, user, timeout=30)
+    if rc != 0:
+        raise RuntimeError(f"docker run failed: {err[-500:]}")
+    return out.strip()
+
+
+def _zorc_agent_inspect(tailscale_ip: str, ssh_key: Path, user: str, container: str) -> dict | None:
+    """`docker inspect` with no -f, JSON parsed locally, rather than a Go
+    template string -- real bug found live during this build: a template
+    string with embedded double quotes (needed for `{{index .Config.Labels
+    "managed-by"}}`) does not reliably survive the round trip through
+    local shell -> ssh's own argument reconstruction -> remote shell
+    (confirmed: silently returned nothing for a label that was genuinely
+    there). Same class of bug as the port-allocator's filter-expression
+    issue -- avoid passing any string with embedded quoting through this
+    path at all, parse structured output in Python instead. Returns None
+    if the container doesn't exist."""
+    rc, out, _ = _ssh_run(tailscale_ip, ssh_key, ["docker", "inspect", container], user)
+    if rc != 0:
+        return None
+    try:
+        parsed = json.loads(out)
+        return parsed[0] if parsed else None
+    except (json.JSONDecodeError, IndexError):
+        return None
+
+
+def _zorc_agent_wait_healthy(tailscale_ip: str, ssh_key: Path, user: str, container_id: str,
+                              timeout_sec: int = 30) -> None:
+    """Bounded wait confirming the container is still running after
+    startup, not immediately crash-looped -- without this, "deploy
+    succeeded" could mean nothing more than "the container was created."""
+    deadline = time.time() + timeout_sec
+    while time.time() < deadline:
+        info = _zorc_agent_inspect(tailscale_ip, ssh_key, user, container_id)
+        status = ((info or {}).get("State") or {}).get("Status")
+        if status == "running":
+            return
+        if status in ("exited", "dead"):
+            _, logs, _ = _ssh_run(tailscale_ip, ssh_key, ["docker", "logs", "--tail", "50", container_id], user)
+            raise RuntimeError(f"container exited immediately after start (status={status}): {logs[-1000:]}")
+        time.sleep(2)
+    raise RuntimeError(f"container did not reach 'running' state within {timeout_sec}s")
+
+
+def _zorc_agent_rollback(tailscale_ip: str, ssh_key: Path, user: str, container_names: list[str]) -> list[dict]:
+    """Best-effort teardown of zorc-created containers on a later-step
+    failure. Verifies the managed-by=zorc label before touching anything --
+    never a name-pattern glob, on a machine with 40+ containers zorc did
+    not create. Never removes the shared network (see
+    _zorc_agent_ensure_network)."""
+    results = []
+    for cname in container_names:
+        info = _zorc_agent_inspect(tailscale_ip, ssh_key, user, cname)
+        labels = ((info or {}).get("Config") or {}).get("Labels") or {}
+        if labels.get("managed-by") != "zorc":
+            results.append({"container": cname, "ok": False,
+                             "error": "not found, or missing managed-by=zorc label -- refused to touch"})
+            continue
+        _ssh_run(tailscale_ip, ssh_key, ["docker", "stop", cname], user, timeout=20)
+        rm_rc, _, rm_err = _ssh_run(tailscale_ip, ssh_key, ["docker", "rm", "-f", cname], user, timeout=20)
+        results.append({"container": cname, "ok": rm_rc == 0, "error": None if rm_rc == 0 else rm_err[-300:]})
+    return results
+
+
 def register_app(*, name: str, memory_mb: int, subdomain: str, repo: str, target: str = "servingz",
                   database: bool = False, redis: bool = False, critical: bool = False) -> None:
     """Appends a new entry to registry.yaml and commits it — mirrors what a
@@ -909,13 +1108,17 @@ def deploy(*, owner_repo: str, name: str, git_branch: str = "main", target_node:
     # not installed -- new dependencies on these machines are exactly the
     # footprint zorc-agent exists to avoid). A genuine new constraint versus
     # the Coolify path, not an existing rule -- say so plainly rather than
-    # implying a missing feature.
-    if node.get("backend") == "zorc-agent" and classification["language"] != "dockerfile":
+    # implying a missing feature. Checks the file's actual presence, not
+    # classification["language"] -- classify() reports "dockerfile" only
+    # when NO other manifest is recognized, so a repo with both a proper
+    # Dockerfile AND e.g. pyproject.toml (a perfectly normal, good setup --
+    # hello-app has exactly this shape) would otherwise be wrongly rejected
+    # here despite having exactly what this backend needs.
+    if node.get("backend") == "zorc-agent" and not (repo_dir / "Dockerfile").exists():
         raise DeployError(
             "backend_build_check",
             f"{target_node!r} (backend: zorc-agent) only supports repos with a Dockerfile at root -- "
-            f"classify() detected {classification['kind']!r}/{classification['language']!r}, not "
-            "dockerfile. No buildpack auto-detection on this backend; add a Dockerfile or target a "
+            "none found. No buildpack auto-detection on this backend; add a Dockerfile or target a "
             "backend: coolify node instead.",
         )
 
