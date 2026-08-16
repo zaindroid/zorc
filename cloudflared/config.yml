@@ -39,6 +39,4 @@ ingress:
   service: https://localhost:443
   originRequest:
     noTLSVerify: true
-- hostname: hello-rtx-test.zaindroid.me
-  service: http://100.124.93.99:20000
 - service: http_status:404
