@@ -112,6 +112,23 @@ apps:
     critical: false
     depends_on: []
 
+  - name: blylinks-crm
+    target: hostinger-vps
+    memory_mb: 384
+    # No subdomain -- this app uses a fully custom external domain
+    # (portal.blylinks.com, on its own registrar/DNS, not zaindroid.me)
+    # instead of the platform's usual {subdomain}.zaindroid.me pattern.
+    # Routed via hostinger-vps's direct public-IP ingress (plain A record
+    # at 2.25.105.110), not the Cloudflare Tunnel -- blylinks.com's
+    # nameservers are Hostinger's, not Cloudflare's.
+    subdomain: null
+    database: true
+    redis_db: null
+    storage_prefix: null
+    repo: "github.com/zaindroid/blylinks-crm"
+    critical: false
+    depends_on: []
+
 # ---------------------------------------------------------------------------
 # Reserved names — do not allocate these to apps.
 # ---------------------------------------------------------------------------

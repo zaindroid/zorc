@@ -12,5 +12,11 @@
       "iht-search",
       "iht-automations"
     ]
+  },
+  "blylinks-crm": {
+    "kind": "coolify",
+    "coolify_uuid": "u12lip63a9zi3g6hq4az83g0",
+    "coolify_postgres_uuid": "yxwbfp5davvvc81kz9z4htkq",
+    "domains": []
   }
 }
