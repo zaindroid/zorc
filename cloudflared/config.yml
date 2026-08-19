@@ -41,4 +41,8 @@ ingress:
     noTLSVerify: true
 - hostname: hermes-sglang.zaindroid.me
   service: http://100.119.248.100:20000
+- hostname: hermes.zaindroid.me
+  service: https://localhost:443
+  originRequest:
+    noTLSVerify: true
 - service: http_status:404
