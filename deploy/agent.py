@@ -652,20 +652,28 @@ def resolve_env_vars(repo_dir: Path, env_overrides: dict[str, str] | None) -> tu
 DEDICATED_POSTGRES_MEMORY_MB = 150
 
 
-def _provision_postgres_coolify(app_name: str, node: dict, target_node: str) -> tuple[str, list[str]]:
+def _provision_postgres_coolify(app_name: str, node: dict, target_node: str,
+                                 image: str = "postgres:18-alpine") -> tuple[str, list[str]]:
     """Backend-specific head #1: creates a Coolify-managed dedicated
     Postgres, waits (bounded, 90s) for it to report healthy. Returns
     (container_name, exec_cmd_prefix) -- exec_cmd_prefix is how the shared
     tail below reaches it: plain `docker exec` if this process already
     runs on the target (servingz), SSH with the standard REMOTE_DEPLOY_KEY
-    otherwise."""
+    otherwise.
+
+    image -- override for an app needing a non-vanilla Postgres, e.g.
+    "pgvector/pgvector:pg18" for an app that needs the vector extension
+    (vanilla postgres:18-alpine doesn't carry it). Same role+database
+    creation tail either way; see provision_dedicated_postgres's
+    post_create_sql for running extension/schema setup on the new
+    database once it exists."""
     with httpx.Client(timeout=30) as client:
         r = client.post(f"{COOLIFY_URL}/databases/postgresql", headers=_coolify_headers(), json={
             "project_uuid": COOLIFY_PROJECT_UUID,
             "server_uuid": node["server_uuid"],
             "environment_name": COOLIFY_ENVIRONMENT_NAME,
             "name": f"{app_name}-postgres",
-            "image": "postgres:18-alpine",
+            "image": image,
         })
         r.raise_for_status()
         db_uuid = r.json()["uuid"]
@@ -702,13 +710,14 @@ def _provision_postgres_coolify(app_name: str, node: dict, target_node: str) -> 
     return container_name, exec_prefix
 
 
-def _provision_postgres_zorc_agent(app_name: str, node: dict) -> tuple[str, list[str]]:
+def _provision_postgres_zorc_agent(app_name: str, node: dict,
+                                    image: str = "postgres:18-alpine") -> tuple[str, list[str]]:
     """Backend-specific head #2: a direct `docker run` on the zorc-agent
     network -- no Coolify API involved at all, matches everything else
     this backend does. Superuser password generated here, used only for
     the one connection the shared tail makes immediately after, never
     returned or logged. Returns (container_name, exec_cmd_prefix), same
-    shape as the Coolify head."""
+    shape as the Coolify head. image: see _provision_postgres_coolify."""
     tailscale_ip = node.get("tailscale_ip")
     if not tailscale_ip:
         raise RuntimeError("node has no tailscale_ip in registry.yaml -- cannot reach it")
@@ -722,7 +731,7 @@ def _provision_postgres_zorc_agent(app_name: str, node: dict) -> tuple[str, list
         tailscale_ip, ssh_key,
         ["docker", "run", "-d", "--name", container_name, "--network", ZORC_AGENT_NETWORK,
          "--restart", "unless-stopped", "--label", "managed-by=zorc", "--label", f"zorc-app={app_name}",
-         "-e", f"POSTGRES_PASSWORD={superuser_password}", "postgres:18-alpine"],
+         "-e", f"POSTGRES_PASSWORD={superuser_password}", image],
         user, timeout=30,
     )
     if rc != 0:
@@ -752,7 +761,9 @@ def _provision_postgres_zorc_agent(app_name: str, node: dict) -> tuple[str, list
     return container_name, exec_prefix
 
 
-def provision_dedicated_postgres(app_name: str, target_node: str) -> tuple[str, str]:
+def provision_dedicated_postgres(app_name: str, target_node: str,
+                                  image: str = "postgres:18-alpine",
+                                  post_create_sql: str | None = None) -> tuple[str, str]:
     """Creates a new, single-app-dedicated Postgres instance on target_node
     -- via Coolify's API for backend: coolify nodes, or a direct `docker
     run` for backend: zorc-agent nodes (see the two heads above) -- then
@@ -765,16 +776,28 @@ def provision_dedicated_postgres(app_name: str, target_node: str) -> tuple[str, 
     Built after discovering DATABASE_URL provisioning was entirely
     unimplemented despite being a documented part of the platform contract
     -- blylinks-crm needed this done by hand once; this is that process
-    turned into reusable, repeatable code."""
+    turned into reusable, repeatable code.
+
+    image -- non-default Postgres image, e.g. "pgvector/pgvector:pg18" for
+    an app needing the vector extension (see the two provision heads).
+
+    post_create_sql -- run against the NEW app database (not the
+    maintenance "postgres" database the initial connection lands on) right
+    after it's created, via a `\\c {db_role}` reconnect -- e.g.
+    "CREATE EXTENSION IF NOT EXISTS vector;" for an app using image=
+    pgvector/pgvector. Runs as the new role's own owner privileges are
+    already in place by this point, so no separate grant is needed."""
     node = node_config(target_node)
     if node.get("backend") == "zorc-agent":
-        container_name, exec_prefix = _provision_postgres_zorc_agent(app_name, node)
+        container_name, exec_prefix = _provision_postgres_zorc_agent(app_name, node, image=image)
     else:
-        container_name, exec_prefix = _provision_postgres_coolify(app_name, node, target_node)
+        container_name, exec_prefix = _provision_postgres_coolify(app_name, node, target_node, image=image)
 
     db_role = re.sub(r"[^a-z0-9_]", "_", app_name.lower())
     db_password = secrets.token_hex(24)
     sql = f"CREATE ROLE {db_role} WITH LOGIN PASSWORD '{db_password}'; CREATE DATABASE {db_role} OWNER {db_role};"
+    if post_create_sql:
+        sql += f"\n\\c {db_role}\n{post_create_sql}"
 
     proc = subprocess.run(exec_prefix, input=sql, capture_output=True, text=True, timeout=20)
     if proc.returncode != 0:
