@@ -612,7 +612,13 @@ def parse_app_yaml(repo_dir: Path) -> dict:
     database = parsed.get("database", False)
     if not isinstance(database, bool):
         raise ValueError(f"app.yaml database must be true or false, got {database!r}")
-    return {"env": env, "database": database}
+    persistent_storage = parsed.get("persistent_storage")
+    if persistent_storage is not None:
+        if not isinstance(persistent_storage, dict) or "mount_path" not in persistent_storage:
+            raise ValueError(
+                f"app.yaml persistent_storage must be {{mount_path: /some/path}}, got {persistent_storage!r}"
+            )
+    return {"env": env, "database": database, "persistent_storage": persistent_storage}
 
 
 def resolve_env_vars(repo_dir: Path, env_overrides: dict[str, str] | None) -> tuple[dict[str, str], list[str]]:
@@ -853,6 +859,34 @@ def set_coolify_env_vars(coolify_uuid: str, vars_to_set: dict[str, str]) -> None
             r.raise_for_status()
 
 
+def add_coolify_persistent_storage(coolify_uuid: str, name: str, mount_path: str) -> None:
+    """Attaches a Coolify-managed named volume to the application, mounted
+    at mount_path -- no host_path given, so Coolify creates a Docker-
+    managed volume (not a host bind mount) and namespaces it under the
+    app's own uuid to avoid collisions with any other app's volume.
+
+    Called after create_coolify_app (instant_deploy=False) and before
+    trigger_coolify_deploy, same ordering as set_coolify_env_vars, so the
+    container's first real start already has the mount -- Coolify (like
+    Docker) only applies volume changes on container recreation, not to
+    an already-running container.
+
+    Payload shape confirmed live against a disposable throwaway app
+    (create_coolify_app + this call + GET to verify + DELETE to clean up,
+    all outside any real deploy): type is a required field with no
+    useful error on what's valid until you guess right -- "persistent"
+    is a Docker-managed volume (this function's only use case); the
+    other valid value, "file", is for single-file bind-mounts with a
+    different field set entirely, not used here."""
+    with httpx.Client(timeout=30) as client:
+        r = client.post(
+            f"{COOLIFY_URL}/applications/{coolify_uuid}/storages",
+            headers=_coolify_headers(),
+            json={"name": name, "mount_path": mount_path, "type": "persistent"},
+        )
+        r.raise_for_status()
+
+
 def trigger_coolify_deploy(coolify_uuid: str) -> None:
     """Explicitly starts the first real build+deploy -- the counterpart to
     create_coolify_app(instant_deploy=False). Coolify's own webhook-style
@@ -986,10 +1020,23 @@ def _zorc_agent_preflight_gpu(tailscale_ip: str, ssh_key: Path, user: str) -> No
 
 
 def _zorc_agent_run_container(tailscale_ip: str, ssh_key: Path, user: str, *, name: str, image_tag: str,
-                               port: int, memory_mb: int, env_vars: dict[str, str], needs_gpu: bool) -> str:
+                               port: int, memory_mb: int, env_vars: dict[str, str], needs_gpu: bool,
+                               gpu_legacy_runtime: bool = False) -> str:
     """Starts the container, labeled for safe rollback identification.
     Returns the container ID. Does not itself verify health -- see
-    _zorc_agent_wait_healthy()."""
+    _zorc_agent_wait_healthy().
+
+    gpu_legacy_runtime -- real bug found live on jetson-thor: its Docker
+    (Jetson/L4T-style nvidia-container-runtime) rejects the `--gpus all`
+    flag outright ("invoking the NVIDIA Container Runtime Hook directly
+    ... is not supported"), even though rtx5090's Docker (newer NVIDIA
+    Container Toolkit) accepts it fine -- two GPU nodes, two incompatible
+    conventions. `docker info` confirms both machines register an
+    `nvidia` runtime, so `--runtime nvidia` + the driver-capabilities env
+    vars it expects (not needed with `--gpus`) is the portable fallback.
+    Driven by nodes/<name>'s own `gpu_runtime: legacy` in registry.yaml
+    (see _deploy_zorc_agent) -- rtx5090 is untouched, still plain
+    `--gpus all`, exactly as already proven working there."""
     cmd = [
         "docker", "run", "-d",
         "--name", name,
@@ -1001,7 +1048,11 @@ def _zorc_agent_run_container(tailscale_ip: str, ssh_key: Path, user: str, *, na
         "-p", f"{port}:{ZORC_AGENT_CONTAINER_PORT}",
     ]
     if needs_gpu:
-        cmd += ["--gpus", "all"]
+        if gpu_legacy_runtime:
+            cmd += ["--runtime", "nvidia",
+                    "-e", "NVIDIA_VISIBLE_DEVICES=all", "-e", "NVIDIA_DRIVER_CAPABILITIES=all"]
+        else:
+            cmd += ["--gpus", "all"]
     for key, value in env_vars.items():
         cmd += ["-e", f"{key}={value}"]
     cmd.append(image_tag)
@@ -1184,6 +1235,7 @@ def _deploy_zorc_agent(*, step, log: list, node: dict, target_node: str, name: s
         "run_container", _zorc_agent_run_container, tailscale_ip, ssh_key, user,
         name=name, image_tag=image_tag, port=port, memory_mb=memory_mb,
         env_vars=env_vars_to_set, needs_gpu=needs_gpu,
+        gpu_legacy_runtime=node.get("gpu_runtime") == "legacy",
     )
 
     try:
@@ -1334,6 +1386,9 @@ def deploy(*, owner_repo: str, name: str, git_branch: str = "main", target_node:
     # the static budget check would pass on a number the deploy would then
     # exceed once provision_dedicated_postgres() actually runs.
     needs_database = classification["kind"] != "static" and parse_app_yaml(repo_dir).get("database", False)
+    # Coolify-only today (zorc-agent has no app that needs this yet) -- see
+    # add_coolify_persistent_storage(). {mount_path: "/opt/data"} in app.yaml.
+    persistent_storage = parse_app_yaml(repo_dir).get("persistent_storage") if classification["kind"] != "static" else None
 
     memory_mb = memory_mb_override if memory_mb_override is not None else classification["memory_mb"]
     if needs_database:
@@ -1404,18 +1459,25 @@ def deploy(*, owner_repo: str, name: str, git_branch: str = "main", target_node:
         "create_coolify_app", create_coolify_app,
         name=name, git_repository=f"https://github.com/{owner_repo}",
         git_branch=git_branch, build_pack=build_pack, memory_mb=memory_mb, domain=domain,
-        server_uuid=node["server_uuid"], instant_deploy=not env_vars_to_set,
+        server_uuid=node["server_uuid"], instant_deploy=not env_vars_to_set and not persistent_storage,
         build_command=classification.get("build_command"),
         start_command=classification.get("start_command"),
     )
 
     try:
-        if env_vars_to_set:
+        if env_vars_to_set or persistent_storage:
             # instant_deploy was False above specifically so this can run
             # first -- the container's actual first start happens at
             # trigger_coolify_deploy, by which point every declared env var
-            # (generated or caller-supplied) is already set.
-            step("set_env_vars", set_coolify_env_vars, coolify_result["uuid"], env_vars_to_set)
+            # (generated or caller-supplied) is already set and the volume
+            # (if any) is already attached -- Coolify, like Docker, only
+            # applies a volume mount on container (re)creation, not to an
+            # already-running one.
+            if env_vars_to_set:
+                step("set_env_vars", set_coolify_env_vars, coolify_result["uuid"], env_vars_to_set)
+            if persistent_storage:
+                step("add_persistent_storage", add_coolify_persistent_storage, coolify_result["uuid"],
+                     name=f"{name}-data", mount_path=persistent_storage["mount_path"])
             step("trigger_coolify_deploy", trigger_coolify_deploy, coolify_result["uuid"])
 
         # A node with a real public IP is reached directly (A record at its IP,
