@@ -180,6 +180,17 @@ infrastructure:
 # Applications. Add new entries at the end. Keep alphabetical within groups.
 # ---------------------------------------------------------------------------
 apps:
+  - name: gemma4-api
+    target: bitbots_gpu
+    memory_mb: 40000
+    subdomain: gemma4-api
+    database: null
+    redis_db: null
+    storage_prefix: null
+    repo: "github.com/zaindroid/gemma4-api"
+    critical: false
+    depends_on: []
+
   - name: thor-platform
     target: servingz
     memory_mb: 662
