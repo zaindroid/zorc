@@ -30,3 +30,14 @@ candidates:
       (same mechanism that blocks root on rtx5090) rather than plain
       authorized_keys -- confirm the actual trust boundary before
       registering anything privileged.
+
+  - hostname: bitbots_gpu
+    tailscale_ip: 100.118.75.128
+    ssh_key: deploy/secrets/bitbots_gpu_deploy_key
+    user: zul2s
+    note: >
+      Personal AI workstation (bitbots01), dual RTX 3090s, already running
+      its own AI services (misotts-voice-agent, sglang-phi4, whisper-asr)
+      -- shared/partial node, not fully zorc-owned. Reachable over
+      Tailscale only (no public IP); intended for GPU-based AI apps/APIs
+      and AI app testing, exposed via Cloudflare Tunnel if/when needed.

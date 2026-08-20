@@ -312,10 +312,21 @@ def _detect_accelerator() -> dict | None:
     at all."""
     rc, out, _ = _run(["nvidia-smi", "--query-gpu=name,driver_version,memory.total", "--format=csv,noheader"])
     if rc == 0 and out.strip():
+        # Multi-GPU nodes print one CSV line per card. "name"/"driver" come
+        # from the first card (homogeneous multi-GPU boxes are the only
+        # kind seen so far); vram_mb is the SUM across all cards, since
+        # that is the number placement fitness actually cares about.
+        # "count" makes the aggregation legible rather than silently
+        # inflating a number that used to mean "one card".
         try:
-            name, driver, vram_s = [x.strip() for x in out.strip().split(",")]
-            vram_mb = int(vram_s.replace(" MiB", "").strip())
-            return {"type": "cuda", "name": name, "vram_mb": vram_mb, "driver": driver}
+            cards = []
+            for line in out.strip().splitlines():
+                name, driver, vram_s = [x.strip() for x in line.split(",")]
+                vram_mb = int(vram_s.replace(" MiB", "").strip())
+                cards.append((name, driver, vram_mb))
+            name, driver, _ = cards[0]
+            total_vram_mb = sum(c[2] for c in cards)
+            return {"type": "cuda", "name": name, "vram_mb": total_vram_mb, "count": len(cards), "driver": driver}
         except ValueError:
             pass
 

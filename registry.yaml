@@ -115,6 +115,32 @@ nodes:
                               # rejects --gpus all outright -- needs --runtime nvidia instead
                               # (see _zorc_agent_run_container's gpu_legacy_runtime). rtx5090
                               # is unaffected, still plain --gpus all.
+  bitbots_gpu:
+    # Personal AI workstation (hostname bitbots01), NOT zorc-owned -- dual
+    # RTX 3090s, already running its own AI services (misotts-voice-agent,
+    # sglang-phi4, whisper-asr) under a non-root account with docker-group
+    # access. Same model as rtx5090/jetson-thor: for AI GPU workloads and
+    # AI app testing only, never general-purpose apps (see AGENTS.md and
+    # _deploy_zorc_agent's Dockerfile-only gate in deploy/agent.py).
+    #
+    # Same dynamic-budget model as rtx5090/jetson-thor above -- usable_mb/
+    # max_utilisation is a static sanity ceiling on zorc's own declared
+    # apps only, NOT a reservation against this machine's other workloads.
+    # live_headroom_mb() is the real, real-time gate.
+    total_memory_mb: 128729
+    reserved_mb: 2000        # zorc-agent's own docker/network overhead only
+    usable_mb: 126729
+    max_utilisation: 0.50    # zorc's own declared apps capped at ~63400 MB on paper;
+                              # live_headroom_mb() is the real gate, not this number
+    has_public_ip: false     # Tailscale-only, no public IP of its own
+    tailscale_ip: 100.118.75.128
+    ssh_key: deploy/secrets/bitbots_gpu_deploy_key
+    ssh_user: zul2s          # non-root, no passwordless sudo -- but in the docker group,
+                              # confirmed docker/--gpus all work without sudo
+    provider: personal
+    backend: zorc-agent
+    is_control_plane: false
+
 
 domains:
   root: zaindroid.me

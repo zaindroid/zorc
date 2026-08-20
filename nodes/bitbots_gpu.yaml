@@ -1,0 +1,27 @@
+node: bitbots_gpu
+tailscale_ip: 100.118.75.128
+arch: x86_64
+accelerator:
+  type: cuda
+  name: NVIDIA GeForce RTX 3090
+  vram_mb: 49152
+  count: 2
+  driver: 595.71.05
+cpu:
+  model: AMD Ryzen 9 5900X 12-Core Processor
+  cores: 12
+  threads: 24
+ram_mb: 128729
+power:
+  source: ac
+  on_battery: false
+capabilities:
+- docker
+- zorc-agent
+- gpu
+- shared-partial
+labels:
+- personal-workstation
+- gpu-node
+status: online
+last_seen: '2026-08-20T17:05:25.176584+00:00'
