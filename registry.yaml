@@ -180,6 +180,17 @@ infrastructure:
 # Applications. Add new entries at the end. Keep alphabetical within groups.
 # ---------------------------------------------------------------------------
 apps:
+  - name: bitbots-gpu-smoke
+    target: bitbots_gpu
+    memory_mb: 384
+    subdomain: bitbots-gpu-smoke
+    database: null
+    redis_db: null
+    storage_prefix: null
+    repo: "github.com/zaindroid/bitbots-gpu-smoke"
+    critical: false
+    depends_on: []
+
   - name: thor-platform
     target: servingz
     memory_mb: 662
