@@ -180,6 +180,17 @@ infrastructure:
 # Applications. Add new entries at the end. Keep alphabetical within groups.
 # ---------------------------------------------------------------------------
 apps:
+  - name: hermes4-api
+    target: bitbots_gpu
+    memory_mb: 48000
+    subdomain: hermes4-api
+    database: null
+    redis_db: null
+    storage_prefix: null
+    repo: "github.com/zaindroid/hermes4-api"
+    critical: false
+    depends_on: []
+
   - name: thor-platform
     target: servingz
     memory_mb: 662
