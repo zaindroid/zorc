@@ -1044,7 +1044,7 @@ def _zorc_agent_preflight_gpu(tailscale_ip: str, ssh_key: Path, user: str) -> No
 
 def _zorc_agent_run_container(tailscale_ip: str, ssh_key: Path, user: str, *, name: str, image_tag: str,
                                port: int, memory_mb: int, env_vars: dict[str, str], needs_gpu: bool,
-                               gpu_legacy_runtime: bool = False) -> str:
+                               gpu_legacy_runtime: bool = False, volumes: list[str] | None = None) -> str:
     """Starts the container, labeled for safe rollback identification.
     Returns the container ID. Does not itself verify health -- see
     _zorc_agent_wait_healthy().
@@ -1070,12 +1070,28 @@ def _zorc_agent_run_container(tailscale_ip: str, ssh_key: Path, user: str, *, na
         "--label", f"zorc-app={name}",
         "-p", f"{port}:{ZORC_AGENT_CONTAINER_PORT}",
     ]
+    # Not wired through the public MCP deploy() surface -- a host bind
+    # mount is real host filesystem access, a meaningfully bigger
+    # privilege than anything else that surface grants. Internal-only,
+    # for direct agent.deploy() calls (this session's established
+    # pattern), same trust boundary as target_node forcing.
+    for v in (volumes or []):
+        cmd += ["-v", v]
     if needs_gpu:
         if gpu_legacy_runtime:
             cmd += ["--runtime", "nvidia",
                     "-e", "NVIDIA_VISIBLE_DEVICES=all", "-e", "NVIDIA_DRIVER_CAPABILITIES=all"]
         else:
             cmd += ["--gpus", "all"]
+        # Multi-process GPU frameworks (sglang/vLLM tensor-parallel workers
+        # coordinating over NCCL, torch shared-memory tensors) routinely
+        # need far more than Docker's 64MB default /dev/shm -- real gap
+        # found live deploying a multi-GPU model, not a hypothetical.
+        # Fixed at a generous size rather than plumbed through app.yaml:
+        # every needs_gpu app on this backend is an ML workload with the
+        # same class of requirement, and this costs nothing when unused
+        # (tmpfs, not a reservation against the node's real RAM).
+        cmd += ["--shm-size", "16g"]
     for key, value in env_vars.items():
         cmd += ["-e", f"{key}={value}"]
     cmd.append(image_tag)
@@ -1232,7 +1248,7 @@ def git_commit_and_push(message: str) -> None:
 def _deploy_zorc_agent(*, step, log: list, node: dict, target_node: str, name: str, owner_repo: str,
                         repo_dir: Path, classification: dict, memory_mb: int, env_vars_to_set: dict[str, str],
                         needs_gpu: bool, needs_database: bool, postgres_container_name: str | None,
-                        domain: str) -> dict:
+                        domain: str, volumes: list[str] | None = None) -> dict:
     """The zorc-agent equivalent of deploy()'s Coolify branch below --
     everything from here down runs entirely over SSH against a non-root
     Docker daemon, no Coolify API involved. Called from deploy() once the
@@ -1258,7 +1274,7 @@ def _deploy_zorc_agent(*, step, log: list, node: dict, target_node: str, name: s
         "run_container", _zorc_agent_run_container, tailscale_ip, ssh_key, user,
         name=name, image_tag=image_tag, port=port, memory_mb=memory_mb,
         env_vars=env_vars_to_set, needs_gpu=needs_gpu,
-        gpu_legacy_runtime=node.get("gpu_runtime") == "legacy",
+        gpu_legacy_runtime=node.get("gpu_runtime") == "legacy", volumes=volumes,
     )
 
     try:
@@ -1310,7 +1326,7 @@ class DeployError(Exception):
 
 def deploy(*, owner_repo: str, name: str, git_branch: str = "main", target_node: str = "servingz",
            memory_mb_override: int | None = None, env_overrides: dict[str, str] | None = None,
-           needs_gpu: bool = False) -> dict:
+           needs_gpu: bool = False, volumes: list[str] | None = None) -> dict:
     """Full pipeline: clone -> classify -> budget check -> live resource
     check -> either Cloudflare Pages (static) or Coolify (real app), DNS +
     registration either way. Raises DeployError with the exact step and
@@ -1475,7 +1491,7 @@ def deploy(*, owner_repo: str, name: str, git_branch: str = "main", target_node:
             step=step, log=log, node=node, target_node=target_node, name=name, owner_repo=owner_repo,
             repo_dir=repo_dir, classification=classification, memory_mb=memory_mb,
             env_vars_to_set=env_vars_to_set, needs_gpu=needs_gpu, needs_database=needs_database,
-            postgres_container_name=postgres_uuid, domain=domain,
+            postgres_container_name=postgres_uuid, domain=domain, volumes=volumes,
         )
 
     coolify_result = step(
