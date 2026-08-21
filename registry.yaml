@@ -81,6 +81,11 @@ nodes:
     ssh_user: zulhaq         # non-root -- this machine's Tailscale SSH ACL blocks root entirely
     provider: personal
     backend: zorc-agent
+    gpu_runtime: cdi         # this host's legacy `--gpus all` hook path started failing
+                              # (`Failed to initialize NVML: Unknown Error` in-container despite
+                              # a healthy host nvidia-smi) -- confirmed live A/B test, `--device
+                              # nvidia.com/gpu=all` (CDI) works. See _zorc_agent_run_container's
+                              # gpu_cdi. jetson-thor/bitbots_gpu unaffected, still their own modes.
     is_control_plane: false
 
   jetson-thor:
@@ -180,6 +185,17 @@ infrastructure:
 # Applications. Add new entries at the end. Keep alphabetical within groups.
 # ---------------------------------------------------------------------------
 apps:
+  - name: esp32-mesh
+    target: hostinger-vps
+    memory_mb: 512
+    subdomain: esp32-mesh
+    database: null
+    redis_db: null
+    storage_prefix: null
+    repo: "github.com/zaindroid/esp32-federated-mesh"
+    critical: false
+    depends_on: []
+
   - name: hermes4-rtx
     target: rtx5090
     memory_mb: 40000
