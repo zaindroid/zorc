@@ -193,6 +193,7 @@ apps:
     redis_db: null
     storage_prefix: null
     repo: "github.com/zaindroid/esp32-federated-mesh"
+    owner: "zainey"
     critical: false
     depends_on: []
 
@@ -204,6 +205,7 @@ apps:
     redis_db: null
     storage_prefix: null
     repo: "github.com/zaindroid/hermes4-rtx"
+    owner: "zainey"
     critical: false
     depends_on: []
 
@@ -215,6 +217,7 @@ apps:
     redis_db: null
     storage_prefix: null
     repo: "github.com/zaindroid/hermes4-api"
+    owner: "zainey"
     critical: false
     depends_on: []
 
@@ -226,6 +229,7 @@ apps:
     redis_db: null
     storage_prefix: null
     repo: "github.com/zaindroid/benchmarks-blackwell-nvidia_thor"
+    owner: "zainey"
     critical: false
     depends_on: []
 
@@ -237,6 +241,7 @@ apps:
     redis_db: null
     storage_prefix: null
     repo: "github.com/zaindroid/hermes-agent-wrapper"
+    owner: "zainey"
     critical: false
     depends_on: []
 
@@ -248,6 +253,7 @@ apps:
     redis_db: null
     storage_prefix: null
     repo: "github.com/zaindroid/hermes-sglang-wrapper"
+    owner: "zainey"
     critical: false
     depends_on: []
 
@@ -259,6 +265,7 @@ apps:
     redis_db: null
     storage_prefix: null
     repo: "github.com/zaindroid/ivay-caller_portal"
+    owner: "zainey"
     critical: false
     depends_on: []
 
@@ -270,6 +277,7 @@ apps:
     redis_db: null
     storage_prefix: null
     repo: "github.com/zaindroid/iht_news"
+    owner: "zainey"
     critical: false
     depends_on: []
 
@@ -281,6 +289,7 @@ apps:
     redis_db: null
     storage_prefix: null
     repo: "github.com/zaindroid/iht_news"
+    owner: "zainey"
     critical: false
     depends_on: []
 
@@ -292,6 +301,7 @@ apps:
     redis_db: null
     storage_prefix: null
     repo: "github.com/zaindroid/hello-app"
+    owner: "zainey"
     critical: false
     depends_on: []
 
@@ -303,6 +313,7 @@ apps:
     redis_db: null
     storage_prefix: null
     repo: "github.com/zaindroid/zorc"
+    owner: "zainey"
     critical: false
     depends_on: []
 
@@ -320,6 +331,7 @@ apps:
     redis_db: null
     storage_prefix: null
     repo: "github.com/zaindroid/blylinks-crm"
+    owner: "zainey"
     critical: false
     depends_on: []
 
