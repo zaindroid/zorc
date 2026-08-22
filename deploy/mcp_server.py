@@ -12,6 +12,7 @@ config, whether or not that app was created through this server. That
 boundary is what limits this server's blast radius to "a new resource
 might exist" rather than "an existing app might break."
 """
+import hashlib
 import json
 import secrets as secrets_module
 import shutil
@@ -23,7 +24,7 @@ from typing import Literal
 
 import uvicorn
 import yaml
-from mcp.server.mcpserver import MCPServer
+from mcp.server.mcpserver import Context, MCPServer
 from mcp.server.transport_security import TransportSecuritySettings
 from starlette.applications import Starlette
 from starlette.middleware.base import BaseHTTPMiddleware
@@ -69,14 +70,21 @@ _HEAVY_DEPENDENCY_SIGNALS = (
 )
 
 
-def _audit(action: str, params: dict, outcome: dict) -> None:
+def _audit(action: str, params: dict, outcome: dict, client: dict | None = None) -> None:
     """Structured JSON-lines audit log -- every mutating call, in or out,
     including rejections. Matches AGENTS.md §8's structured-logging
     convention (JSON to stdout would also be fine; a dedicated file is
-    easier to grep for "every deploy this server has ever triggered")."""
+    easier to grep for "every deploy this server has ever triggered").
+
+    client is the resolved {"name", "role"} identity from _caller_identity()
+    -- logs the resolved NAME only, never a token or its hash. Optional
+    (defaults to None -> logged as "unknown") so this stays call-compatible
+    for any future tool that hasn't been threaded through _caller_identity()
+    yet, though every mutating tool on this server should always pass it."""
     entry = {
         "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         "action": action,
+        "client": (client or {}).get("name", "unknown"),
         "params": params,
         "outcome": outcome,
     }
@@ -694,7 +702,7 @@ def app_metrics(name: str) -> dict:
 
 
 @mcp.tool()
-def deploy(owner_repo: str, name: str, report_id: str, git_branch: str = "main",
+def deploy(ctx: Context, owner_repo: str, name: str, report_id: str, git_branch: str = "main",
            env_overrides: dict[str, str] | None = None) -> dict:
     """Deploys a new app. THE ONLY MUTATING TOOL ON THIS SERVER -- creates
     a brand-new app; never touches, modifies, or deletes any existing one.
@@ -720,7 +728,12 @@ def deploy(owner_repo: str, name: str, report_id: str, git_branch: str = "main",
     recommended_memory_mb and recommended_node, and resolving+setting env
     vars before the container's first real start) with best-effort rollback
     if a later step fails. Rate-limited to 5 successful deploys/hour
-    (read-only tools are unlimited)."""
+    (read-only tools are unlimited).
+
+    ctx is injected by the MCP SDK, never supplied by the caller -- used
+    only to resolve which client (from mcp_token.json) is making this call,
+    for the audit log."""
+    caller = _caller_identity(ctx)
     params = {"owner_repo": owner_repo, "name": name, "report_id": report_id, "git_branch": git_branch,
               "env_overrides_keys": sorted((env_overrides or {}).keys())}  # keys only -- never log secret values
 
@@ -729,13 +742,13 @@ def deploy(owner_repo: str, name: str, report_id: str, git_branch: str = "main",
         outcome = {"status": "rejected",
                    "reason": f"no approved report {report_id!r} -- call analyze_deployment_requirements() "
                               "first (or it expired; reports are valid for 1 hour)"}
-        _audit("deploy", params, outcome)
+        _audit("deploy", params, outcome, client=caller)
         return outcome
     if time.time() > entry["expires_at"]:
         del _approved_reports[report_id]
         outcome = {"status": "rejected", "reason": f"report {report_id!r} expired -- call "
                                                      "analyze_deployment_requirements() again"}
-        _audit("deploy", params, outcome)
+        _audit("deploy", params, outcome, client=caller)
         return outcome
     report = entry["report"]
 
@@ -745,7 +758,7 @@ def deploy(owner_repo: str, name: str, report_id: str, git_branch: str = "main",
     if len(_deploy_timestamps) >= DEPLOY_RATE_LIMIT:
         outcome = {"status": "rejected",
                    "reason": f"rate limit: {DEPLOY_RATE_LIMIT} deploys per {DEPLOY_RATE_WINDOW_SEC}s exceeded"}
-        _audit("deploy", params, outcome)
+        _audit("deploy", params, outcome, client=caller)
         return outcome
 
     # Hard refusal, not agent.register_app()'s existing silent no-op --
@@ -756,7 +769,7 @@ def deploy(owner_repo: str, name: str, report_id: str, git_branch: str = "main",
         outcome = {"status": "rejected",
                    "reason": f"'{name}' already exists in registry.yaml -- this tool only creates new apps, "
                               "it cannot modify or redeploy an existing one"}
-        _audit("deploy", params, outcome)
+        _audit("deploy", params, outcome, client=caller)
         return outcome
 
     target_node = report["recommended_node"] or "servingz"  # static sites: recommended_node is None, unused by agent.deploy()'s static branch
@@ -767,35 +780,93 @@ def deploy(owner_repo: str, name: str, report_id: str, git_branch: str = "main",
                                target_node=target_node, memory_mb_override=memory_mb_override,
                                env_overrides=env_overrides, needs_gpu=report.get("needs_gpu", False))
         _deploy_timestamps.append(now)
-        _audit("deploy", params, {"status": "deployed", "domain": result.get("domain"), "report": report})
+        _audit("deploy", params, {"status": "deployed", "domain": result.get("domain"), "report": report}, client=caller)
         return result
     except agent.DeployError as e:
         outcome = {"status": "failed", "step": e.step, "reason": e.reason}
-        _audit("deploy", params, outcome)
+        _audit("deploy", params, outcome, client=caller)
         return outcome
     except KeyError as e:
         # node_config() raising on a bad target_node -- shouldn't happen
         # since the report's node came from _recommend_placement(), but
         # surfaced explicitly rather than swallowed if it somehow does.
         outcome = {"status": "rejected", "reason": str(e)}
-        _audit("deploy", params, outcome)
+        _audit("deploy", params, outcome, client=caller)
         return outcome
 
 
 # ---------------------------------------------------------------- auth ----
 
-def _load_token() -> str:
-    return json.loads(MCP_TOKEN_PATH.read_text())["token"]
+# Loaded once, cached, and reloaded automatically when mcp_token.json's
+# mtime changes -- so scripts/mint_token.py's rotations take effect on the
+# next request with no service restart, without re-reading the file on
+# every single request either. Module-level singleton, deliberately not a
+# class: this process only ever has one token file.
+_TOKEN_CACHE: dict = {"mtime": None, "map": {}}
+
+
+def _load_token_map() -> dict:
+    """{sha256(token) hex: {"name": ..., "role": "admin"|"client"}} -- see
+    scripts/mint_token.py, the only thing that ever writes this file. Raw
+    tokens are never stored on disk or logged, only their hash."""
+    mtime = MCP_TOKEN_PATH.stat().st_mtime
+    if _TOKEN_CACHE["mtime"] != mtime:
+        _TOKEN_CACHE["map"] = json.loads(MCP_TOKEN_PATH.read_text())
+        _TOKEN_CACHE["mtime"] = mtime
+    return _TOKEN_CACHE["map"]
+
+
+def _resolve_client(token: str) -> dict | None:
+    """Hashes the candidate bearer token and checks it against every stored
+    hash using a constant-time comparison per candidate (secrets.compare_digest)
+    -- belt-and-suspenders on top of the hash-then-lookup pattern already
+    being timing-safe by construction (an attacker who doesn't hold a valid
+    token can't produce a matching sha256 preimage no matter how the
+    comparison is timed). Returns the resolved {"name", "role"}, or None for
+    anything that doesn't match a known token."""
+    if not token:
+        return None
+    candidate_hash = hashlib.sha256(token.encode()).hexdigest()
+    for stored_hash, info in _load_token_map().items():
+        if secrets_module.compare_digest(candidate_hash, stored_hash):
+            return info
+    return None
+
+
+def _caller_identity(ctx: Context) -> dict:
+    """Re-resolves the calling client's {"name", "role"} from the bearer
+    token on this MCP request, for tools to pass into _audit(). Deliberately
+    NOT read from request.state -- BearerAuthMiddleware runs at the ASGI
+    layer on the raw Starlette Request, but each individual tool call inside
+    an MCP session gets its own Context wrapping a (possibly different)
+    request object down in the SDK's transport plumbing, with no guaranteed
+    shared `.state`. ctx.headers IS the SDK's own documented, per-tool-call
+    channel for this (see mcp.server.mcpserver.context.Context.headers), so
+    re-deriving identity from the same Authorization header there -- rather
+    than trusting an attribute that may not have survived the hop -- is the
+    robust option, not a shortcut. Cheap (one more hash + dict scan) and
+    fails closed: BearerAuthMiddleware already guarantees this header
+    resolves to a real client by the time any tool body runs, so a None
+    here means the SDK's request-object wiring changed under us -- refuse
+    rather than audit an unknown caller as though it were legitimate."""
+    headers = ctx.headers or {}
+    auth = headers.get("authorization") or headers.get("Authorization") or ""
+    token = auth[len("Bearer "):] if auth.startswith("Bearer ") else ""
+    client = _resolve_client(token)
+    if client is None:
+        raise PermissionError("could not resolve caller identity from this request's bearer token")
+    return client
 
 
 class BearerAuthMiddleware(BaseHTTPMiddleware):
-    """One shared secret, checked on every request except the platform's
-    own required health/version endpoints. Deliberately NOT using the MCP
-    SDK's OAuth-oriented auth provider machinery (AuthSettings/
-    TokenVerifier expects a full authorization-server flow with client
-    registration) -- this is a single static token shared across the
-    user's own agents, so a plain ASGI middleware checking one header is
-    the right amount of complexity, not an under-engineered shortcut.
+    """Per-client bearer tokens (see _resolve_client/_load_token_map above),
+    checked on every request except the platform's own required
+    health/version endpoints. Deliberately NOT using the MCP SDK's
+    OAuth-oriented auth provider machinery (AuthSettings/TokenVerifier
+    expects a full authorization-server flow with client registration) --
+    this is a small set of static per-client tokens minted by
+    scripts/mint_token.py, so a plain ASGI middleware checking one header
+    is the right amount of complexity, not an under-engineered shortcut.
 
     Real bug found live: this middleware used to blanket-401 EVERY path
     that wasn't in PUBLIC_PATHS, including OAuth discovery endpoints
@@ -823,9 +894,17 @@ class BearerAuthMiddleware(BaseHTTPMiddleware):
                 or path in self._OAUTH_DISCOVERY_PATHS
                 or path.startswith(self._OAUTH_DISCOVERY_PREFIXES)):
             return await call_next(request)
-        expected = f"Bearer {_load_token()}"
-        if request.headers.get("authorization", "") != expected:
+        auth = request.headers.get("authorization", "")
+        token = auth[len("Bearer "):] if auth.startswith("Bearer ") else ""
+        client = _resolve_client(token)
+        if client is None:
             return JSONResponse({"error": "unauthorized"}, status_code=401)
+        # Set for any future plain-Starlette route added to this app (the
+        # platform endpoints below, or a later addition) -- MCP tool calls
+        # themselves don't rely on this and re-resolve via ctx.headers
+        # instead (see _caller_identity's docstring for why).
+        request.state.client_name = client["name"]
+        request.state.client_role = client["role"]
         return await call_next(request)
 
 
@@ -850,6 +929,11 @@ async def version(request: Request):
 
 
 def build_app() -> Starlette:
+    # Load (and validate) the token map now, at process startup, rather than
+    # waiting for the first request to discover a missing/malformed
+    # mcp_token.json -- fail closed at boot, not on someone's first call.
+    _load_token_map()
+
     # The MCP SDK's DNS-rebinding protection rejects any Host header it
     # doesn't recognize by default (only localhost variants) -- a real
     # security feature, not something to disable. This server sits behind
