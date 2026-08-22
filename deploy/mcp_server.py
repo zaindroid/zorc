@@ -14,6 +14,7 @@ might exist" rather than "an existing app might break."
 """
 import hashlib
 import json
+import os
 import secrets as secrets_module
 import shutil
 import time
@@ -34,7 +35,11 @@ from starlette.responses import JSONResponse, PlainTextResponse
 import agent  # deploy/agent.py, sibling module
 
 MCP_SECRETS = Path(__file__).parent / "secrets"
-MCP_TOKEN_PATH = MCP_SECRETS / "mcp_token.json"
+# ZORC_MCP_TOKEN_PATH exists purely for scripts/test_mcp_auth.py -- lets the
+# CI pipeline test point a real, fully-wired server at a disposable token
+# file instead of the production one. Unset in normal operation (systemd's
+# unit file doesn't set it), so production always resolves to the real path.
+MCP_TOKEN_PATH = Path(os.environ.get("ZORC_MCP_TOKEN_PATH", str(MCP_SECRETS / "mcp_token.json")))
 AUDIT_LOG_PATH = Path(__file__).parent / "mcp_audit.log"
 
 # Public, unauthenticated paths -- Coolify's own health checker has no
@@ -122,6 +127,20 @@ mcp = MCPServer(
         "tells you which is which before you get there."
     ),
 )
+
+
+@mcp.tool()
+def whoami(ctx: Context) -> dict:
+    """Returns the calling client's own resolved identity ({"name", "role"})
+    -- lets any client self-check who it's authenticated as, and is this
+    server's smoke test that Context/ctx.headers-based identity resolution
+    (_caller_identity) works uniformly across every tool, not just deploy()
+    -- FastMCP builds an identical Context for every tool call through one
+    shared code path (see mcp.server.mcpserver.server's _handle_call_tool),
+    so if this resolves correctly here it resolves correctly everywhere.
+    Read-only, no side effects, not rate-limited or audited (nothing here
+    is a mutation)."""
+    return _caller_identity(ctx)
 
 
 @mcp.tool()
@@ -808,10 +827,34 @@ _TOKEN_CACHE: dict = {"mtime": None, "map": {}}
 def _load_token_map() -> dict:
     """{sha256(token) hex: {"name": ..., "role": "admin"|"client"}} -- see
     scripts/mint_token.py, the only thing that ever writes this file. Raw
-    tokens are never stored on disk or logged, only their hash."""
+    tokens are never stored on disk or logged, only their hash.
+
+    Shape-validated on every (re)load, not just parsed as JSON -- a
+    malformed file (wrong type, an entry missing "name", a "role" outside
+    {"admin","client"}) raises here rather than being accepted as a
+    partial/best-effort map. Two different moments this can be hit:
+    eagerly at process startup (build_app() calls this before the app is
+    assembled -- an unhandled exception there kills the process, i.e. the
+    service refuses to start on a bad file, checked by
+    scripts/test_mcp_auth.py) and on a later reload triggered by the
+    file's mtime changing while already running (a bad hand-edit while
+    live) -- callers of THIS function (_resolve_client, and this file's
+    build_app()) are the ones responsible for turning that second case
+    into "deny everyone" rather than a raw 500; see _resolve_client."""
     mtime = MCP_TOKEN_PATH.stat().st_mtime
     if _TOKEN_CACHE["mtime"] != mtime:
-        _TOKEN_CACHE["map"] = json.loads(MCP_TOKEN_PATH.read_text())
+        raw = json.loads(MCP_TOKEN_PATH.read_text())
+        if not isinstance(raw, dict):
+            raise ValueError(f"{MCP_TOKEN_PATH}: expected a JSON object of {{hash: {{name, role}}}}, "
+                              f"got {type(raw).__name__}")
+        for h, info in raw.items():
+            if (not isinstance(info, dict) or not isinstance(info.get("name"), str) or not info.get("name")
+                    or info.get("role") not in ("admin", "client")):
+                raise ValueError(f"{MCP_TOKEN_PATH}: malformed entry for hash {h[:8]}... -- "
+                                  "expected {'name': <non-empty str>, 'role': 'admin'|'client'}")
+        # Only commit to the cache once the WHOLE file has validated clean --
+        # never adopt a partially-checked map.
+        _TOKEN_CACHE["map"] = raw
         _TOKEN_CACHE["mtime"] = mtime
     return _TOKEN_CACHE["map"]
 
@@ -823,11 +866,23 @@ def _resolve_client(token: str) -> dict | None:
     being timing-safe by construction (an attacker who doesn't hold a valid
     token can't produce a matching sha256 preimage no matter how the
     comparison is timed). Returns the resolved {"name", "role"}, or None for
-    anything that doesn't match a known token."""
+    anything that doesn't match a known token -- including when the token
+    file itself can't be loaded right now (corrupted by a bad hand-edit
+    while the service is already running, permissions problem, whatever).
+    That last case is deliberate: a caller here (BearerAuthMiddleware,
+    _caller_identity) has no way to distinguish "genuinely no client
+    matches" from "the map is broken," and fail-closed means both act the
+    same way -- deny -- rather than either crashing the request with a raw
+    500 or silently trusting a stale/partial map. This is the ONLY place
+    that trade-off is made, so both callers inherit it uniformly."""
     if not token:
         return None
+    try:
+        token_map = _load_token_map()
+    except Exception:
+        return None  # can't authoritatively resolve anything right now -- fail closed, not 500
     candidate_hash = hashlib.sha256(token.encode()).hexdigest()
-    for stored_hash, info in _load_token_map().items():
+    for stored_hash, info in token_map.items():
         if secrets_module.compare_digest(candidate_hash, stored_hash):
             return info
     return None
@@ -844,10 +899,15 @@ def _caller_identity(ctx: Context) -> dict:
     channel for this (see mcp.server.mcpserver.context.Context.headers), so
     re-deriving identity from the same Authorization header there -- rather
     than trusting an attribute that may not have survived the hop -- is the
-    robust option, not a shortcut. Cheap (one more hash + dict scan) and
+    robust option, not a shortcut. This function does its OWN hash+lookup
+    via _resolve_client() every call -- it is not reading anything the
+    middleware stashed, and never will be, so it stays a self-sufficient
+    gate even for a hypothetical future tool-call path that bypassed
+    BearerAuthMiddleware entirely. Cheap (one more hash + dict scan) and
     fails closed: BearerAuthMiddleware already guarantees this header
-    resolves to a real client by the time any tool body runs, so a None
-    here means the SDK's request-object wiring changed under us -- refuse
+    resolves to a real client by the time any tool body runs under normal
+    operation, so a None here means either that guarantee broke somehow or
+    the token map became unloadable between the two checks -- refuse
     rather than audit an unknown caller as though it were legitimate."""
     headers = ctx.headers or {}
     auth = headers.get("authorization") or headers.get("Authorization") or ""
@@ -939,10 +999,16 @@ def build_app() -> Starlette:
     # security feature, not something to disable. This server sits behind
     # the Cloudflare Tunnel at mcp.zaindroid.me, so that hostname (and
     # plain localhost, for the manual/local testing done during
-    # development) needs to be explicitly trusted.
+    # development) needs to be explicitly trusted. ZORC_MCP_ALLOWED_HOSTS
+    # (comma-separated) extends this list -- unset in normal operation;
+    # scripts/test_mcp_auth.py uses it to add its own random throwaway
+    # port, which otherwise 421s here exactly like a real DNS-rebinding
+    # attempt would (that's this check doing its job, not a bug).
+    allowed_hosts = ["mcp.zaindroid.me", "127.0.0.1:8081", "localhost:8081"]
+    allowed_hosts += [h for h in os.environ.get("ZORC_MCP_ALLOWED_HOSTS", "").split(",") if h]
     security = TransportSecuritySettings(
         enable_dns_rebinding_protection=True,
-        allowed_hosts=["mcp.zaindroid.me", "127.0.0.1:8081", "localhost:8081"],
+        allowed_hosts=allowed_hosts,
     )
     app = mcp.streamable_http_app(transport_security=security)
     app.add_route("/health", health, methods=["GET"])
