@@ -53,4 +53,8 @@ ingress:
   service: http://100.118.75.128:20000
 - hostname: hermes4-rtx.zaindroid.me
   service: http://100.124.93.99:20000
+- hostname: zbots.zaindroid.me
+  service: https://localhost:443
+  originRequest:
+    noTLSVerify: true
 - service: http_status:404
