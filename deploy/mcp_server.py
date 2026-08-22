@@ -9,16 +9,22 @@ for "how deployment actually works" stays agent.py.
 Mutating tools: deploy() (create-only -- refuses outright if the name
 already exists, never touches an existing app), redeploy() and restart()
 (idempotent re-apply on an app the caller owns -- rebuild current
-branch/restart the container, never a config/env change). None of the
-three can delete anything -- there is still no teardown tool on this
-server. Every mutating tool goes through _require_owner_or_admin() (once
-an app exists to own -- deploy() has nothing to check ownership against
-yet) and its own rate limit, and is logged via _audit() under the
-resolved caller's name, never anything caller-supplied.
+branch/restart the container, never a config/env change), and the
+request_teardown()/approve_action()/reject_action() queue -- the ONE
+destructive capability on this server, deliberately two steps: a client
+(or admin) can only ever QUEUE a teardown; executing one is admin-only,
+full stop, regardless of who requested it or who owns the app. There is
+still no way for deploy()/redeploy()/restart() themselves to delete
+anything. Every mutating tool goes through _require_owner_or_admin() (or,
+for approve_action/reject_action, a hard-coded admin-only check -- app
+ownership doesn't grant destruction rights) and its own rate limit, and
+is logged via _audit() under the resolved caller's name, never anything
+caller-supplied.
 
 Everything else (get_app_status, get_app_logs, get_deploy_history,
-diagnose_app, list_nodes, ...) is read-only and ownership-scoped the same
-way: a client sees only apps they own, admin sees everything.
+diagnose_app, list_pending_actions, list_nodes, ...) is read-only and
+ownership-scoped the same way: a client sees only apps/requests they
+own/made, admin sees everything.
 """
 import hashlib
 import json
@@ -54,6 +60,13 @@ MCP_TOKEN_PATH = Path(os.environ.get("ZORC_MCP_TOKEN_PATH", str(MCP_SECRETS / "m
 # never be able to write into the real production mcp_audit.log just
 # because it forgot to override this. Unset in normal operation.
 AUDIT_LOG_PATH = Path(os.environ.get("ZORC_MCP_AUDIT_LOG_PATH", str(Path(__file__).parent / "mcp_audit.log")))
+# Phase 4b's request/approve queue -- {id: {"action", "name", "requested_by",
+# "requested_at", "status", ...}}. A real file, not the in-memory pattern
+# _approved_reports below uses, deliberately: a pending teardown request
+# must survive this process restarting before an admin gets to it. Same
+# env-var-override pattern as the two paths above, same reason.
+PENDING_ACTIONS_PATH = Path(os.environ.get("ZORC_MCP_PENDING_ACTIONS_PATH",
+                                             str(Path(__file__).parent / "pending_actions.json")))
 
 # Public, unauthenticated paths -- Coolify's own health checker has no
 # bearer token, and per AGENTS.md's app contract /health must not require
@@ -76,6 +89,25 @@ _redeploy_timestamps: deque[float] = deque()
 RESTART_RATE_LIMIT = 10
 RESTART_RATE_WINDOW_SEC = 3600
 _restart_timestamps: deque[float] = deque()
+
+# Phase 4b: request_teardown() only ever queues -- own generous limit, it's
+# not destructive. approve_action() is where actual deletion happens, so
+# it gets the tightest budget on this server, tighter than redeploy's even
+# -- a mistaken/compromised admin session looping approvals is the one
+# failure mode that can't be undone. reject_action() is harmless (declines
+# a request) and gets a loose limit, mostly to satisfy "every mutating
+# tool has SOME rate limit" rather than because it's a real risk.
+TEARDOWN_REQUEST_RATE_LIMIT = 5
+TEARDOWN_REQUEST_RATE_WINDOW_SEC = 3600
+_teardown_request_timestamps: deque[float] = deque()
+
+APPROVE_ACTION_RATE_LIMIT = 3
+APPROVE_ACTION_RATE_WINDOW_SEC = 3600
+_approve_action_timestamps: deque[float] = deque()
+
+REJECT_ACTION_RATE_LIMIT = 20
+REJECT_ACTION_RATE_WINDOW_SEC = 3600
+_reject_action_timestamps: deque[float] = deque()
 
 BUILD_SHA = "dev"  # overwritten by Coolify's build-arg injection if configured; fine as a static fallback
 
@@ -1100,6 +1132,213 @@ def restart(ctx: Context, name: str) -> dict:
         outcome = {"status": "failed", "reason": str(e)}
         _audit("restart", params, outcome, client=caller)
         return outcome
+
+
+# --------------------------------------------------------- Phase 4: teardown ----
+# The ONE destructive capability on this server -- deliberately two steps
+# (4b, not the simpler 4a confirm=True), per explicit user instruction:
+# request_teardown() only ever queues, never deletes anything by itself;
+# approve_action() is the sole place agent.delete_app() gets called, and
+# it's admin-only regardless of who requested the teardown or who owns
+# the app. A human is in the loop for every deletion, full stop -- there
+# is no path from a client's own call straight to destruction.
+
+def _load_pending_actions() -> dict:
+    if not PENDING_ACTIONS_PATH.exists():
+        return {}
+    return json.loads(PENDING_ACTIONS_PATH.read_text())
+
+
+def _save_pending_actions(actions: dict) -> None:
+    PENDING_ACTIONS_PATH.write_text(json.dumps(actions, indent=2))
+
+
+@mcp.tool()
+def request_teardown(ctx: Context, name: str) -> dict:
+    """Queues a teardown request for an app you own (or any app, if
+    you're admin) -- does NOT delete anything. Returns the request's id;
+    an ADMIN must separately call approve_action(id) to actually execute
+    it (see that tool's docstring for why this is two steps). Use
+    list_pending_actions() to check a request's status.
+
+    Refuses a second pending request for the same app -- returns the
+    existing id instead of creating a duplicate. Rate-limited and
+    audited like every mutating tool here, even though this specific
+    call never deletes anything itself; the actual destruction is
+    entirely inside approve_action()."""
+    caller = _caller_identity(ctx)
+    params = {"name": name}
+
+    gate = _require_owner_or_admin(caller, name)
+    if not gate["ok"]:
+        _audit("request_teardown", params, gate, client=caller)
+        return gate
+
+    now = time.time()
+    while _teardown_request_timestamps and now - _teardown_request_timestamps[0] > TEARDOWN_REQUEST_RATE_WINDOW_SEC:
+        _teardown_request_timestamps.popleft()
+    if len(_teardown_request_timestamps) >= TEARDOWN_REQUEST_RATE_LIMIT:
+        outcome = {"status": "rejected",
+                   "reason": f"rate limit: {TEARDOWN_REQUEST_RATE_LIMIT} teardown requests per "
+                             f"{TEARDOWN_REQUEST_RATE_WINDOW_SEC}s exceeded"}
+        _audit("request_teardown", params, outcome, client=caller)
+        return outcome
+
+    actions = _load_pending_actions()
+    existing = next((a for a in actions.values()
+                      if a.get("name") == name and a.get("action") == "teardown" and a.get("status") == "pending"),
+                     None)
+    if existing:
+        outcome = {"status": "already_pending", "id": existing["id"], "name": name,
+                    "reason": f"a teardown request for {name!r} is already pending (id {existing['id']!r}, "
+                              f"requested by {existing['requested_by']!r})"}
+        _audit("request_teardown", params, outcome, client=caller)
+        return outcome
+
+    action_id = secrets_module.token_hex(8)
+    actions[action_id] = {
+        "id": action_id, "action": "teardown", "name": name,
+        "requested_by": caller["name"], "requested_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "status": "pending",
+    }
+    _save_pending_actions(actions)
+    _teardown_request_timestamps.append(now)
+    outcome = {"status": "requested", "id": action_id, "name": name}
+    _audit("request_teardown", params, outcome, client=caller)
+    return outcome
+
+
+@mcp.tool()
+def list_pending_actions(ctx: Context) -> dict:
+    """Lists queued actions from request_teardown() -- admin sees every
+    request; a client sees only the ones they themselves requested (never
+    another client's, even for an app they own -- ownership of the APP
+    doesn't imply visibility into who else requested what against it).
+    Read-only, not rate-limited or audited."""
+    caller = _caller_identity(ctx)
+    actions = list(_load_pending_actions().values())
+    if caller.get("role") != "admin":
+        actions = [a for a in actions if a.get("requested_by") == caller.get("name")]
+    actions.sort(key=lambda a: a.get("requested_at", ""), reverse=True)
+    return {"actions": actions}
+
+
+@mcp.tool()
+def approve_action(ctx: Context, id: str) -> dict:
+    """Executes a pending action queued by request_teardown() -- ADMIN
+    ONLY, full stop, regardless of who requested it or who owns the app.
+    This is the ONE place actual destruction happens on this server;
+    deploy()/redeploy()/restart() only ever create or re-apply. Refuses
+    cleanly (never a stack trace) for a non-admin caller, an unknown id,
+    or an id that's already been resolved (approved/rejected already) --
+    never silently no-ops or re-executes something twice.
+
+    Calls agent.delete_app(name), which is genuinely irreversible: the
+    Coolify resource (or Pages project), its DNS record, its tunnel
+    route, the resource_map entry, and the registry.yaml entry are all
+    removed, and the registry change is committed. A failure partway
+    through is recorded on the queue entry as "failed" with the error,
+    not silently dropped -- check list_pending_actions() after a failure
+    rather than assuming nothing happened."""
+    caller = _caller_identity(ctx)
+    params = {"id": id}
+
+    if caller.get("role") != "admin":
+        outcome = {"status": "rejected", "reason": "approve_action is admin-only"}
+        _audit("approve_action", params, outcome, client=caller)
+        return outcome
+
+    now = time.time()
+    while _approve_action_timestamps and now - _approve_action_timestamps[0] > APPROVE_ACTION_RATE_WINDOW_SEC:
+        _approve_action_timestamps.popleft()
+    if len(_approve_action_timestamps) >= APPROVE_ACTION_RATE_LIMIT:
+        outcome = {"status": "rejected",
+                   "reason": f"rate limit: {APPROVE_ACTION_RATE_LIMIT} approvals per "
+                             f"{APPROVE_ACTION_RATE_WINDOW_SEC}s exceeded"}
+        _audit("approve_action", params, outcome, client=caller)
+        return outcome
+
+    actions = _load_pending_actions()
+    entry = actions.get(id)
+    if entry is None:
+        outcome = {"status": "rejected", "reason": f"no pending action with id {id!r}"}
+        _audit("approve_action", params, outcome, client=caller)
+        return outcome
+    if entry.get("status") != "pending":
+        outcome = {"status": "rejected",
+                   "reason": f"action {id!r} is already {entry.get('status')!r}, not pending"}
+        _audit("approve_action", params, outcome, client=caller)
+        return outcome
+    if entry.get("action") != "teardown":
+        outcome = {"status": "rejected", "reason": f"unknown action type {entry.get('action')!r}"}
+        _audit("approve_action", params, outcome, client=caller)
+        return outcome
+
+    try:
+        result = agent.delete_app(entry["name"])
+        entry.update(status="approved_and_executed", approved_by=caller["name"],
+                      approved_at=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), result=result)
+        actions[id] = entry
+        _save_pending_actions(actions)
+        _approve_action_timestamps.append(now)
+        outcome = {"status": "executed", "id": id, "name": entry["name"], "result": result}
+        _audit("approve_action", params, outcome, client=caller)
+        return outcome
+    except Exception as e:
+        entry.update(status="failed", approved_by=caller["name"],
+                      approved_at=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), error=str(e))
+        actions[id] = entry
+        _save_pending_actions(actions)
+        outcome = {"status": "failed", "id": id, "name": entry["name"], "reason": str(e)}
+        _audit("approve_action", params, outcome, client=caller)
+        return outcome
+
+
+@mcp.tool()
+def reject_action(ctx: Context, id: str) -> dict:
+    """Declines a pending action queued by request_teardown() without
+    executing it -- ADMIN ONLY, same reasoning as approve_action(): a
+    human is in the loop for every decision about destruction, including
+    the decision NOT to. Refuses cleanly for a non-admin caller, an
+    unknown id, or an id that's already resolved."""
+    caller = _caller_identity(ctx)
+    params = {"id": id}
+
+    if caller.get("role") != "admin":
+        outcome = {"status": "rejected", "reason": "reject_action is admin-only"}
+        _audit("reject_action", params, outcome, client=caller)
+        return outcome
+
+    now = time.time()
+    while _reject_action_timestamps and now - _reject_action_timestamps[0] > REJECT_ACTION_RATE_WINDOW_SEC:
+        _reject_action_timestamps.popleft()
+    if len(_reject_action_timestamps) >= REJECT_ACTION_RATE_LIMIT:
+        outcome = {"status": "rejected",
+                   "reason": f"rate limit: {REJECT_ACTION_RATE_LIMIT} rejections per "
+                             f"{REJECT_ACTION_RATE_WINDOW_SEC}s exceeded"}
+        _audit("reject_action", params, outcome, client=caller)
+        return outcome
+
+    actions = _load_pending_actions()
+    entry = actions.get(id)
+    if entry is None:
+        outcome = {"status": "rejected", "reason": f"no pending action with id {id!r}"}
+        _audit("reject_action", params, outcome, client=caller)
+        return outcome
+    if entry.get("status") != "pending":
+        outcome = {"status": "rejected",
+                   "reason": f"action {id!r} is already {entry.get('status')!r}, not pending"}
+        _audit("reject_action", params, outcome, client=caller)
+        return outcome
+
+    entry.update(status="rejected", rejected_by=caller["name"],
+                 rejected_at=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()))
+    actions[id] = entry
+    _save_pending_actions(actions)
+    _reject_action_timestamps.append(now)
+    outcome = {"status": "action_rejected", "id": id, "name": entry["name"]}
+    _audit("reject_action", params, outcome, client=caller)
+    return outcome
 
 
 # ---------------------------------------------------------------- auth ----
