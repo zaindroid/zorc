@@ -6,15 +6,24 @@ this file adds guardrails and a read-only introspection surface on top of
 them, it does not reimplement deployment logic. Single source of truth
 for "how deployment actually works" stays agent.py.
 
-Hard boundary: the only mutating tool is deploy(), which can only CREATE
-new apps. It cannot delete, stop, restart, or modify any existing app's
-config, whether or not that app was created through this server. That
-boundary is what limits this server's blast radius to "a new resource
-might exist" rather than "an existing app might break."
+Mutating tools: deploy() (create-only -- refuses outright if the name
+already exists, never touches an existing app), redeploy() and restart()
+(idempotent re-apply on an app the caller owns -- rebuild current
+branch/restart the container, never a config/env change). None of the
+three can delete anything -- there is still no teardown tool on this
+server. Every mutating tool goes through _require_owner_or_admin() (once
+an app exists to own -- deploy() has nothing to check ownership against
+yet) and its own rate limit, and is logged via _audit() under the
+resolved caller's name, never anything caller-supplied.
+
+Everything else (get_app_status, get_app_logs, get_deploy_history,
+diagnose_app, list_nodes, ...) is read-only and ownership-scoped the same
+way: a client sees only apps they own, admin sees everything.
 """
 import hashlib
 import json
 import os
+import re
 import secrets as secrets_module
 import shutil
 import time
@@ -715,26 +724,183 @@ def check_budget(name: str, memory_mb: int, target_node: str = "servingz") -> di
     return {"fits": ok, "reason": reason}
 
 
-@mcp.tool()
-def app_status(name: str) -> dict:
-    """Live status of an existing, already-deployed app. Read-only --
-    does not create, modify, or affect anything."""
-    return agent.app_status(name)
+# -------------------------------------------------------- observability ----
+# Phase 3: read-only, ownership-scoped (a client sees only apps they own;
+# admin sees everything -- same _require_owner_or_admin gate every mutating
+# tool uses, just never followed by an actual mutation). Replaces the
+# earlier app_status/app_logs/app_metrics tools, which had no ownership
+# scoping at all -- any client could read any app's logs/status/metrics
+# regardless of who owned it, a real gap Phase 1's ownership model never
+# actually closed until now. That gap is why those three tools are gone
+# rather than left alongside these -- keeping both would mean the old,
+# unscoped ones were still a working bypass around the new ones.
+
+def _read_deploy_history(name: str, limit: int = 20) -> list[dict]:
+    """Every audit-logged action (deploy/redeploy/restart, including
+    rejections and failures) whose params reference this app name, newest
+    first. Sourced from mcp_audit.log -- the only durable record this
+    server keeps of what it's done to a given app over time; Coolify
+    itself only shows its own most recent build, not a history keyed by
+    caller/outcome the way this audit trail is."""
+    if not AUDIT_LOG_PATH.exists():
+        return []
+    entries = []
+    with open(AUDIT_LOG_PATH) as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                entry = json.loads(line)
+            except json.JSONDecodeError:
+                continue  # a corrupt line shouldn't take the whole history down
+            if entry.get("params", {}).get("name") == name:
+                entries.append(entry)
+    entries.sort(key=lambda e: e.get("ts", ""), reverse=True)
+    return entries[:limit]
 
 
 @mcp.tool()
-def app_logs(name: str, lines: int = 200) -> str:
-    """Recent logs for an existing, already-deployed app. Read-only."""
-    return agent.app_logs(name, lines)
+def get_app_status(ctx: Context, name: str) -> dict:
+    """Live status of an app you own (or any app, if you're admin):
+    container/process state, and actual-vs-budget memory/CPU (Coolify
+    apps/services and zorc-agent containers all report real usage now --
+    zorc-agent apps didn't before this tool existed, see agent.py's
+    app_status()). Read-only, ownership-scoped, not rate-limited or
+    audited (nothing here is a mutation)."""
+    caller = _caller_identity(ctx)
+    gate = _require_owner_or_admin(caller, name)
+    if not gate["ok"]:
+        return gate
+    status = agent.app_status(name)
+    budget_mb, used_mb = status.get("memory_mb") or 0, status.get("mem_used_mb")
+    if budget_mb and used_mb is not None:
+        status["budget_utilization_percent"] = round(100 * used_mb / budget_mb, 1)
+    return status
 
 
 @mcp.tool()
-def app_metrics(name: str) -> dict:
-    """Live CPU/memory usage for an existing, already-deployed app.
-    Read-only -- this is the ongoing resource-tracking data source
-    (backed by Coolify's own container stats, the same numbers the
-    platform's own memory-pressure alerting uses)."""
-    return agent.app_resources(name)
+def get_app_logs(ctx: Context, name: str, tail: int = 200, since: str | None = None,
+                  grep: str | None = None) -> str:
+    """Recent logs for an app you own (or any app, if you're admin).
+    since (zorc-agent apps only -- see agent.app_logs()'s docstring for
+    why Coolify's path doesn't honor it) accepts a Docker --since value
+    like "1h"/"30m" or an RFC3339 timestamp. grep is a plain case-
+    insensitive substring filter applied after fetching, not a regex, and
+    not sent to Coolify/docker directly -- works the same for both
+    backends. Read-only, ownership-scoped."""
+    caller = _caller_identity(ctx)
+    gate = _require_owner_or_admin(caller, name)
+    if not gate["ok"]:
+        # This tool's return type is str (the log text itself on success),
+        # so a refusal stays a string too -- the same parenthetical-
+        # message convention agent.app_logs() already uses for its own
+        # "no logs available" cases, not a dict shape this signature never
+        # promised.
+        return f"(refused: {gate['reason']})"
+    return agent.app_logs(name, tail, since, grep)
+
+
+@mcp.tool()
+def get_deploy_history(ctx: Context, name: str, limit: int = 20) -> dict:
+    """Recent deploy/redeploy/restart actions taken against an app you own
+    (or any app, if you're admin), newest first, sourced from this
+    server's own audit log -- who did what, when, and the outcome
+    (including rejections/failures, not just successes). Read-only,
+    ownership-scoped."""
+    caller = _caller_identity(ctx)
+    gate = _require_owner_or_admin(caller, name)
+    if not gate["ok"]:
+        return gate
+    return {"name": name, "history": _read_deploy_history(name, limit)}
+
+
+# Deliberately keyword/pattern based, not an LLM -- this codebase has none
+# by design (see agent.py's own module docstring: "Deliberately no LLM").
+# A log line naming an ALL_CAPS-looking identifier next to phrasing like
+# "is not defined"/"is required"/"missing" is a decent, cheap signal for
+# "this looks like an unset environment variable" -- surfaced as a
+# possible cause in diagnose_app's findings, never asserted as certain.
+_ENV_VAR_LOG_SIGNAL_RE = re.compile(
+    r"\b[A-Z][A-Z0-9_]{2,}\b[^\n]{0,40}\b(is not (defined|set)|is required|must be set|missing)\b"
+    r"|\b(missing|required)\b[^\n]{0,40}\b[A-Z][A-Z0-9_]{2,}\b"
+    r"|KeyError:\s*'?[A-Z][A-Z0-9_]{2,}'?",
+    re.IGNORECASE,
+)
+
+_SEVERITY_ORDER = {"critical": 0, "high": 1, "medium": 2, "info": 3}
+
+
+@mcp.tool()
+def diagnose_app(ctx: Context, name: str) -> dict:
+    """Fuses recent logs + live status + last deploy outcome + resource
+    use into one "why might this app be unhealthy" answer, for an app you
+    own (or any app, if you're admin). Built entirely on get_app_status/
+    get_app_logs/get_deploy_history's own data -- a set of deterministic,
+    clearly-labeled heuristics (container not running, high restart
+    count, last deploy/redeploy failed, near/at its memory budget, a log
+    line that looks like a missing env var), not a guess dressed up as a
+    diagnosis. Always returns the underlying evidence (status_summary,
+    last_deploy, a log tail) alongside the findings, specifically so a
+    human or another agent reading this can judge for themselves rather
+    than trust a label blindly. Read-only, ownership-scoped."""
+    caller = _caller_identity(ctx)
+    gate = _require_owner_or_admin(caller, name)
+    if not gate["ok"]:
+        return gate
+
+    status = agent.app_status(name)
+    history = _read_deploy_history(name, limit=5)
+    logs = agent.app_logs(name, lines=200)
+
+    findings = []
+
+    if status.get("status") == "not_found":
+        findings.append({"severity": "critical", "signal": "no running resource found",
+                          "detail": "status is 'not_found' -- the container/app may never have started, "
+                                    "or was removed outside zorc"})
+    elif not str(status.get("status", "")).lower().startswith("running"):
+        findings.append({"severity": "critical", "signal": f"status is {status.get('status')!r}, not running",
+                          "detail": status})
+
+    if status.get("kind") == "zorc-agent" and (status.get("restart_count") or 0) >= 3:
+        findings.append({"severity": "high",
+                          "signal": f"container has restarted {status['restart_count']} times",
+                          "detail": "a high restart count usually means it's crash-looping, not just slow to start"})
+
+    last_deploy = next((h for h in history if h.get("action") in ("deploy", "redeploy")), None)
+    if last_deploy and last_deploy.get("outcome", {}).get("status") in ("failed", "rejected"):
+        outcome = last_deploy["outcome"]
+        findings.append({"severity": "high", "signal": f"last {last_deploy['action']} did not succeed",
+                          "detail": {"step": outcome.get("step"), "reason": outcome.get("reason")}})
+
+    budget_mb, used_mb = status.get("memory_mb") or 0, status.get("mem_used_mb")
+    if budget_mb and used_mb is not None and used_mb >= budget_mb * 0.95:
+        findings.append({"severity": "medium", "signal": f"using {used_mb}MB against a {budget_mb}MB budget",
+                          "detail": "at or near its declared memory limit -- possible OOM risk/kill"})
+
+    if isinstance(logs, str) and not logs.startswith("("):
+        env_lines = [line for line in logs.splitlines() if _ENV_VAR_LOG_SIGNAL_RE.search(line)]
+        if env_lines:
+            findings.append({"severity": "high",
+                              "signal": "log lines suggest a missing/misconfigured environment variable",
+                              "detail": env_lines[:5]})
+
+    if not findings:
+        findings.append({"severity": "info", "signal": "no obvious problem found by these heuristics",
+                          "detail": "status/logs/deploy-history all look nominal from here -- check the "
+                                    "app's own /health and /ready responses and application-level logs "
+                                    "for anything these heuristics wouldn't catch"})
+
+    findings.sort(key=lambda f: _SEVERITY_ORDER.get(f["severity"], 4))
+    return {
+        "name": name,
+        "status_summary": {"kind": status.get("kind"), "status": status.get("status"),
+                            "memory_mb": status.get("memory_mb"), "mem_used_mb": status.get("mem_used_mb")},
+        "last_deploy": last_deploy,
+        "findings": findings,
+        "log_tail": logs[-2000:] if isinstance(logs, str) else logs,
+    }
 
 
 @mcp.tool()

@@ -1666,6 +1666,31 @@ def _docker_stats() -> list[dict]:
     return out
 
 
+def _docker_stats_remote(tailscale_ip: str, ssh_key: Path, user: str) -> list[dict]:
+    """Same as _docker_stats() but for a zorc-agent node this process
+    isn't running on, over SSH -- the live CPU/memory counterpart to
+    _zorc_agent_inspect's container-state view. Used by app_resources()/
+    app_status() for zorc-agent apps, which have no Coolify container
+    stats API to fall back on."""
+    code, out, err = _ssh_run(tailscale_ip, ssh_key, ["docker", "stats", "--no-stream", "--format", "{{json .}}"],
+                               user=user, timeout=15)
+    if code != 0:
+        return []
+    result = []
+    for line in out.strip().splitlines():
+        if not line:
+            continue
+        d = json.loads(line)
+        used_str, limit_str = (d.get("MemUsage") or "0 / 0").split(" / ")
+        result.append({
+            "name": d.get("Name", ""),
+            "cpu_percent": float((d.get("CPUPerc") or "0%").rstrip("%") or 0),
+            "mem_used_mb": _parse_mem_to_mb(used_str),
+            "mem_limit_mb": _parse_mem_to_mb(limit_str),
+        })
+    return result
+
+
 def _host_memory_mb() -> tuple[float, float]:
     """(total, available) in MB. MemAvailable (not MemFree) is the real
     "could still be used" number -- it already accounts for reclaimable
@@ -1685,6 +1710,21 @@ def app_resources(name: str) -> dict:
     kind = mapped.get("kind")
     if kind == "pages":
         return {"kind": "pages", "cpu_percent": 0, "mem_used_mb": 0, "containers": 0}
+    if kind == "zorc-agent":
+        target_node = mapped.get("node")
+        container_name = mapped.get("container_name") or name
+        if not target_node:
+            return {"kind": "zorc-agent", "cpu_percent": 0, "mem_used_mb": 0, "containers": 0}
+        node = node_config(target_node)
+        stats = [s for s in _docker_stats_remote(node["tailscale_ip"], ZORC_DIR / node["ssh_key"],
+                                                  node.get("ssh_user", "root"))
+                 if s["name"] == container_name]
+        return {
+            "kind": "zorc-agent",
+            "cpu_percent": round(sum(s["cpu_percent"] for s in stats), 1),
+            "mem_used_mb": round(sum(s["mem_used_mb"] for s in stats), 1),
+            "containers": len(stats),
+        }
     coolify_uuid = mapped.get("coolify_uuid") or _find_coolify_uuid(name)
     if not coolify_uuid:
         return {"kind": kind, "cpu_percent": 0, "mem_used_mb": 0, "containers": 0}
@@ -1799,6 +1839,31 @@ def app_status(name: str) -> dict:
             "memory_mb": 0,
         }
 
+    if kind == "zorc-agent":
+        mapped = _load_resource_map().get(name, {})
+        target_node = mapped.get("node")
+        container_name = mapped.get("container_name") or name
+        if not target_node:
+            return {"kind": "zorc-agent", "name": name, "status": "not_found",
+                    "memory_mb": reg_entry.get("memory_mb", 0)}
+        node = node_config(target_node)
+        info = _zorc_agent_inspect(node["tailscale_ip"], ZORC_DIR / node["ssh_key"],
+                                    node.get("ssh_user", "root"), container_name)
+        if info is None:
+            return {"kind": "zorc-agent", "name": name, "status": "not_found",
+                    "node": target_node, "memory_mb": reg_entry.get("memory_mb", 0)}
+        state = info.get("State") or {}
+        usage = app_resources(name)
+        return {
+            "kind": "zorc-agent", "name": name, "node": target_node, "container": container_name,
+            "status": state.get("Status", "unknown"),
+            "restart_count": info.get("RestartCount", 0),
+            "started_at": state.get("StartedAt"),
+            "exit_code": state.get("ExitCode") if state.get("Status") != "running" else None,
+            "memory_mb": reg_entry.get("memory_mb", 0),
+            "cpu_percent": usage["cpu_percent"], "mem_used_mb": usage["mem_used_mb"],
+        }
+
     if kind == "coolify-service":
         # A docker-compose stack -- Coolify decomposes it into "service
         # applications" and "service databases", each with their own
@@ -1842,22 +1907,57 @@ def app_status(name: str) -> dict:
     }
 
 
-def app_logs(name: str, lines: int = 200) -> str:
+def app_logs(name: str, lines: int = 200, since: str | None = None, grep: str | None = None) -> str:
+    """Recent logs for an existing, already-deployed app -- read-only, no
+    side effects.
+
+    since, if given, is passed through as Docker's own --since filter
+    (accepts a duration like "1h"/"30m" or an RFC3339 timestamp) -- only
+    implemented for zorc-agent apps today. Coolify's /applications/{uuid}/
+    logs endpoint has no documented equivalent parameter; rather than
+    guess at one that might silently be ignored, since is simply unused
+    on that path (not applied, not an error either) until/unless that's
+    confirmed against the live API.
+
+    grep, if given, is a plain case-insensitive substring filter applied
+    CLIENT-SIDE after fetching -- uniformly for both backends, not shipped
+    to Coolify or docker directly. Not a regex."""
     kind = _load_resource_map().get(name, {}).get("kind")
-    if kind == "coolify-service":
-        return ("(this is a multi-container service -- open it in Coolify directly "
+    if kind == "zorc-agent":
+        mapped = _load_resource_map().get(name, {})
+        target_node = mapped.get("node")
+        container_name = mapped.get("container_name") or name
+        if not target_node:
+            return f"(no recorded node for zorc-agent app {name!r} -- cannot fetch logs)"
+        node = node_config(target_node)
+        cmd = ["docker", "logs", "--tail", str(lines)]
+        if since:
+            cmd += ["--since", since]
+        cmd.append(container_name)
+        code, out, err = _ssh_run(node["tailscale_ip"], ZORC_DIR / node["ssh_key"], cmd,
+                                   user=node.get("ssh_user", "root"), timeout=20)
+        logs = out if code == 0 else f"(docker logs failed: {(err or out).strip()[-500:]})"
+    elif kind == "coolify-service":
+        logs = ("(this is a multi-container service -- open it in Coolify directly "
                 "to see per-container logs, e.g. wordpress/db/typesense/n8n each "
                 "have their own log stream)")
-    coolify_uuid = _find_coolify_uuid(name)
-    if not coolify_uuid:
-        return "(no Coolify resource found -- static/Pages apps don't have server logs here; check the Cloudflare Pages dashboard)"
-    with httpx.Client(timeout=20) as client:
-        r = client.get(
-            f"{COOLIFY_URL}/applications/{coolify_uuid}/logs",
-            headers=_coolify_headers(), params={"lines": lines},
-        )
-        r.raise_for_status()
-        return r.json().get("logs", "")
+    else:
+        coolify_uuid = _find_coolify_uuid(name)
+        if not coolify_uuid:
+            logs = "(no Coolify resource found -- static/Pages apps don't have server logs here; check the Cloudflare Pages dashboard)"
+        else:
+            with httpx.Client(timeout=20) as client:
+                r = client.get(
+                    f"{COOLIFY_URL}/applications/{coolify_uuid}/logs",
+                    headers=_coolify_headers(), params={"lines": lines},
+                )
+                r.raise_for_status()
+                logs = r.json().get("logs", "")
+
+    if grep and logs and not logs.startswith("("):
+        matched = [line for line in logs.splitlines() if grep.lower() in line.lower()]
+        logs = "\n".join(matched) if matched else f"(no lines matched grep={grep!r} out of {len(logs.splitlines())} fetched)"
+    return logs
 
 
 def app_action(name: str, action: str) -> dict:
