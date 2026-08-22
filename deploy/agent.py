@@ -1044,7 +1044,8 @@ def _zorc_agent_preflight_gpu(tailscale_ip: str, ssh_key: Path, user: str) -> No
 
 def _zorc_agent_run_container(tailscale_ip: str, ssh_key: Path, user: str, *, name: str, image_tag: str,
                                port: int, memory_mb: int, env_vars: dict[str, str], needs_gpu: bool,
-                               gpu_legacy_runtime: bool = False, volumes: list[str] | None = None) -> str:
+                               gpu_legacy_runtime: bool = False, gpu_cdi: bool = False,
+                               volumes: list[str] | None = None) -> str:
     """Starts the container, labeled for safe rollback identification.
     Returns the container ID. Does not itself verify health -- see
     _zorc_agent_wait_healthy().
@@ -1058,8 +1059,20 @@ def _zorc_agent_run_container(tailscale_ip: str, ssh_key: Path, user: str, *, na
     `nvidia` runtime, so `--runtime nvidia` + the driver-capabilities env
     vars it expects (not needed with `--gpus`) is the portable fallback.
     Driven by nodes/<name>'s own `gpu_runtime: legacy` in registry.yaml
-    (see _deploy_zorc_agent) -- rtx5090 is untouched, still plain
-    `--gpus all`, exactly as already proven working there."""
+    (see _deploy_zorc_agent).
+
+    gpu_cdi -- real bug found live on rtx5090: `--gpus all` (the legacy
+    nvidia-container-runtime hook path) started failing there with
+    `Failed to initialize NVML: Unknown Error` inside the container even
+    though host-level `nvidia-smi` was completely healthy -- confirmed via
+    a direct A/B test (`docker run --gpus all ... nvidia-smi -L` fails,
+    `docker run --device nvidia.com/gpu=all ... nvidia-smi -L` succeeds on
+    the same host, same moment). Root cause: the legacy hook path is
+    broken on this host's toolkit version/config; the newer CDI
+    (Container Device Interface) device-injection path is not. `--device
+    nvidia.com/gpu=all` is the CDI equivalent of `--gpus all` and needs no
+    extra env vars. Driven by nodes/<name>'s own `gpu_runtime: cdi` in
+    registry.yaml (see _deploy_zorc_agent)."""
     cmd = [
         "docker", "run", "-d",
         "--name", name,
@@ -1081,6 +1094,8 @@ def _zorc_agent_run_container(tailscale_ip: str, ssh_key: Path, user: str, *, na
         if gpu_legacy_runtime:
             cmd += ["--runtime", "nvidia",
                     "-e", "NVIDIA_VISIBLE_DEVICES=all", "-e", "NVIDIA_DRIVER_CAPABILITIES=all"]
+        elif gpu_cdi:
+            cmd += ["--device", "nvidia.com/gpu=all"]
         else:
             cmd += ["--gpus", "all"]
         # Multi-process GPU frameworks (sglang/vLLM tensor-parallel workers
@@ -1161,13 +1176,24 @@ def _zorc_agent_rollback(tailscale_ip: str, ssh_key: Path, user: str, container_
     return results
 
 
-def register_app(*, name: str, memory_mb: int, subdomain: str, repo: str, target: str = "servingz",
+def register_app(*, name: str, memory_mb: int, subdomain: str, repo: str, owner: str, target: str = "servingz",
                   database: bool = False, redis: bool = False, critical: bool = False) -> None:
     """Appends a new entry to registry.yaml and commits it — mirrors what a
     human did by hand for hello-app. target must be "pages" for static
     sites (memory_mb: 0) or a real node name from registry.yaml's `nodes`
     section for real apps -- check_budget.py's own sanity rule rejects
-    node+0 or pages+nonzero combinations, and an unknown target name."""
+    node+0 or pages+nonzero combinations, and an unknown target name.
+
+    owner is required, not optional -- the resolved MCP client name (see
+    mcp_server.py's _caller_identity) that requested this deploy, or an
+    explicit human-chosen value for anything registered outside the MCP
+    path. No default and no empty-string fallback: an app with no owner
+    is exactly the gap Phase 1 (ownership) closes, so a caller forgetting
+    to pass one should fail loudly here rather than silently produce
+    another unowned entry -- see scripts/backfill_owner.py for the one-off
+    migration that gave every PRE-Phase-1 entry an owner."""
+    if not owner:
+        raise ValueError("register_app() requires a non-empty owner -- refusing to create another unowned entry")
     if name_taken(name):
         return  # idempotent -- a repeated deploy of the same app shouldn't double-register it
     text = REGISTRY_PATH.read_text()
@@ -1180,6 +1206,7 @@ def register_app(*, name: str, memory_mb: int, subdomain: str, repo: str, target
     redis_db: null
     storage_prefix: null
     repo: "{repo}"
+    owner: "{owner}"
     critical: {"true" if critical else "false"}
     depends_on: []
 """
@@ -1245,7 +1272,7 @@ def git_commit_and_push(message: str) -> None:
     subprocess.run(["git", "-C", str(ZORC_DIR), "push", "origin", "main"], check=True)
 
 
-def _deploy_zorc_agent(*, step, log: list, node: dict, target_node: str, name: str, owner_repo: str,
+def _deploy_zorc_agent(*, step, log: list, node: dict, target_node: str, name: str, owner_repo: str, owner: str,
                         repo_dir: Path, classification: dict, memory_mb: int, env_vars_to_set: dict[str, str],
                         needs_gpu: bool, needs_database: bool, postgres_container_name: str | None,
                         domain: str, volumes: list[str] | None = None) -> dict:
@@ -1274,7 +1301,8 @@ def _deploy_zorc_agent(*, step, log: list, node: dict, target_node: str, name: s
         "run_container", _zorc_agent_run_container, tailscale_ip, ssh_key, user,
         name=name, image_tag=image_tag, port=port, memory_mb=memory_mb,
         env_vars=env_vars_to_set, needs_gpu=needs_gpu,
-        gpu_legacy_runtime=node.get("gpu_runtime") == "legacy", volumes=volumes,
+        gpu_legacy_runtime=node.get("gpu_runtime") == "legacy",
+        gpu_cdi=node.get("gpu_runtime") == "cdi", volumes=volumes,
     )
 
     try:
@@ -1287,7 +1315,7 @@ def _deploy_zorc_agent(*, step, log: list, node: dict, target_node: str, name: s
         step("add_tunnel_route", add_tunnel_route, domain, service=service_url)
 
         step("register_app", register_app, name=name, memory_mb=memory_mb, subdomain=name,
-             repo=f"github.com/{owner_repo}", target=target_node, database=needs_database)
+             repo=f"github.com/{owner_repo}", owner=owner, target=target_node, database=needs_database)
         step("record_resource", record_resource, name, kind="zorc-agent", container_name=name,
              postgres_container_name=postgres_container_name, node=target_node)
         step("commit_and_push", git_commit_and_push, f"registry: add {name} (deployed via zorc-agent)")
@@ -1324,7 +1352,7 @@ class DeployError(Exception):
         super().__init__(f"{step}: {reason}")
 
 
-def deploy(*, owner_repo: str, name: str, git_branch: str = "main", target_node: str = "servingz",
+def deploy(*, owner_repo: str, name: str, owner: str, git_branch: str = "main", target_node: str = "servingz",
            memory_mb_override: int | None = None, env_overrides: dict[str, str] | None = None,
            needs_gpu: bool = False, volumes: list[str] | None = None) -> dict:
     """Full pipeline: clone -> classify -> budget check -> live resource
@@ -1339,6 +1367,12 @@ def deploy(*, owner_repo: str, name: str, git_branch: str = "main", target_node:
     that's what gets cleaned up). The static-site path has no rollback --
     it fails much earlier in practice and Pages projects cost no node
     memory either way.
+
+    owner is required (Phase 1 -- see register_app()) and is stamped onto
+    the new registry.yaml entry verbatim. mcp_server.py's deploy() tool
+    always passes the caller's own resolved identity here (never anything
+    the caller typed) -- so an app deployed through the MCP surface is
+    owned by whoever's token actually created it, full stop.
 
     target_node picks which node from registry.yaml's `nodes` section a
     real app (not a static site -- those always go to Cloudflare Pages
@@ -1445,7 +1479,7 @@ def deploy(*, owner_repo: str, name: str, git_branch: str = "main", target_node:
         step("add_pages_custom_domain", add_pages_custom_domain, name, domain)
         step("create_dns_record", create_dns_record, name, f"{name}.pages.dev")
         step("register_app", register_app, name=name, memory_mb=0, subdomain=name,
-             repo=f"github.com/{owner_repo}", target="pages")
+             repo=f"github.com/{owner_repo}", owner=owner, target="pages")
         step("record_resource", record_resource, name, kind="pages")
         step("commit_and_push", git_commit_and_push, f"registry: add {name} (static, via deploy agent)")
         return {
@@ -1489,7 +1523,7 @@ def deploy(*, owner_repo: str, name: str, git_branch: str = "main", target_node:
     if node.get("backend") == "zorc-agent":
         return _deploy_zorc_agent(
             step=step, log=log, node=node, target_node=target_node, name=name, owner_repo=owner_repo,
-            repo_dir=repo_dir, classification=classification, memory_mb=memory_mb,
+            owner=owner, repo_dir=repo_dir, classification=classification, memory_mb=memory_mb,
             env_vars_to_set=env_vars_to_set, needs_gpu=needs_gpu, needs_database=needs_database,
             postgres_container_name=postgres_uuid, domain=domain, volumes=volumes,
         )
@@ -1529,7 +1563,7 @@ def deploy(*, owner_repo: str, name: str, git_branch: str = "main", target_node:
             step("add_tunnel_route", add_tunnel_route, domain)
 
         step("register_app", register_app, name=name, memory_mb=memory_mb, subdomain=name,
-             repo=f"github.com/{owner_repo}", target=target_node, database=needs_database)
+             repo=f"github.com/{owner_repo}", owner=owner, target=target_node, database=needs_database)
         step("record_resource", record_resource, name, kind="coolify", coolify_uuid=coolify_result.get("uuid"),
              coolify_postgres_uuid=postgres_uuid)
         step("commit_and_push", git_commit_and_push, f"registry: add {name} (deployed via deploy agent)")

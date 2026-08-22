@@ -30,6 +30,15 @@ import agent as deploy_agent  # noqa: E402
 
 DEPLOY_JOBS: dict[str, dict] = {}  # in-memory job status, fine for a single-operator platform
 
+# deploy/agent.py's Phase 1 ownership work (see registry.yaml's `owner`
+# field, deploy/agent.py's register_app()) made `owner` a required arg of
+# deploy_agent.deploy() -- this dashboard has no per-client token/identity
+# system of its own (it's a single human operator behind Cloudflare
+# Access, per this file's own docstring), so there's no caller identity to
+# resolve the way mcp_server.py's _caller_identity does. The one human who
+# can reach this dashboard at all owns whatever they deploy through it.
+DASHBOARD_OWNER = "zainey"
+
 FIELD_RE = re.compile(r"^(App|Commit|Staging|Compare|Run): (.+)$", re.MULTILINE)
 
 app = FastAPI()
@@ -78,7 +87,8 @@ class DeployRequest(BaseModel):
 def _run_deploy_job(job_id: str, req: DeployRequest):
     DEPLOY_JOBS[job_id]["status"] = "running"
     try:
-        result = deploy_agent.deploy(owner_repo=req.owner_repo, name=req.name, git_branch=req.git_branch)
+        result = deploy_agent.deploy(owner_repo=req.owner_repo, name=req.name, owner=DASHBOARD_OWNER,
+                                      git_branch=req.git_branch)
         DEPLOY_JOBS[job_id].update(status="done", result=result)
     except deploy_agent.DeployError as e:
         DEPLOY_JOBS[job_id].update(status="failed", error={"step": e.step, "reason": e.reason})

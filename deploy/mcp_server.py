@@ -795,7 +795,7 @@ def deploy(ctx: Context, owner_repo: str, name: str, report_id: str, git_branch:
     memory_mb_override = report["recommended_memory_mb"] if report["repo_kind"] != "static" else None
 
     try:
-        result = agent.deploy(owner_repo=owner_repo, name=name, git_branch=git_branch,
+        result = agent.deploy(owner_repo=owner_repo, name=name, owner=caller["name"], git_branch=git_branch,
                                target_node=target_node, memory_mb_override=memory_mb_override,
                                env_overrides=env_overrides, needs_gpu=report.get("needs_gpu", False))
         _deploy_timestamps.append(now)
@@ -916,6 +916,48 @@ def _caller_identity(ctx: Context) -> dict:
     if client is None:
         raise PermissionError("could not resolve caller identity from this request's bearer token")
     return client
+
+
+# ------------------------------------------------------------- ownership ----
+# Phase 1: turns the shared free-for-all into per-owner lanes. deploy()
+# itself never calls this (it only ever creates, and refuses outright on
+# name_taken -- there's no existing app to own a claim over yet). Every
+# FUTURE mutating tool that acts on an app that already exists (redeploy,
+# restart, teardown, ...) calls this first, before doing anything else.
+
+def _require_owner_or_admin(caller: dict, app_name: str) -> dict:
+    """Ownership gate for a mutating tool acting on an EXISTING app.
+    `caller` is the dict _caller_identity(ctx) already returned -- passed
+    in rather than re-resolved here so a tool that already has it (every
+    mutating tool will, per the pattern deploy() established) doesn't pay
+    for a second hash+lookup, and so this function stays trivially unit-
+    testable without needing a real Context/request at all.
+
+    Returns {"ok": True, "app": <registry.yaml entry dict>} on success, or
+    {"ok": False, "reason": "..."} on refusal. Callers check "ok" and
+    return the refusal dict directly (same shape _audit()'s outcome
+    already uses elsewhere in this file) -- a caller-facing tool gets a
+    clean structured rejection for "wrong owner" or "no such app," never
+    an unhandled exception/stack trace.
+
+    Rule: role=="admin" passes for any app, always. A client passes only
+    when registry.yaml's `owner` field for that app matches their own
+    resolved name exactly -- never a substring/prefix match, never
+    case-insensitive. An app with a missing/empty `owner` (shouldn't
+    exist after scripts/backfill_owner.py, but fail closed if one somehow
+    does -- a stale registry.yaml edited by hand, a future bug) refuses
+    every client outright; it is NEVER treated as "unowned, anyone may
+    act on it." Only admin can act on an app with no recorded owner."""
+    reg = agent.load_registry()
+    app = next((a for a in reg.get("apps", []) if a.get("name") == app_name), None)
+    if app is None:
+        return {"ok": False, "reason": f"{app_name!r} is not a registered app"}
+    if caller.get("role") == "admin":
+        return {"ok": True, "app": app}
+    owner = app.get("owner")
+    if not owner or owner != caller.get("name"):
+        return {"ok": False, "reason": f"{caller.get('name')!r} does not own {app_name!r}"}
+    return {"ok": True, "app": app}
 
 
 class BearerAuthMiddleware(BaseHTTPMiddleware):
