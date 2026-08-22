@@ -1861,13 +1861,32 @@ def app_logs(name: str, lines: int = 200) -> str:
 
 
 def app_action(name: str, action: str) -> dict:
-    """action: start | stop | restart. Coolify apps/services only -- Pages
-    has no such concept (it's not a running process)."""
+    """action: start | stop | restart. Coolify apps/services via the
+    Coolify API; zorc-agent apps via `docker <action>` over SSH against
+    the recorded container_name/node (see record_resource) -- these have
+    no Coolify resource at all, matching how _deploy_zorc_agent created
+    them in the first place. Pages/static apps have no running process
+    to act on -- refused with a clear reason, not a generic 404."""
     if action not in ("start", "stop", "restart"):
         raise ValueError(f"unknown action {action!r}")
-    kind = _load_resource_map().get(name, {}).get("kind")
+    mapped = _load_resource_map().get(name, {})
+    kind = mapped.get("kind")
+    if kind == "zorc-agent":
+        target_node = mapped.get("node")
+        container_name = mapped.get("container_name") or name
+        if not target_node:
+            raise ValueError(f"no recorded node for zorc-agent app {name!r} -- cannot {action} it")
+        node = node_config(target_node)
+        tailscale_ip = node["tailscale_ip"]
+        ssh_key = ZORC_DIR / node["ssh_key"]
+        user = node.get("ssh_user", "root")
+        code, out, err = _ssh_run(tailscale_ip, ssh_key, ["docker", action, container_name], user=user, timeout=30)
+        if code != 0:
+            raise RuntimeError(f"docker {action} {container_name} on {target_node} failed: "
+                                f"{(err or out).strip()[-500:]}")
+        return {"action": action, "name": name, "node": target_node, "container": container_name}
     if kind == "coolify-service":
-        service_uuid = _load_resource_map().get(name, {}).get("coolify_uuid")
+        service_uuid = mapped.get("coolify_uuid")
         if not service_uuid:
             raise ValueError(f"no Coolify service found for {name}")
         with httpx.Client(timeout=30) as client:
@@ -1881,6 +1900,55 @@ def app_action(name: str, action: str) -> dict:
         r = client.post(f"{COOLIFY_URL}/applications/{coolify_uuid}/{action}", headers=_coolify_headers())
         r.raise_for_status()
         return r.json()
+
+
+def redeploy(name: str) -> dict:
+    """Re-triggers a build+deploy of an EXISTING, already-registered app,
+    using whatever repo/branch/env/build config Coolify already has for it
+    (set once, back at its original deploy()) -- never anything freshly
+    supplied. This is "rebuild the current HEAD of the already-configured
+    branch," not "rebuild the exact commit that previously failed" --
+    Coolify's deploy trigger doesn't expose a way to target an arbitrary
+    historical SHA, only "build whatever HEAD is right now." Reuses
+    existing env vars entirely; does not re-collect or re-generate any of
+    them (compare deploy(), which resolves+sets env fresh because it's
+    creating a brand-new app that has none yet).
+
+    Single-container Coolify applications only (kind "coolify" in
+    resource_map.json) -- trigger_coolify_deploy() calls Coolify's
+    `/deploy?uuid=` endpoint, which its own docstring notes is keyed by
+    APPLICATION uuid specifically; app_action() (start/stop/restart) has a
+    genuinely separate `/services/{uuid}/{action}` code path for
+    multi-container "coolify-service" stacks, which strongly suggests the
+    generic deploy-trigger does NOT accept a service uuid the same way.
+    Unverified either way against the live API, so kind "coolify-service"
+    refuses here rather than guessing -- confirm the right endpoint before
+    extending this. A static Cloudflare Pages site has no "redeploy the
+    same build" primitive here either (would need a fresh local
+    clone+wrangler upload, effectively deploy_to_pages() again), and a
+    zorc-agent app has no Coolify resource to trigger at all (would need
+    its own re-upload+rebuild+recreate-container pipeline, closer to
+    _deploy_zorc_agent than a simple trigger). All three refuse cleanly
+    rather than attempting something ad hoc.
+
+    Raises ValueError (never silently no-ops) if the app isn't registered
+    at all, or is registered but not a single-container Coolify app, or
+    is one but has no recorded coolify_uuid to target."""
+    if not name_taken(name):
+        raise ValueError(f"{name!r} is not a registered app -- nothing to redeploy")
+    mapped = _load_resource_map().get(name, {})
+    kind = mapped.get("kind")
+    if kind != "coolify":
+        raise ValueError(
+            f"{name!r} is a {kind!r} app -- redeploy() only supports single-container Coolify "
+            "apps (kind 'coolify') right now; coolify-service, static/Pages, and zorc-agent "
+            "apps aren't supported by this tool yet"
+        )
+    coolify_uuid = mapped.get("coolify_uuid")
+    if not coolify_uuid:
+        raise ValueError(f"{name!r} has no recorded coolify_uuid in resource_map.json -- cannot redeploy")
+    trigger_coolify_deploy(coolify_uuid)
+    return {"redeployed": name, "kind": kind, "coolify_uuid": coolify_uuid}
 
 
 def remove_registry_entry(name: str) -> None:

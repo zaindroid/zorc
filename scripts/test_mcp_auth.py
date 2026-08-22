@@ -94,6 +94,11 @@ def spawn_server(token_path: Path, port: int) -> subprocess.Popen:
     # test spawns on a random port, which needs to be added explicitly or
     # every request 421s here exactly like a real rebinding attempt would.
     env["ZORC_MCP_ALLOWED_HOSTS"] = f"127.0.0.1:{port},localhost:{port}"
+    # Belt-and-suspenders: this test doesn't currently call any audited
+    # tool, but a future addition to _SAFE_TO_ACTUALLY_CALL easily could --
+    # redirect audit writes to a throwaway path on principle, so that
+    # never becomes a silent way to pollute the real production log.
+    env["ZORC_MCP_AUDIT_LOG_PATH"] = str(Path(tempfile.mktemp(suffix=".log")))
     return subprocess.Popen(
         [PYTHON, "-m", "uvicorn", "mcp_server:app", "--host", "127.0.0.1", "--port", str(port),
          "--app-dir", str(DEPLOY_DIR)],  # matches production's systemd unit invocation exactly

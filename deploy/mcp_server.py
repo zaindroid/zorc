@@ -40,7 +40,11 @@ MCP_SECRETS = Path(__file__).parent / "secrets"
 # file instead of the production one. Unset in normal operation (systemd's
 # unit file doesn't set it), so production always resolves to the real path.
 MCP_TOKEN_PATH = Path(os.environ.get("ZORC_MCP_TOKEN_PATH", str(MCP_SECRETS / "mcp_token.json")))
-AUDIT_LOG_PATH = Path(__file__).parent / "mcp_audit.log"
+# Same reasoning as MCP_TOKEN_PATH above -- a subprocess-spawned test server
+# (scripts/test_mcp_auth.py) that exercises an audited/mutating tool should
+# never be able to write into the real production mcp_audit.log just
+# because it forgot to override this. Unset in normal operation.
+AUDIT_LOG_PATH = Path(os.environ.get("ZORC_MCP_AUDIT_LOG_PATH", str(Path(__file__).parent / "mcp_audit.log")))
 
 # Public, unauthenticated paths -- Coolify's own health checker has no
 # bearer token, and per AGENTS.md's app contract /health must not require
@@ -50,6 +54,19 @@ PUBLIC_PATHS = {"/health", "/ready", "/version"}
 DEPLOY_RATE_LIMIT = 5           # max successful deploys...
 DEPLOY_RATE_WINDOW_SEC = 3600   # ...per this many seconds
 _deploy_timestamps: deque[float] = deque()
+
+# Separate, smaller limits from deploy()'s -- a redeploy-loop (something
+# retrying a failed build over and over) or a restart-loop is a distinct
+# failure mode from an actual deploy spree, and deserves its own budget
+# rather than competing with deploy()'s for the same counter. Platform-
+# wide, not per-client, matching deploy()'s own existing precedent above.
+REDEPLOY_RATE_LIMIT = 3
+REDEPLOY_RATE_WINDOW_SEC = 3600
+_redeploy_timestamps: deque[float] = deque()
+
+RESTART_RATE_LIMIT = 10
+RESTART_RATE_WINDOW_SEC = 3600
+_restart_timestamps: deque[float] = deque()
 
 BUILD_SHA = "dev"  # overwritten by Coolify's build-arg injection if configured; fine as a static fallback
 
@@ -811,6 +828,111 @@ def deploy(ctx: Context, owner_repo: str, name: str, report_id: str, git_branch:
         # surfaced explicitly rather than swallowed if it somehow does.
         outcome = {"status": "rejected", "reason": str(e)}
         _audit("deploy", params, outcome, client=caller)
+        return outcome
+
+
+@mcp.tool()
+def redeploy(ctx: Context, name: str, confirm_redeploy: bool = True) -> dict:
+    """Re-triggers a build+deploy of an EXISTING app you already own (or
+    any app, if you're admin) -- idempotent, non-destructive re-apply, NOT
+    a way to change anything. Pulls repo/branch/env/build config entirely
+    from what Coolify already has configured for this app; there is no way
+    to pass a different branch, env var, or memory limit here -- this is
+    "rebuild the current HEAD of the already-configured branch," not a
+    second deploy() with different parameters. See agent.redeploy()'s
+    docstring for exactly what "current HEAD" means and why.
+
+    Only works for single-container Coolify apps today (kind "coolify") --
+    refuses cleanly for coolify-service stacks, static/Pages sites, and
+    zorc-agent apps, none of which this tool supports yet.
+
+    confirm_redeploy defaults True (this is non-destructive -- unlike
+    teardown, there's no real harm in the default), but is still a real
+    parameter: pass False to get a no-op refusal instead, if a caller
+    wants that as an explicit safety rail in its own calling code.
+
+    Rate-limited separately from deploy() -- 3 redeploys/hour platform-
+    wide, since a redeploy-loop (something retrying a failed build over
+    and over) is exactly the failure mode this budget exists to catch."""
+    caller = _caller_identity(ctx)
+    params = {"name": name, "confirm_redeploy": confirm_redeploy}
+
+    if not confirm_redeploy:
+        outcome = {"status": "rejected", "reason": "confirm_redeploy=False -- pass True to proceed"}
+        _audit("redeploy", params, outcome, client=caller)
+        return outcome
+
+    gate = _require_owner_or_admin(caller, name)
+    if not gate["ok"]:
+        _audit("redeploy", params, gate, client=caller)
+        return gate
+
+    now = time.time()
+    while _redeploy_timestamps and now - _redeploy_timestamps[0] > REDEPLOY_RATE_WINDOW_SEC:
+        _redeploy_timestamps.popleft()
+    if len(_redeploy_timestamps) >= REDEPLOY_RATE_LIMIT:
+        outcome = {"status": "rejected",
+                   "reason": f"rate limit: {REDEPLOY_RATE_LIMIT} redeploys per {REDEPLOY_RATE_WINDOW_SEC}s exceeded"}
+        _audit("redeploy", params, outcome, client=caller)
+        return outcome
+
+    try:
+        result = agent.redeploy(name)
+        _redeploy_timestamps.append(now)
+        outcome = {"status": "redeployed", **result}
+        _audit("redeploy", params, outcome, client=caller)
+        return outcome
+    except ValueError as e:
+        outcome = {"status": "rejected", "reason": str(e)}
+        _audit("redeploy", params, outcome, client=caller)
+        return outcome
+
+
+@mcp.tool()
+def restart(ctx: Context, name: str) -> dict:
+    """Restarts the running container for an app you own (or any app, if
+    you're admin) -- no rebuild, no config/env/branch change, just a
+    process restart. Coolify apps/services and zorc-agent apps are all
+    supported (see agent.app_action()); a static/Pages site has no running
+    process and refuses cleanly.
+
+    Rate-limited separately from deploy()/redeploy() -- 10 restarts/hour
+    platform-wide, loose enough for normal use but still a real ceiling
+    against a restart-loop."""
+    caller = _caller_identity(ctx)
+    params = {"name": name}
+
+    gate = _require_owner_or_admin(caller, name)
+    if not gate["ok"]:
+        _audit("restart", params, gate, client=caller)
+        return gate
+
+    now = time.time()
+    while _restart_timestamps and now - _restart_timestamps[0] > RESTART_RATE_WINDOW_SEC:
+        _restart_timestamps.popleft()
+    if len(_restart_timestamps) >= RESTART_RATE_LIMIT:
+        outcome = {"status": "rejected",
+                   "reason": f"rate limit: {RESTART_RATE_LIMIT} restarts per {RESTART_RATE_WINDOW_SEC}s exceeded"}
+        _audit("restart", params, outcome, client=caller)
+        return outcome
+
+    try:
+        result = agent.app_action(name, "restart")
+        _restart_timestamps.append(now)
+        outcome = {"status": "restarted", "result": result}
+        _audit("restart", params, outcome, client=caller)
+        return outcome
+    except ValueError as e:
+        outcome = {"status": "rejected", "reason": str(e)}
+        _audit("restart", params, outcome, client=caller)
+        return outcome
+    except RuntimeError as e:
+        # app_action's zorc-agent branch raises this for a failed `docker
+        # restart` over SSH -- a real failure, not a rejection, but still
+        # something to surface as a structured outcome rather than a
+        # dangling exception for the caller.
+        outcome = {"status": "failed", "reason": str(e)}
+        _audit("restart", params, outcome, client=caller)
         return outcome
 
 
