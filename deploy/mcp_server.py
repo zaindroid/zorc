@@ -7,19 +7,22 @@ them, it does not reimplement deployment logic. Single source of truth
 for "how deployment actually works" stays agent.py.
 
 Mutating tools: deploy() (create-only -- refuses outright if the name
-already exists, never touches an existing app), redeploy() and restart()
-(idempotent re-apply on an app the caller owns -- rebuild current
-branch/restart the container, never a config/env change), and the
-request_teardown()/approve_action()/reject_action() queue -- the ONE
-destructive capability on this server, deliberately two steps: a client
-(or admin) can only ever QUEUE a teardown; executing one is admin-only,
-full stop, regardless of who requested it or who owns the app. There is
-still no way for deploy()/redeploy()/restart() themselves to delete
-anything. Every mutating tool goes through _require_owner_or_admin() (or,
+already exists, never touches an existing app, and can still target a
+GPU node directly and immediately if called that way -- unchanged),
+redeploy() and restart() (idempotent re-apply on an app the caller owns --
+rebuild current branch/restart the container, never a config/env change),
+and the shared request_teardown()/request_gpu_service()/approve_action()/
+reject_action() queue -- the two actions on this server consequential
+enough to need a human before they happen: real destruction (teardown),
+and a new deploy actually landing on one of the user's own GPU machines
+(rtx5090/jetson-thor/bitbots_gpu -- not dedicated to zorc, borrowed for
+spare capacity only). Either request_*() tool only ever QUEUES; executing
+one is admin-only, full stop, regardless of who requested it or who owns
+the app. Every mutating tool goes through _require_owner_or_admin() (or,
 for approve_action/reject_action, a hard-coded admin-only check -- app
-ownership doesn't grant destruction rights) and its own rate limit, and
-is logged via _audit() under the resolved caller's name, never anything
-caller-supplied.
+ownership doesn't grant destruction or GPU-deploy rights) and its own
+rate limit, and is logged via _audit() under the resolved caller's name,
+never anything caller-supplied.
 
 Everything else (get_app_status, get_app_logs, get_deploy_history,
 diagnose_app, list_pending_actions, list_nodes, ...) is read-only and
@@ -109,6 +112,13 @@ REJECT_ACTION_RATE_LIMIT = 20
 REJECT_ACTION_RATE_WINDOW_SEC = 3600
 _reject_action_timestamps: deque[float] = deque()
 
+# Phase 6.2: same reasoning as TEARDOWN_REQUEST_RATE_LIMIT above -- this
+# only ever queues, approve_action()/reject_action() (already rate-limited
+# above) are shared with teardown for the actual approve/reject step.
+GPU_SERVICE_REQUEST_RATE_LIMIT = 5
+GPU_SERVICE_REQUEST_RATE_WINDOW_SEC = 3600
+_gpu_service_request_timestamps: deque[float] = deque()
+
 BUILD_SHA = "dev"  # overwritten by Coolify's build-arg injection if configured; fine as a static fallback
 
 # Approved requirements-analysis reports, keyed by report_id. deploy()
@@ -119,6 +129,20 @@ BUILD_SHA = "dev"  # overwritten by Coolify's build-arg injection if configured;
 # for by much (the repo could change in between otherwise).
 REPORT_TTL_SEC = 3600
 _approved_reports: dict[str, dict] = {}  # report_id -> {"report": {...}, "expires_at": float}
+
+# Phase 6.2's request_gpu_service() queues a deploy for admin approval --
+# but env_overrides can carry real secrets (a third-party model API key,
+# etc), and the queue itself (PENDING_ACTIONS_PATH) is deliberately a durable
+# FILE so a pending request survives this process restarting before an
+# admin gets to it (see request_teardown's comment above). Persisting
+# secrets to that disk file for however long a request sits pending is a
+# meaningfully bigger exposure than _approved_reports' in-memory, 1-hour-
+# TTL pattern above -- so env_overrides for a gpu_service_deploy request
+# live ONLY here, in memory, keyed by the same request id, and are never
+# written to PENDING_ACTIONS_PATH. If this process restarts before
+# approval, they're gone -- approve_action() treats that as a clean
+# failure ("resubmit"), never a deploy with silently-missing secrets.
+_pending_gpu_deploy_secrets: dict[str, dict[str, str]] = {}
 
 # Dependencies that push real memory usage well above a bare framework's
 # baseline -- headless browsers, ML/data libs, image/video processing.
@@ -1268,14 +1292,25 @@ def restart(ctx: Context, name: str) -> dict:
         return outcome
 
 
-# --------------------------------------------------------- Phase 4: teardown ----
-# The ONE destructive capability on this server -- deliberately two steps
-# (4b, not the simpler 4a confirm=True), per explicit user instruction:
-# request_teardown() only ever queues, never deletes anything by itself;
-# approve_action() is the sole place agent.delete_app() gets called, and
-# it's admin-only regardless of who requested the teardown or who owns
-# the app. A human is in the loop for every deletion, full stop -- there
-# is no path from a client's own call straight to destruction.
+# ------------------------------------------------- Phase 4/6.2: gated actions ----
+# The shared request/approve/reject queue -- deliberately two steps for
+# anything consequential enough to need a human before it happens, per
+# explicit user instruction, rather than the simpler confirm=True pattern
+# deploy()/redeploy()/restart() use for less risky actions. Two action
+# types share this same queue and the same approve_action()/reject_action():
+#   - "teardown" (Phase 4b): the ONE destructive capability on this server.
+#   - "gpu_service_deploy" (Phase 6.2): a new deploy landing on one of the
+#     user's own GPU machines (rtx5090/jetson-thor/bitbots_gpu) -- not
+#     dedicated to zorc, borrowed for spare capacity only, so nothing new
+#     lands there without a human saying yes. deploy()/redeploy()/restart()
+#     themselves are UNCHANGED and still act immediately, even for a
+#     needs_gpu=True deploy -- this is an additional, safer, opt-in path,
+#     not a restriction bolted onto the existing ones.
+# Both request_*() tools only ever queue; approve_action() is the sole
+# place either agent.delete_app() or agent.deploy() actually runs for a
+# queued request, and it's admin-only regardless of who requested it or
+# who owns the app. A human is in the loop for both, full stop -- there is
+# no path from a client's own call straight to either one.
 
 def _load_pending_actions() -> dict:
     if not PENDING_ACTIONS_PATH.exists():
@@ -1342,13 +1377,132 @@ def request_teardown(ctx: Context, name: str) -> dict:
     return outcome
 
 
+# ----------------------------------------------------- Phase 6.2: GPU services ----
+# rtx5090/jetson-thor/bitbots_gpu are NOT dedicated to zorc -- they're the
+# user's own personal machines, already running their own work; zorc only
+# borrows spare capacity on them, and only ever to host a persistent AI/
+# API-serving component another app calls over the network (never a
+# one-off batch job -- there is no job queue on this platform, deliberately
+# never built, see gpu_fleet_status()'s own note). Per explicit user
+# instruction: any deploy that actually lands on one of these nodes needs
+# a human in the loop first, same as teardown -- but deploy() ITSELF stays
+# untouched (still immediate, even for needs_gpu=True, exactly as it's
+# always worked) so nothing that already calls it breaks. This is a
+# SEPARATE, additional, safer path for GPU-bound deploys going forward:
+# request_gpu_service() only ever queues, approve_action() (shared with
+# teardown, see above) is still the sole place agent.deploy() actually
+# runs for one of these.
+
+@mcp.tool()
+def request_gpu_service(ctx: Context, owner_repo: str, name: str, report_id: str,
+                         git_branch: str = "main", env_overrides: dict[str, str] | None = None) -> dict:
+    """Queues a deploy of a NEW AI/API-serving app onto a GPU node --
+    does NOT deploy anything itself. An ADMIN must separately call
+    approve_action(id) to actually run it (see that tool's docstring).
+    This is the intended, gated path onto rtx5090/jetson-thor/bitbots_gpu
+    going forward -- these machines are the user's own, not dedicated to
+    zorc, borrowed for spare capacity only, so nothing lands on them
+    without a human saying yes first.
+
+    Requires report_id from a prior, APPROVED analyze_deployment_requirements()
+    call with needs_gpu=True for this same repo -- refused otherwise (this
+    tool is specifically for the AI-serving piece of an architecture, not
+    a general-purpose deploy; use deploy() for anything that doesn't need
+    a GPU). Same create-only boundary as deploy(): refuses if the name is
+    already taken, never touches an existing app.
+
+    env_overrides works exactly like deploy()'s -- but is held in memory
+    only until approval (see this file's own comment on
+    _pending_gpu_deploy_secrets for why), NOT written to the pending-
+    actions file. If this server restarts before an admin approves,
+    those values are gone and approval will fail cleanly asking you to
+    resubmit, rather than silently deploying with missing secrets."""
+    caller = _caller_identity(ctx)
+    params = {"owner_repo": owner_repo, "name": name, "report_id": report_id, "git_branch": git_branch,
+              "env_overrides_keys": sorted((env_overrides or {}).keys())}
+
+    entry = _approved_reports.get(report_id)
+    if entry is None:
+        outcome = {"status": "rejected",
+                   "reason": f"no approved report {report_id!r} -- call analyze_deployment_requirements() "
+                              "first (or it expired; reports are valid for 1 hour)"}
+        _audit("request_gpu_service", params, outcome, client=caller)
+        return outcome
+    if time.time() > entry["expires_at"]:
+        del _approved_reports[report_id]
+        outcome = {"status": "rejected", "reason": f"report {report_id!r} expired -- call "
+                                                     "analyze_deployment_requirements() again"}
+        _audit("request_gpu_service", params, outcome, client=caller)
+        return outcome
+    report = entry["report"]
+
+    if not report.get("needs_gpu"):
+        outcome = {"status": "rejected",
+                   "reason": "this report's needs_gpu is false -- request_gpu_service() is only for apps that "
+                              "actually need one (the AI/API-serving piece of a split architecture); use "
+                              "deploy() for a normal app"}
+        _audit("request_gpu_service", params, outcome, client=caller)
+        return outcome
+
+    now = time.time()
+    while (_gpu_service_request_timestamps
+           and now - _gpu_service_request_timestamps[0] > GPU_SERVICE_REQUEST_RATE_WINDOW_SEC):
+        _gpu_service_request_timestamps.popleft()
+    if len(_gpu_service_request_timestamps) >= GPU_SERVICE_REQUEST_RATE_LIMIT:
+        outcome = {"status": "rejected",
+                   "reason": f"rate limit: {GPU_SERVICE_REQUEST_RATE_LIMIT} GPU service requests per "
+                             f"{GPU_SERVICE_REQUEST_RATE_WINDOW_SEC}s exceeded"}
+        _audit("request_gpu_service", params, outcome, client=caller)
+        return outcome
+
+    if agent.name_taken(name):
+        outcome = {"status": "rejected",
+                   "reason": f"'{name}' already exists in registry.yaml -- this tool only creates new apps"}
+        _audit("request_gpu_service", params, outcome, client=caller)
+        return outcome
+
+    actions = _load_pending_actions()
+    existing = next((a for a in actions.values()
+                      if a.get("name") == name and a.get("action") == "gpu_service_deploy"
+                      and a.get("status") == "pending"), None)
+    if existing:
+        outcome = {"status": "already_pending", "id": existing["id"], "name": name,
+                    "reason": f"a GPU service request for {name!r} is already pending (id {existing['id']!r}, "
+                              f"requested by {existing['requested_by']!r})"}
+        _audit("request_gpu_service", params, outcome, client=caller)
+        return outcome
+
+    # Extracted from the report NOW, not re-read at approval time -- the
+    # report itself may have expired by then (an admin might not get to
+    # this for a while), but once queued this request is self-contained.
+    action_id = secrets_module.token_hex(8)
+    actions[action_id] = {
+        "id": action_id, "action": "gpu_service_deploy", "name": name,
+        "owner_repo": owner_repo, "git_branch": git_branch,
+        "target_node": report["recommended_node"], "memory_mb_override": report["recommended_memory_mb"],
+        "had_env_overrides": bool(env_overrides),
+        "requested_by": caller["name"], "requested_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "status": "pending",
+    }
+    if env_overrides:
+        _pending_gpu_deploy_secrets[action_id] = env_overrides
+    _save_pending_actions(actions)
+    _gpu_service_request_timestamps.append(now)
+    outcome = {"status": "requested", "id": action_id, "name": name, "target_node": report["recommended_node"]}
+    _audit("request_gpu_service", params, outcome, client=caller)
+    return outcome
+
+
 @mcp.tool()
 def list_pending_actions(ctx: Context) -> dict:
-    """Lists queued actions from request_teardown() -- admin sees every
-    request; a client sees only the ones they themselves requested (never
-    another client's, even for an app they own -- ownership of the APP
-    doesn't imply visibility into who else requested what against it).
-    Read-only, not rate-limited or audited."""
+    """Lists queued actions from request_teardown() and
+    request_gpu_service() -- admin sees every request; a client sees only
+    the ones they themselves requested (never another client's, even for
+    an app they own -- ownership of the APP doesn't imply visibility into
+    who else requested what against it). Read-only, not rate-limited or
+    audited. A gpu_service_deploy entry never contains env_overrides
+    values -- those are held in memory only, never written to this file
+    (see _pending_gpu_deploy_secrets)."""
     caller = _caller_identity(ctx)
     actions = list(_load_pending_actions().values())
     if caller.get("role") != "admin":
@@ -1359,21 +1513,34 @@ def list_pending_actions(ctx: Context) -> dict:
 
 @mcp.tool()
 def approve_action(ctx: Context, id: str) -> dict:
-    """Executes a pending action queued by request_teardown() -- ADMIN
-    ONLY, full stop, regardless of who requested it or who owns the app.
-    This is the ONE place actual destruction happens on this server;
-    deploy()/redeploy()/restart() only ever create or re-apply. Refuses
-    cleanly (never a stack trace) for a non-admin caller, an unknown id,
-    or an id that's already been resolved (approved/rejected already) --
-    never silently no-ops or re-executes something twice.
+    """Executes a pending action queued by request_teardown() or
+    request_gpu_service() -- ADMIN ONLY, full stop, regardless of who
+    requested it or who owns the app. This is the ONE place either kind
+    of consequential change actually happens on this server: real
+    destruction (teardown) or a real deploy landing on one of the user's
+    own GPU machines (gpu_service_deploy) -- deploy()/redeploy()/restart()
+    only ever create or re-apply on servingz/hostinger-vps, immediately,
+    no approval gate. Refuses cleanly (never a stack trace) for a non-
+    admin caller, an unknown id, or an id that's already been resolved
+    (approved/rejected already) -- never silently no-ops or re-executes
+    something twice.
 
-    Calls agent.delete_app(name), which is genuinely irreversible: the
+    teardown calls agent.delete_app(name), genuinely irreversible: the
     Coolify resource (or Pages project), its DNS record, its tunnel
     route, the resource_map entry, and the registry.yaml entry are all
-    removed, and the registry change is committed. A failure partway
-    through is recorded on the queue entry as "failed" with the error,
-    not silently dropped -- check list_pending_actions() after a failure
-    rather than assuming nothing happened."""
+    removed, and the registry change is committed.
+
+    gpu_service_deploy calls agent.deploy() with exactly what was
+    captured at request time (target_node, memory, env_overrides) -- if
+    env_overrides were supplied and this process restarted since the
+    request, they're gone (see _pending_gpu_deploy_secrets) and this
+    fails cleanly asking for a resubmit, rather than deploying with
+    silently-missing secrets.
+
+    Either way, a failure partway through is recorded on the queue entry
+    as "failed" with the error, not silently dropped -- check
+    list_pending_actions() after a failure rather than assuming nothing
+    happened."""
     caller = _caller_identity(ctx)
     params = {"id": id}
 
@@ -1403,13 +1570,28 @@ def approve_action(ctx: Context, id: str) -> dict:
                    "reason": f"action {id!r} is already {entry.get('status')!r}, not pending"}
         _audit("approve_action", params, outcome, client=caller)
         return outcome
-    if entry.get("action") != "teardown":
+    if entry.get("action") not in ("teardown", "gpu_service_deploy"):
         outcome = {"status": "rejected", "reason": f"unknown action type {entry.get('action')!r}"}
         _audit("approve_action", params, outcome, client=caller)
         return outcome
 
     try:
-        result = agent.delete_app(entry["name"])
+        if entry["action"] == "teardown":
+            result = agent.delete_app(entry["name"])
+        else:  # gpu_service_deploy
+            env_overrides = None
+            if entry.get("had_env_overrides"):
+                env_overrides = _pending_gpu_deploy_secrets.get(id)
+                if env_overrides is None:
+                    raise RuntimeError(
+                        "this request's env_overrides were lost (the server restarted since it was "
+                        "submitted) -- ask the original requester to call request_gpu_service() again"
+                    )
+            result = agent.deploy(owner_repo=entry["owner_repo"], name=entry["name"],
+                                   owner=entry["requested_by"], git_branch=entry.get("git_branch", "main"),
+                                   target_node=entry["target_node"], memory_mb_override=entry.get("memory_mb_override"),
+                                   env_overrides=env_overrides, needs_gpu=True)
+            _pending_gpu_deploy_secrets.pop(id, None)
         entry.update(status="approved_and_executed", approved_by=caller["name"],
                       approved_at=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), result=result)
         actions[id] = entry
@@ -1430,11 +1612,14 @@ def approve_action(ctx: Context, id: str) -> dict:
 
 @mcp.tool()
 def reject_action(ctx: Context, id: str) -> dict:
-    """Declines a pending action queued by request_teardown() without
-    executing it -- ADMIN ONLY, same reasoning as approve_action(): a
-    human is in the loop for every decision about destruction, including
-    the decision NOT to. Refuses cleanly for a non-admin caller, an
-    unknown id, or an id that's already resolved."""
+    """Declines a pending action queued by request_teardown() or
+    request_gpu_service() without executing it -- ADMIN ONLY, same
+    reasoning as approve_action(): a human is in the loop for every
+    decision about destruction or a new GPU deploy, including the
+    decision NOT to. Refuses cleanly for a non-admin caller, an unknown
+    id, or an id that's already resolved. Any in-memory env_overrides
+    held for a rejected gpu_service_deploy request are discarded here too
+    -- a rejected request's secrets don't linger."""
     caller = _caller_identity(ctx)
     params = {"id": id}
 
@@ -1469,6 +1654,7 @@ def reject_action(ctx: Context, id: str) -> dict:
                  rejected_at=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()))
     actions[id] = entry
     _save_pending_actions(actions)
+    _pending_gpu_deploy_secrets.pop(id, None)
     _reject_action_timestamps.append(now)
     outcome = {"status": "action_rejected", "id": id, "name": entry["name"]}
     _audit("reject_action", params, outcome, client=caller)
