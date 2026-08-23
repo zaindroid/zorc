@@ -362,16 +362,29 @@ def gpu_fleet_status() -> dict:
             "live": live_cards is not None,
         }
         if live_cards:
-            total_util = round(sum(c["utilization_pct"] for c in live_cards) / len(live_cards), 1)
-            total_used_mb = sum(c["mem_used_mb"] for c in live_cards)
-            total_vram_mb = sum(c["mem_total_mb"] for c in live_cards)
+            # Per-field, not per-card: a card can report real
+            # temp/utilization but no memory numbers at all (confirmed
+            # live on jetson-thor -- unified memory, nvidia-smi reports
+            # "[N/A]" for memory.used/memory.total there, see
+            # agent._parse_nvidia_smi_field) -- summing/averaging only
+            # over the cards that actually HAVE a given field, rather
+            # than crashing on None or silently treating a missing
+            # reading as 0, which would understate usage.
+            utils = [c["utilization_pct"] for c in live_cards if c["utilization_pct"] is not None]
+            mems_used = [c["mem_used_mb"] for c in live_cards if c["mem_used_mb"] is not None]
+            mems_total = [c["mem_total_mb"] for c in live_cards if c["mem_total_mb"] is not None]
+            avg_util = round(sum(utils) / len(utils), 1) if utils else None
+            total_used_mb = sum(mems_used) if mems_used else None
+            total_vram_mb = sum(mems_total) if mems_total else None
+            mem_free_mb = (total_vram_mb - total_used_mb) if (total_vram_mb is not None and total_used_mb is not None) else None
             node_entry.update({
                 "cards": live_cards,
-                "avg_utilization_pct": total_util,
+                "avg_utilization_pct": avg_util,
                 "mem_used_mb": total_used_mb,
                 "mem_total_mb": total_vram_mb,
-                "mem_free_mb": total_vram_mb - total_used_mb,
-                "busy": total_util > 5 or (total_vram_mb > 0 and total_used_mb / total_vram_mb > 0.1),
+                "mem_free_mb": mem_free_mb,
+                "busy": bool((avg_util is not None and avg_util > 5)
+                             or (total_vram_mb and total_used_mb is not None and total_used_mb / total_vram_mb > 0.1)),
             })
         else:
             node_entry["note"] = ("no live GPU telemetry right now -- node may be unreachable, or nvidia-smi "

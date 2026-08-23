@@ -45,6 +45,17 @@ def test_parse_nvidia_smi_csv(agent) -> None:
     check("empty output -> None, not a crash", agent._parse_nvidia_smi_csv("") is None)
     check("garbage output -> None, not a crash", agent._parse_nvidia_smi_csv("not,even,close,to,valid,csv,here") is None)
 
+    # Real scenario confirmed live: jetson-thor's nvidia-smi shim reports
+    # "[N/A]" for memory.used/memory.total (unified-memory architecture,
+    # no separate dedicated VRAM) while temp/utilization are still real
+    # numbers on the same line -- must keep the fields it has, not
+    # discard the whole card.
+    jetson = agent._parse_nvidia_smi_csv("0, NVIDIA Thor, 50, 0, [N/A], [N/A]")
+    check("a card with [N/A] memory fields keeps its valid temp/utilization, doesn't get dropped entirely",
+          jetson == [{"index": 0, "name": "NVIDIA Thor", "temp_c": 50, "utilization_pct": 0,
+                      "mem_used_mb": None, "mem_total_mb": None}],
+          str(jetson))
+
 
 FIXTURE_REGISTRY = {
     "nodes": {
@@ -54,6 +65,8 @@ FIXTURE_REGISTRY = {
                     "ssh_key": "deploy/secrets/rtx5090_deploy_key", "ssh_user": "zulhaq"},
         "bitbots_gpu": {"backend": "zorc-agent", "tailscale_ip": "100.118.75.128",
                         "ssh_key": "deploy/secrets/bitbots_gpu_deploy_key", "ssh_user": "zul2s"},
+        "jetson-thor": {"backend": "zorc-agent", "tailscale_ip": "100.119.248.100",
+                        "ssh_key": "deploy/secrets/jetson-thor_deploy_key", "ssh_user": "zain"},
         # A node this test invents on the spot -- proves the function is
         # genuinely generic, not secretly hardcoded to the three real ones.
         "brand-new-gpu-box": {"backend": "zorc-agent", "tailscale_ip": "100.99.99.99",
@@ -66,6 +79,7 @@ FIXTURE_TELEMETRY = {
     "hostinger-vps": {},  # no accelerator key at all
     "rtx5090": {"accelerator": {"type": "cuda", "name": "NVIDIA GeForce RTX 5090", "vram_mb": 32607, "count": 1}},
     "bitbots_gpu": {"accelerator": {"type": "cuda", "name": "NVIDIA GeForce RTX 3090", "vram_mb": 49152, "count": 2}},
+    "jetson-thor": {"accelerator": {"type": "tegra", "name": "NVIDIA Thor", "vram_mb": None, "count": 1}},
     "brand-new-gpu-box": {"accelerator": {"type": "cuda", "name": "NVIDIA Fake GPU 9000", "vram_mb": 8192, "count": 1}},
 }
 
@@ -93,6 +107,9 @@ def main() -> int:
                       "mem_used_mb": 100, "mem_total_mb": 24576},
                     {"index": 1, "name": "RTX 3090", "temp_c": 34, "utilization_pct": 1,
                      "mem_used_mb": 50, "mem_total_mb": 24576}]
+        if tailscale_ip == "100.119.248.100":  # jetson-thor -- real temp/util, [N/A] memory (unified memory)
+            return [{"index": 0, "name": "NVIDIA Thor", "temp_c": 50, "utilization_pct": 0,
+                      "mem_used_mb": None, "mem_total_mb": None}]
         if tailscale_ip == "100.99.99.99":  # the brand-new node -- unreachable
             return None
         return None
@@ -109,14 +126,14 @@ def main() -> int:
 
         check("hostinger-vps (no accelerator) is excluded from the fleet",
               "hostinger-vps" not in fleet_by_node, str(list(fleet_by_node)))
-        check("all 4 GPU-bearing nodes are present, including one invented for this test alone",
-              {"servingz", "rtx5090", "bitbots_gpu", "brand-new-gpu-box"} <= set(fleet_by_node),
+        check("all 5 GPU-bearing nodes are present, including one invented for this test alone",
+              {"servingz", "rtx5090", "bitbots_gpu", "jetson-thor", "brand-new-gpu-box"} <= set(fleet_by_node),
               str(list(fleet_by_node)))
 
         check("LOCAL_NODE (servingz) uses the local query path, not SSH",
               fleet_by_node["servingz"]["live"] is True, str(fleet_by_node["servingz"]))
         check("...and never shows up as a remote SSH call itself",
-              all(ip != "servingz" for ip, _, _ in remote_calls) and len(remote_calls) == 3,
+              all(ip != "servingz" for ip, _, _ in remote_calls) and len(remote_calls) == 4,
               f"remote_calls={remote_calls}")
 
         rtx = fleet_by_node["rtx5090"]
@@ -129,6 +146,16 @@ def main() -> int:
         check("bitbots_gpu sums memory across both cards", bb["mem_used_mb"] == 150 and bb["mem_total_mb"] == 49152,
               str(bb))
         check("bitbots_gpu is NOT flagged busy (near-idle)", bb["busy"] is False, str(bb))
+
+        # jetson-thor: real scenario, unified memory -- live=true, real
+        # temp/utilization, but mem fields are None, not 0 or a crash.
+        jt = fleet_by_node["jetson-thor"]
+        check("jetson-thor reports live=true despite having no memory numbers", jt["live"] is True, str(jt))
+        check("jetson-thor's avg_utilization_pct is a real number (0.0), not None",
+              jt["avg_utilization_pct"] == 0.0, str(jt))
+        check("jetson-thor's memory fields are None (not 0, not a crash) -- unified memory, nothing to report",
+              jt["mem_used_mb"] is None and jt["mem_total_mb"] is None and jt["mem_free_mb"] is None, str(jt))
+        check("jetson-thor is NOT flagged busy (0% util, no memory signal either)", jt["busy"] is False, str(jt))
 
         new_node = fleet_by_node["brand-new-gpu-box"]
         check("the brand-new node (query returns None -- simulating unreachable) shows live=false, not a crash",

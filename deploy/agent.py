@@ -1723,25 +1723,54 @@ _NVIDIA_SMI_QUERY_ARGS = [
 ]
 
 
+def _parse_nvidia_smi_field(s: str) -> int | None:
+    """One numeric field from nvidia-smi's CSV output -- returns None for
+    "[N/A]" (real value seen live: jetson-thor's nvidia-smi shim reports
+    memory.used/memory.total as "[N/A]", since Jetson's unified-memory
+    architecture has no separate dedicated VRAM to report -- temp/
+    utilization are still real numbers on the same line) or anything else
+    unparseable, rather than raising."""
+    s = s.strip()
+    if not s or s.upper() in ("[N/A]", "N/A"):
+        return None
+    try:
+        return int(s)
+    except ValueError:
+        return None
+
+
 def _parse_nvidia_smi_csv(out: str) -> list[dict] | None:
     """Shared by the local and remote query below -- one row per physical
     card (a multi-GPU box like bitbots_gpu's dual 3090s prints two lines).
-    Returns None on anything unparseable rather than a partial/best-effort
-    list -- fail closed, same principle as everywhere else this codebase
-    parses an external command's output."""
+    Per-FIELD parsing, not per-row/all-or-nothing: a card that reports
+    "[N/A]" for memory but real numbers for temp/utilization (confirmed
+    live on jetson-thor) keeps the fields it has rather than the whole
+    card being discarded over one missing one -- that would silently
+    throw away real, useful data for the sake of a rule ("fail closed")
+    that doesn't actually apply here, since a partial reading isn't a
+    trust/safety problem the way a malformed auth token is. Only "index"
+    and "name" are required per card; a line missing even those is
+    dropped. Returns None only if NO line produced a usable card at all
+    (empty output, or every line genuinely unparseable)."""
     if not out.strip():
         return None
-    try:
-        cards = []
-        for line in out.strip().splitlines():
-            idx, name, temp, util, mem_used, mem_total = [x.strip() for x in line.split(",")]
-            cards.append({
-                "index": int(idx), "name": name, "temp_c": int(temp),
-                "utilization_pct": int(util), "mem_used_mb": int(mem_used), "mem_total_mb": int(mem_total),
-            })
-        return cards
-    except ValueError:
-        return None
+    cards = []
+    for line in out.strip().splitlines():
+        parts = [x.strip() for x in line.split(",")]
+        if len(parts) != 6:
+            continue
+        idx_s, name, temp_s, util_s, mem_used_s, mem_total_s = parts
+        idx = _parse_nvidia_smi_field(idx_s)
+        if idx is None or not name:
+            continue
+        cards.append({
+            "index": idx, "name": name,
+            "temp_c": _parse_nvidia_smi_field(temp_s),
+            "utilization_pct": _parse_nvidia_smi_field(util_s),
+            "mem_used_mb": _parse_nvidia_smi_field(mem_used_s),
+            "mem_total_mb": _parse_nvidia_smi_field(mem_total_s),
+        })
+    return cards or None
 
 
 def _nvidia_smi_query_local() -> list[dict] | None:
