@@ -1288,8 +1288,26 @@ def add_tunnel_route(hostname: str, service: str = "https://localhost:443") -> N
     # Always push to live + reload from here, even if the repo file already
     # had the rule (a prior run got this far before failing) -- that's
     # exactly the case that silently broke before.
-    subprocess.run(["sudo", "cp", str(repo_config_path), str(config_path)], check=True)
-    subprocess.run(["sudo", "systemctl", "reload-or-restart", "cloudflared"], check=True)
+    #
+    # Real bug found live (2026-08-23): this used `sudo cp` + `sudo
+    # systemctl reload-or-restart cloudflared` -- works fine when agent.py
+    # runs interactively, but zorc-mcp.service (and zorc-status-server.
+    # service) both set NoNewPrivileges=true, which blocks sudo from
+    # elevating AT ALL, unconditionally, regardless of sudoers config
+    # (confirmed via `setpriv --no-new-privs -- sudo ...` -- sudo itself
+    # refuses: "the 'no new privileges' flag is set"). Every deploy/
+    # teardown that reached this step through the real MCP server was
+    # silently failing at add_tunnel_route -- confirmed in mcp_audit.log
+    # across multiple real apps. Fixed at the permission layer instead of
+    # working around it here: /etc/cloudflared/config.yml is now owned by
+    # zman directly (no sudo needed to write it), and a scoped polkit rule
+    # (/etc/polkit-1/rules.d/49-zman-cloudflared.rules) lets zman reload
+    # ONLY cloudflared.service without authentication -- systemctl talks
+    # to PID 1 over D-Bus, not via setuid, so it isn't blocked by
+    # NoNewPrivileges the way sudo is. No `sudo` prefix needed on either
+    # command anymore; using one now would just fail the same way again.
+    subprocess.run(["cp", str(repo_config_path), str(config_path)], check=True)
+    subprocess.run(["systemctl", "reload-or-restart", "cloudflared"], check=True)
 
 
 def git_commit_and_push(message: str) -> None:
@@ -2224,8 +2242,12 @@ def delete_app(name: str) -> dict:
         cfg = yaml.safe_load(repo_config_path.read_text())
         cfg["ingress"] = [r_ for r_ in cfg["ingress"] if r_.get("hostname") != hostname]
         repo_config_path.write_text(yaml.dump(cfg, sort_keys=False))
-        subprocess.run(["sudo", "cp", str(repo_config_path), "/etc/cloudflared/config.yml"], check=True)
-        subprocess.run(["sudo", "systemctl", "reload-or-restart", "cloudflared"], check=True)
+        # No sudo -- see add_tunnel_route()'s comment on why (NoNewPrivileges
+        # blocks it unconditionally from within zorc-mcp.service; fixed at
+        # the permission layer: config.yml is zman-owned, cloudflared
+        # reload is polkit-granted to zman specifically).
+        subprocess.run(["cp", str(repo_config_path), "/etc/cloudflared/config.yml"], check=True)
+        subprocess.run(["systemctl", "reload-or-restart", "cloudflared"], check=True)
 
         with httpx.Client(timeout=15) as client:
             existing = client.get(
@@ -2257,8 +2279,12 @@ def delete_app(name: str) -> dict:
         service_hostnames = {f"{d}.{PLATFORM_ROOT_DOMAIN}" for d in domains}
         cfg["ingress"] = [r_ for r_ in cfg["ingress"] if r_.get("hostname") not in service_hostnames]
         repo_config_path.write_text(yaml.dump(cfg, sort_keys=False))
-        subprocess.run(["sudo", "cp", str(repo_config_path), "/etc/cloudflared/config.yml"], check=True)
-        subprocess.run(["sudo", "systemctl", "reload-or-restart", "cloudflared"], check=True)
+        # No sudo -- see add_tunnel_route()'s comment on why (NoNewPrivileges
+        # blocks it unconditionally from within zorc-mcp.service; fixed at
+        # the permission layer: config.yml is zman-owned, cloudflared
+        # reload is polkit-granted to zman specifically).
+        subprocess.run(["cp", str(repo_config_path), "/etc/cloudflared/config.yml"], check=True)
+        subprocess.run(["systemctl", "reload-or-restart", "cloudflared"], check=True)
         with httpx.Client(timeout=15) as client:
             for d in domains:
                 h = f"{d}.{PLATFORM_ROOT_DOMAIN}"
@@ -2306,8 +2332,12 @@ def delete_app(name: str) -> dict:
         cfg = yaml.safe_load(repo_config_path.read_text())
         cfg["ingress"] = [r_ for r_ in cfg["ingress"] if r_.get("hostname") != hostname]
         repo_config_path.write_text(yaml.dump(cfg, sort_keys=False))
-        subprocess.run(["sudo", "cp", str(repo_config_path), "/etc/cloudflared/config.yml"], check=True)
-        subprocess.run(["sudo", "systemctl", "reload-or-restart", "cloudflared"], check=True)
+        # No sudo -- see add_tunnel_route()'s comment on why (NoNewPrivileges
+        # blocks it unconditionally from within zorc-mcp.service; fixed at
+        # the permission layer: config.yml is zman-owned, cloudflared
+        # reload is polkit-granted to zman specifically).
+        subprocess.run(["cp", str(repo_config_path), "/etc/cloudflared/config.yml"], check=True)
+        subprocess.run(["systemctl", "reload-or-restart", "cloudflared"], check=True)
 
     with httpx.Client(timeout=15) as client:
         existing = client.get(
