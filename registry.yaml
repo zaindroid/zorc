@@ -182,6 +182,24 @@ infrastructure:
     note: managed by Coolify, routes by hostname
 
 # ---------------------------------------------------------------------------
+# Per-owner memory budgets (Phase 5) -- soft cap on how much total
+# memory_mb one CLIENT-role owner's own apps may sum to, PLATFORM-WIDE
+# (across every node, not per-node -- this catches "one person's apps
+# quietly ate a whole node, or several", the failure mode Phase 5 exists
+# for). Admin-role callers are exempt entirely (see mcp_server.py's
+# analyze_deployment_requirements -- this section has no concept of
+# roles itself, that check happens in code). An owner with no entry in
+# overrides gets default_mb. Advisory, deliberately generous for trusted
+# users -- no cgroup/hard-infrastructure enforcement, just a block at
+# analyze_deployment_requirements() time with a clear reason. Raise an
+# override by hand here (a normal reviewed registry.yaml edit) if a real
+# need outgrows it.
+# ---------------------------------------------------------------------------
+owner_budgets:
+  default_mb: 8192
+  overrides: {}
+
+# ---------------------------------------------------------------------------
 # Applications. Add new entries at the end. Keep alphabetical within groups.
 # ---------------------------------------------------------------------------
 apps:
