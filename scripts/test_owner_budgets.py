@@ -85,7 +85,7 @@ def test_analyze_deployment_requirements_budget_gate(agent, m) -> None:
     agent.load_registry = lambda: fixture_registry
     agent.clone_repo = lambda owner_repo, git_branch="main": Path("/tmp/fake-repo-does-not-need-to-exist")
     agent.classify = lambda repo_dir: {"kind": "python", "language": "python", "reason": "requirements.txt found"}
-    agent.parse_app_yaml = lambda repo_dir: {"env": {}, "database": False, "persistent_storage": None}
+    agent.parse_app_yaml = lambda repo_dir: {"env": {}, "database": False, "ai": False, "persistent_storage": None}
     m._estimate_memory_from_repo = lambda repo_dir, classification: (512, [])
     m._recommend_placement = lambda memory_mb, needs_public_ip, needs_gpu=False: {
         "recommended_node": "servingz", "fits": True, "reason": "plenty of headroom",
@@ -99,7 +99,7 @@ def test_analyze_deployment_requirements_budget_gate(agent, m) -> None:
             ctx=object(),  # unused -- _caller_identity is monkeypatched above
             owner_repo="someorg/somerepo", architecture="single_service", app_kind="api",
             frontend_rendering="none", framework="fastapi", expected_concurrency="low",
-            has_database=False, has_background_jobs=False, needs_websockets=False,
+            has_database=False, needs_ai=False, has_background_jobs=False, needs_websockets=False,
             needs_persistent_storage=False, needs_public_ip=False, needs_gpu=False,
             estimated_memory_mb=512, reasoning="a plain FastAPI service, 512MB is the standard baseline for this",
         )

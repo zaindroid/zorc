@@ -128,18 +128,20 @@ correct and this file is stale — fix it in your PR.
 
 ### Shared infrastructure
 
-**As of 2026-08-09: Postgres and Redis are live.** Object storage and the
-LLM gateway are still NOT provisioned — apps must not assume either exists;
-**stop and ask** before assuming, same as before. Coolify's own internal
-`coolify-db`/`coolify-redis` remain platform-only, never for apps — the
-shared instances below are separate, dedicated deployments.
+**As of 2026-08-09: Postgres and Redis are live. As of 2026-08-23: the
+LLM gateway is live too** (`zorc-ai-gateway` -- free-tier Groq/Google AI
+Studio/OpenRouter, auto-failover between them). Object storage is still
+NOT provisioned — apps must not assume it exists; **stop and ask** before
+assuming, same as before. Coolify's own internal `coolify-db`/
+`coolify-redis` remain platform-only, never for apps — the shared
+instances below are separate, dedicated deployments.
 
 | Service | Reach it at | Use for | Never |
 |---|---|---|---|
 | **Postgres 18** | `t5amapezxhesfta6w82ksyt0:5432` (internal Docker network only, `coolify` network) | relational data, job state, anything durable | query another app's DB; add a second Postgres |
 | **Redis 7** | `h8nk9npsxzv9kkklvgqb93zj:6379` (internal Docker network only, `coolify` network) | queues, cache, rate limits, locks | store anything you can't lose; add another broker |
 | **Object storage** | not provisioned — ask first | files, audio, images, exports over ~100 KB | store user files on the container filesystem |
-| **LLM gateway** | not provisioned — ask first | all LLM, VLM, embedding, STT, TTS calls | call a provider SDK directly; hold a provider key in an app |
+| **LLM gateway** | `ai-gateway-internal:8080` (internal Docker network only, `coolify` network; stable Coolify `custom_network_aliases`, not the raw container name, which changes every redeploy) | all LLM chat-completion calls | call a provider SDK directly; hold a provider key in an app; assume VLM/embedding/STT/TTS work yet (chat completions only so far) |
 
 Postgres/Redis: **one database + one role per app** (Postgres) / **one
 logical DB index per app** (Redis) — created on request when an app needs
@@ -148,9 +150,16 @@ one, not self-service. Connection details arrive as `DATABASE_URL`/
 hostnames above directly in app code — use the env vars so credentials and
 routing can change without an app redeploy.
 
-The LLM gateway is OpenAI-compatible — point any OpenAI SDK at `LLM_BASE_URL`.
-Routing, failover, caching, cost tracking and tracing all live there. An app
-that bypasses it loses all of that and will be rejected in review.
+The LLM gateway is OpenAI-compatible — set app.yaml's `ai: true` and
+deploy() injects `LLM_BASE_URL`/`LLM_API_KEY` automatically (same pattern
+as `database: true`, see section 5). Point any OpenAI SDK at
+`LLM_BASE_URL` and call chat completions; the gateway auto-picks a free
+provider and fails over between them if one is unavailable -- the `model`
+you send is ignored/substituted by the gateway itself. Cost tracking/
+tracing are NOT built yet (deviation from what this section previously
+promised) -- routing and failover are real, those two aren't. An app that
+bypasses the gateway and calls a provider directly will be rejected in
+review.
 
 File uploads go **browser → presigned storage URL → storage**, directly. Never
 proxy file bytes through an app container.
@@ -163,7 +172,7 @@ proxy file bytes through an app container.
 
 | Capability | Service | Endpoint | Operations |
 |---|---|---|---|
-| _(none yet — add rows as apps are built)_ | | | |
+| Free-tier LLM chat completions, auto-failover | ai-gateway | `LLM_BASE_URL` (`ai: true` in app.yaml) | `POST /auto/v1/chat/completions`, `GET /providers`, `GET /usage`, `GET /auto/status` |
 
 Every app exposes `GET /openapi.json`. Fetch it to learn an API rather than
 reading its source.
@@ -305,9 +314,16 @@ app on the node report unhealthy and restart at once.
 
 ```
 DATABASE_URL   REDIS_URL   APP_ENV   LOG_LEVEL
-LLM_BASE_URL   LLM_API_KEY   LLM_MODEL
+LLM_BASE_URL   LLM_API_KEY
 S3_ENDPOINT    S3_BUCKET    S3_ACCESS_KEY_ID   S3_SECRET_ACCESS_KEY
 ```
+
+`LLM_API_KEY` is a placeholder value, not a real credential -- the gateway
+always uses its own server-held provider key regardless of what's sent to
+it, this only exists because most OpenAI SDK clients refuse to construct
+without a non-empty api_key. There's no `LLM_MODEL` -- the gateway's
+`/auto` route picks the model itself (see the LLM gateway row above); use
+a provider's direct route instead if you need an exact model id.
 
 Fail loudly at startup if a required variable is missing. Never fall back to a
 default for anything security-relevant.

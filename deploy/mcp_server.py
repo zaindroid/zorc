@@ -11,18 +11,20 @@ already exists, never touches an existing app, and can still target a
 GPU node directly and immediately if called that way -- unchanged),
 redeploy() and restart() (idempotent re-apply on an app the caller owns --
 rebuild current branch/restart the container, never a config/env change),
-and the shared request_teardown()/request_gpu_service()/approve_action()/
-reject_action() queue -- the two actions on this server consequential
-enough to need a human before they happen: real destruction (teardown),
-and a new deploy actually landing on one of the user's own GPU machines
-(rtx5090/jetson-thor/bitbots_gpu -- not dedicated to zorc, borrowed for
-spare capacity only). Either request_*() tool only ever QUEUES; executing
-one is admin-only, full stop, regardless of who requested it or who owns
-the app. Every mutating tool goes through _require_owner_or_admin() (or,
-for approve_action/reject_action, a hard-coded admin-only check -- app
-ownership doesn't grant destruction or GPU-deploy rights) and its own
-rate limit, and is logged via _audit() under the resolved caller's name,
-never anything caller-supplied.
+and the shared request_teardown()/request_gpu_service()/
+request_memory_increase()/approve_action()/reject_action() queue -- the
+three kinds of change on this server consequential enough to need a
+human before they happen: real destruction (teardown), a new deploy
+actually landing on one of the user's own GPU machines (rtx5090/
+jetson-thor/bitbots_gpu -- not dedicated to zorc, borrowed for spare
+capacity only), and a bigger memory allocation for an existing app.
+Either request_*() tool only ever QUEUES; executing one is admin-only,
+full stop, regardless of who requested it or who owns the app. Every
+mutating tool goes through _require_owner_or_admin() (or, for
+approve_action/reject_action, a hard-coded admin-only check -- app
+ownership doesn't grant destruction/GPU-deploy/memory-increase rights)
+and its own rate limit, and is logged via _audit() under the resolved
+caller's name, never anything caller-supplied.
 
 Everything else (get_app_status, get_app_logs, get_deploy_history,
 diagnose_app, list_pending_actions, list_nodes, ...) is read-only and
@@ -119,6 +121,14 @@ GPU_SERVICE_REQUEST_RATE_LIMIT = 5
 GPU_SERVICE_REQUEST_RATE_WINDOW_SEC = 3600
 _gpu_service_request_timestamps: deque[float] = deque()
 
+# Same reasoning as TEARDOWN_REQUEST_RATE_LIMIT/GPU_SERVICE_REQUEST_RATE_LIMIT
+# above -- this only ever queues, approve_action()/reject_action() are
+# shared with teardown/gpu_service_deploy for the actual approve/reject
+# step.
+MEMORY_INCREASE_REQUEST_RATE_LIMIT = 5
+MEMORY_INCREASE_REQUEST_RATE_WINDOW_SEC = 3600
+_memory_increase_request_timestamps: deque[float] = deque()
+
 BUILD_SHA = "dev"  # overwritten by Coolify's build-arg injection if configured; fine as a static fallback
 
 # Approved requirements-analysis reports, keyed by report_id. deploy()
@@ -201,7 +211,11 @@ mcp = MCPServer(
         "app; it cannot touch, modify, or delete anything that already exists. "
         "Needs a database? Set app.yaml's database: true -- a dedicated Postgres "
         "gets provisioned and DATABASE_URL set automatically, you never handle "
-        "credentials yourself. If your app needs any other env var beyond APP_ENV/"
+        "credentials yourself. Needs AI/LLM calls? Set app.yaml's ai: true -- "
+        "LLM_BASE_URL/LLM_API_KEY get wired to the shared free-tier gateway "
+        "automatically, never hold a provider key yourself or call a provider SDK "
+        "directly (see get_platform_contract's ai_gateway_provisioning). If your "
+        "app needs any other env var beyond APP_ENV/"
         "LOG_LEVEL, declare it in app.yaml's env: section (see get_platform_contract) -- "
         "internal secrets get generated and set for you automatically; "
         "anything tied to a real external account must be passed to deploy() "
@@ -234,8 +248,10 @@ def get_platform_contract() -> dict:
         "required_files": {
             "app.yaml": "declares name, memory_mb, port, domains, dependencies, an "
                         "(optional) database: true flag -- see database_provisioning "
-                        "below -- and an (optional) env: section for anything beyond "
-                        "the auto-provided vars -- see env_vars_beyond_defaults below",
+                        "below -- an (optional) ai: true flag -- see "
+                        "ai_gateway_provisioning below -- and an (optional) env: "
+                        "section for anything beyond the auto-provided vars -- see "
+                        "env_vars_beyond_defaults below",
             "Dockerfile": "only if your stack needs something build-autodetection "
                            "can't handle; otherwise a standard manifest "
                            "(package.json / requirements.txt / go.mod / etc) is enough",
@@ -257,6 +273,25 @@ def get_platform_contract() -> dict:
             "env:'s generate: hex secrets -- you never see or handle the credentials). "
             "Omit database: true (or set it false) if your app has no database -- "
             "nothing gets provisioned and DATABASE_URL is simply not set."
+        ),
+        "ai_gateway_provisioning": (
+            "LLM_BASE_URL/LLM_API_KEY are NOT provided unconditionally -- set app.yaml's "
+            "top-level ai: true and deploy() wires this app up to the shared, free-tier "
+            "LLM gateway (zorc-ai-gateway) automatically, no provisioning step needed "
+            "(unlike database: true, it's an existing shared service, not a new "
+            "resource created per app). Point any OpenAI-compatible SDK's base_url at "
+            "LLM_BASE_URL and call chat completions -- the gateway auto-picks a free "
+            "provider (currently Groq/Google AI Studio/OpenRouter) and fails over "
+            "between them if one is rate-limited or out of quota, so you never need to "
+            "handle a real provider key or think about which one to use. The `model` "
+            "field you send is ignored and substituted by the gateway itself; if you "
+            "need an exact model, the gateway also exposes each provider's direct "
+            "route (e.g. LLM_BASE_URL's host at /groq/v1 instead of /auto/v1) -- see "
+            "zorc-ai-gateway's own README for the full contract before relying on "
+            "that. Omit ai: true (or set it false) if your app has no AI/LLM need -- "
+            "nothing gets injected and LLM_BASE_URL is simply not set. Never hold a "
+            "real provider API key in your own app or call a provider SDK directly -- "
+            "that's exactly what this gateway exists to prevent."
         ),
         "env_vars_beyond_defaults": (
             "If your app needs any env var other than the three above (a JWT/session "
@@ -671,6 +706,7 @@ def analyze_deployment_requirements(
     framework: str,
     expected_concurrency: Literal["low", "medium", "high"],
     has_database: bool,
+    needs_ai: bool,
     has_background_jobs: bool,
     needs_websockets: bool,
     needs_persistent_storage: bool,
@@ -688,6 +724,21 @@ def analyze_deployment_requirements(
     it has a database/background jobs/websockets/needs persistent storage
     or a public IP, your own memory estimate, and the reasoning behind
     that estimate (checked for a real justification, not just non-empty).
+
+    needs_ai=True cross-checks against app.yaml's `ai:` flag (same
+    pattern as database) and, if the repo has ai: true declared, the
+    returned report includes llm_base_url and llm_api_key_env -- what
+    deploy() will actually inject into this app's environment, pointing
+    at the shared zorc-ai-gateway (AGENTS.md section 2). Point any
+    OpenAI-compatible SDK at llm_base_url and call chat completions --
+    the gateway auto-picks a free provider (Groq/Google/OpenRouter
+    currently) and fails over between them if one is unavailable; the
+    `model` you send is ignored/substituted by the gateway itself, so
+    don't plan around a specific model id unless you call a provider's
+    direct route instead of /auto (see zorc-ai-gateway's own README).
+    If needs_ai=True but app.yaml has no ai: true, this comes back as a
+    warning (not a block) telling you to add it -- deploy() won't inject
+    anything without the flag actually being set.
 
     architecture="frontend_backend_split" means this repo runs two
     independent processes (e.g. a separate SPA build and its own API
@@ -770,12 +821,28 @@ def analyze_deployment_requirements(
             return {"status": "rejected", "reason": f"app.yaml is malformed: {e}"}
         declared_env = parsed_app_yaml["env"]
         database_requested = parsed_app_yaml["database"]
+        ai_requested = parsed_app_yaml["ai"]
         env_requirements = {
             "generated_internally": sorted(k for k, spec in declared_env.items() if "generate" in spec),
             "required_from_caller": sorted(k for k, spec in declared_env.items() if "required" in spec),
         }
+        ai_gateway_info = None
+        if ai_requested:
+            ai_gateway_info = {
+                "llm_base_url": agent.AI_GATEWAY_INTERNAL_URL,
+                "note": "deploy() injects LLM_BASE_URL/LLM_API_KEY automatically -- point an OpenAI-compatible "
+                        "SDK at LLM_BASE_URL and call chat completions. The gateway auto-picks a free provider "
+                        "and fails over if one is unavailable; the model you send is ignored/substituted -- see "
+                        "zorc-ai-gateway's README for its direct per-provider routes if you need a specific model.",
+            }
 
         warnings = []
+        if needs_ai and not ai_requested:
+            warnings.append(
+                "you said needs_ai=True but app.yaml has no `ai: true` -- deploy() won't inject LLM_BASE_URL/"
+                "LLM_API_KEY without it. Add `ai: true` to app.yaml if this app actually needs the shared LLM "
+                "gateway, or you'll need to reach it manually."
+            )
         if frontend_rendering == "static" and classification["kind"] != "static":
             warnings.append(
                 f"you said frontend_rendering=\"static\" but the repo was detected as "
@@ -829,6 +896,8 @@ def analyze_deployment_requirements(
             "warnings": warnings,
             "env_requirements": env_requirements,
             "database_provisioned": database_requested,
+            "ai_provisioned": ai_requested,
+            **({"ai_gateway": ai_gateway_info} if ai_gateway_info else {}),
             "concurrency_adjusted_estimate_mb": adjusted_estimate_mb,
             "self_reported_mb": estimated_memory_mb,
             "reason": (
@@ -856,6 +925,8 @@ def analyze_deployment_requirements(
                 "warnings": warnings,
                 "env_requirements": env_requirements,
                 "database_provisioned": database_requested,
+                "ai_provisioned": ai_requested,
+                **({"ai_gateway": ai_gateway_info} if ai_gateway_info else {}),
                 "owner_current_total_mb": current_total_mb,
                 "owner_budget_mb": owner_cap_mb,
                 "reason": (
@@ -877,6 +948,8 @@ def analyze_deployment_requirements(
             "warnings": warnings,
             "env_requirements": env_requirements,
             "database_provisioned": database_requested,
+            "ai_provisioned": ai_requested,
+            **({"ai_gateway": ai_gateway_info} if ai_gateway_info else {}),
             "needs_gpu": needs_gpu,
             "reason": f"requirements are consistent, but nothing fits: {placement['reason']}",
         }
@@ -895,6 +968,8 @@ def analyze_deployment_requirements(
         "framework": framework,
         "env_requirements": env_requirements,
         "database_provisioned": database_requested,
+        "ai_provisioned": ai_requested,
+        **({"ai_gateway": ai_gateway_info} if ai_gateway_info else {}),
         "needs_gpu": needs_gpu,
         "status": "approved",
     }
@@ -1377,6 +1452,125 @@ def request_teardown(ctx: Context, name: str) -> dict:
     return outcome
 
 
+@mcp.tool()
+def request_memory_increase(ctx: Context, name: str, requested_memory_mb: int, reason: str) -> dict:
+    """Queues a memory increase request for an app you own (or any app,
+    if you're admin) -- does NOT change anything. Returns the request's
+    id; an ADMIN must separately call approve_action(id) to actually
+    apply it (see that tool's docstring). Use list_pending_actions() to
+    check a request's status.
+
+    requested_memory_mb must be a genuine increase over the app's
+    current memory_mb (registry.yaml) -- this tool only ever asks for
+    MORE, there is no decrease path here. reason must actually justify
+    the request (at least 10 characters, checked for a real
+    justification, not just a placeholder) -- the admin approving this
+    only sees what you write here, there's no other context passed
+    along.
+
+    Refuses up front (before ever queuing) if the increase would push
+    your total memory across every app you own, platform-wide, over your
+    owner_budgets soft cap (registry.yaml) -- same Phase 5 check
+    analyze_deployment_requirements() already does for a brand-new app,
+    applied here for an existing one. Admin callers are exempt. This is
+    advisory against your OWN budget, not the target node's actual
+    headroom -- that's checked for real, live, right before the increase
+    is actually applied (see approve_action() -> agent.resize_app_memory()),
+    since node headroom can change between a request and its approval.
+
+    Refuses a second pending request for the same app -- returns the
+    existing id instead of creating a duplicate. Rate-limited and
+    audited like every mutating tool here, even though this specific
+    call never resizes anything itself; the actual resize is entirely
+    inside approve_action()."""
+    caller = _caller_identity(ctx)
+    params = {"name": name, "requested_memory_mb": requested_memory_mb}
+
+    gate = _require_owner_or_admin(caller, name)
+    if not gate["ok"]:
+        _audit("request_memory_increase", params, gate, client=caller)
+        return gate
+
+    if not reason or len(reason.strip()) < 10:
+        outcome = {"status": "rejected",
+                   "reason": "reason must actually justify the request (at least 10 characters)"}
+        _audit("request_memory_increase", params, outcome, client=caller)
+        return outcome
+
+    reg = agent.load_registry()
+    app_entry = next((a for a in reg.get("apps", []) if a["name"] == name), None)
+    if app_entry is None:
+        outcome = {"status": "rejected", "reason": f"{name!r} is not a registered app"}
+        _audit("request_memory_increase", params, outcome, client=caller)
+        return outcome
+    current_memory_mb = app_entry["memory_mb"]
+
+    if requested_memory_mb <= current_memory_mb:
+        outcome = {"status": "rejected",
+                   "reason": f"requested_memory_mb ({requested_memory_mb}) must be greater than "
+                             f"{name!r}'s current memory_mb ({current_memory_mb}) -- this tool only "
+                             "queues an increase, there is no decrease path"}
+        _audit("request_memory_increase", params, outcome, client=caller)
+        return outcome
+
+    if caller.get("role") != "admin":
+        owner_name = caller.get("name")
+        delta = requested_memory_mb - current_memory_mb
+        current_total_mb = agent.owner_memory_total_mb(owner_name)
+        owner_cap_mb = agent.owner_budget_mb(owner_name)
+        projected_total_mb = current_total_mb + delta
+        if projected_total_mb > owner_cap_mb:
+            outcome = {
+                "status": "rejected",
+                "owner_current_total_mb": current_total_mb, "owner_budget_mb": owner_cap_mb,
+                "reason": (
+                    f"{owner_name!r}'s apps already total {current_total_mb}MB across the platform; this "
+                    f"+{delta}MB increase would bring that to {projected_total_mb}MB, over your "
+                    f"{owner_cap_mb}MB soft per-owner budget (registry.yaml's owner_budgets). Ask an admin "
+                    "to raise your override in registry.yaml if this app genuinely needs it."
+                ),
+            }
+            _audit("request_memory_increase", params, outcome, client=caller)
+            return outcome
+
+    now = time.time()
+    while (_memory_increase_request_timestamps
+           and now - _memory_increase_request_timestamps[0] > MEMORY_INCREASE_REQUEST_RATE_WINDOW_SEC):
+        _memory_increase_request_timestamps.popleft()
+    if len(_memory_increase_request_timestamps) >= MEMORY_INCREASE_REQUEST_RATE_LIMIT:
+        outcome = {"status": "rejected",
+                   "reason": f"rate limit: {MEMORY_INCREASE_REQUEST_RATE_LIMIT} memory increase requests per "
+                             f"{MEMORY_INCREASE_REQUEST_RATE_WINDOW_SEC}s exceeded"}
+        _audit("request_memory_increase", params, outcome, client=caller)
+        return outcome
+
+    actions = _load_pending_actions()
+    existing = next((a for a in actions.values()
+                      if a.get("name") == name and a.get("action") == "memory_increase"
+                      and a.get("status") == "pending"), None)
+    if existing:
+        outcome = {"status": "already_pending", "id": existing["id"], "name": name,
+                    "reason": f"a memory increase request for {name!r} is already pending "
+                              f"(id {existing['id']!r}, requested by {existing['requested_by']!r})"}
+        _audit("request_memory_increase", params, outcome, client=caller)
+        return outcome
+
+    action_id = secrets_module.token_hex(8)
+    actions[action_id] = {
+        "id": action_id, "action": "memory_increase", "name": name,
+        "requested_by": caller["name"], "requested_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "current_memory_mb": current_memory_mb, "requested_memory_mb": requested_memory_mb,
+        "reason": reason.strip(),
+        "status": "pending",
+    }
+    _save_pending_actions(actions)
+    _memory_increase_request_timestamps.append(now)
+    outcome = {"status": "requested", "id": action_id, "name": name,
+               "current_memory_mb": current_memory_mb, "requested_memory_mb": requested_memory_mb}
+    _audit("request_memory_increase", params, outcome, client=caller)
+    return outcome
+
+
 # ----------------------------------------------------- Phase 6.2: GPU services ----
 # rtx5090/jetson-thor/bitbots_gpu are NOT dedicated to zorc -- they're the
 # user's own personal machines, already running their own work; zorc only
@@ -1495,14 +1689,14 @@ def request_gpu_service(ctx: Context, owner_repo: str, name: str, report_id: str
 
 @mcp.tool()
 def list_pending_actions(ctx: Context) -> dict:
-    """Lists queued actions from request_teardown() and
-    request_gpu_service() -- admin sees every request; a client sees only
-    the ones they themselves requested (never another client's, even for
-    an app they own -- ownership of the APP doesn't imply visibility into
-    who else requested what against it). Read-only, not rate-limited or
-    audited. A gpu_service_deploy entry never contains env_overrides
-    values -- those are held in memory only, never written to this file
-    (see _pending_gpu_deploy_secrets)."""
+    """Lists queued actions from request_teardown(), request_gpu_service(),
+    and request_memory_increase() -- admin sees every request; a client
+    sees only the ones they themselves requested (never another client's,
+    even for an app they own -- ownership of the APP doesn't imply
+    visibility into who else requested what against it). Read-only, not
+    rate-limited or audited. A gpu_service_deploy entry never contains
+    env_overrides values -- those are held in memory only, never written
+    to this file (see _pending_gpu_deploy_secrets)."""
     caller = _caller_identity(ctx)
     actions = list(_load_pending_actions().values())
     if caller.get("role") != "admin":
@@ -1513,15 +1707,17 @@ def list_pending_actions(ctx: Context) -> dict:
 
 @mcp.tool()
 def approve_action(ctx: Context, id: str) -> dict:
-    """Executes a pending action queued by request_teardown() or
-    request_gpu_service() -- ADMIN ONLY, full stop, regardless of who
-    requested it or who owns the app. This is the ONE place either kind
-    of consequential change actually happens on this server: real
-    destruction (teardown) or a real deploy landing on one of the user's
-    own GPU machines (gpu_service_deploy) -- deploy()/redeploy()/restart()
-    only ever create or re-apply on servingz/hostinger-vps, immediately,
-    no approval gate. Refuses cleanly (never a stack trace) for a non-
-    admin caller, an unknown id, or an id that's already been resolved
+    """Executes a pending action queued by request_teardown(),
+    request_gpu_service(), or request_memory_increase() -- ADMIN ONLY,
+    full stop, regardless of who requested it or who owns the app. This
+    is the ONE place any of these three kinds of consequential change
+    actually happens on this server: real destruction (teardown), a real
+    deploy landing on one of the user's own GPU machines
+    (gpu_service_deploy), or a bigger memory allocation for an existing
+    app (memory_increase) -- deploy()/redeploy()/restart() only ever
+    create or re-apply on servingz/hostinger-vps, immediately, no
+    approval gate. Refuses cleanly (never a stack trace) for a non-admin
+    caller, an unknown id, or an id that's already been resolved
     (approved/rejected already) -- never silently no-ops or re-executes
     something twice.
 
@@ -1536,6 +1732,13 @@ def approve_action(ctx: Context, id: str) -> dict:
     request, they're gone (see _pending_gpu_deploy_secrets) and this
     fails cleanly asking for a resubmit, rather than deploying with
     silently-missing secrets.
+
+    memory_increase calls agent.resize_app_memory(name, requested_memory_mb)
+    -- re-checks live node headroom right here (things may have changed
+    since the request was queued), applies Coolify's new limit, updates
+    registry.yaml, and redeploys so it actually reaches the running
+    container (a bare limit change alone does not retroactively resize
+    an already-running one).
 
     Either way, a failure partway through is recorded on the queue entry
     as "failed" with the error, not silently dropped -- check
@@ -1570,7 +1773,7 @@ def approve_action(ctx: Context, id: str) -> dict:
                    "reason": f"action {id!r} is already {entry.get('status')!r}, not pending"}
         _audit("approve_action", params, outcome, client=caller)
         return outcome
-    if entry.get("action") not in ("teardown", "gpu_service_deploy"):
+    if entry.get("action") not in ("teardown", "gpu_service_deploy", "memory_increase"):
         outcome = {"status": "rejected", "reason": f"unknown action type {entry.get('action')!r}"}
         _audit("approve_action", params, outcome, client=caller)
         return outcome
@@ -1578,7 +1781,7 @@ def approve_action(ctx: Context, id: str) -> dict:
     try:
         if entry["action"] == "teardown":
             result = agent.delete_app(entry["name"])
-        else:  # gpu_service_deploy
+        elif entry["action"] == "gpu_service_deploy":
             env_overrides = None
             if entry.get("had_env_overrides"):
                 env_overrides = _pending_gpu_deploy_secrets.get(id)
@@ -1592,6 +1795,8 @@ def approve_action(ctx: Context, id: str) -> dict:
                                    target_node=entry["target_node"], memory_mb_override=entry.get("memory_mb_override"),
                                    env_overrides=env_overrides, needs_gpu=True)
             _pending_gpu_deploy_secrets.pop(id, None)
+        else:  # memory_increase
+            result = agent.resize_app_memory(entry["name"], entry["requested_memory_mb"])
         entry.update(status="approved_and_executed", approved_by=caller["name"],
                       approved_at=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), result=result)
         actions[id] = entry

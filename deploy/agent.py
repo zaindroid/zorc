@@ -75,6 +75,21 @@ COOLIFY_ENVIRONMENT_NAME = "production"
 COOLIFY_ENVIRONMENT_UUID = "bn4ub336dd38hhe59qq04xtg"
 PLATFORM_ROOT_DOMAIN = "zaindroid.me"
 
+# The shared LLM gateway (zorc-ai-gateway, AGENTS.md section 2's "LLM
+# gateway" row -- provisioned 2026-08-23). Reachable at a stable Coolify
+# custom_network_aliases entry, NOT its raw container name (which changes
+# on every redeploy of the gateway itself -- confirmed live, repeatedly).
+# ai: true in an app's app.yaml makes deploy() inject these two env vars,
+# the same way database: true injects DATABASE_URL -- see parse_app_yaml()
+# and deploy()'s needs_ai handling below.
+AI_GATEWAY_INTERNAL_URL = "http://ai-gateway-internal:8080/auto/v1"
+# The gateway ignores whatever Authorization header a caller sends and
+# always injects its own real, server-held provider key (see
+# zorc-ai-gateway's own README) -- there is no real per-app key. This
+# exists only because most OpenAI SDK clients refuse to construct with an
+# empty/missing api_key; the actual value is never checked by anything.
+AI_GATEWAY_DUMMY_API_KEY = "not-needed-zorc-ai-gateway-injects-the-real-key"
+
 CLOUDFLARE_TOKEN_PATH = SECRETS / "cloudflare.json"
 CLOUDFLARE_ACCOUNT_ID = "26aa85afc7a8d27691557c29f5bedbe1"
 CLOUDFLARE_ZONE_ID = "f2d0bfd7ab2567c81993e5afe6ef6624"
@@ -590,8 +605,8 @@ _ENV_GENERATE_STRATEGIES = {"hex": lambda: secrets.token_hex(32)}
 
 
 def parse_app_yaml(repo_dir: Path) -> dict:
-    """Reads app.yaml's optional `env:` section and `database:` flag, if
-    present. Format:
+    """Reads app.yaml's optional `env:` section and `database:`/`ai:` flags,
+    if present. Format:
 
         database: true          # provisions a dedicated Postgres instance
                                  # for this app -- zorc creates it, creates
@@ -600,6 +615,21 @@ def parse_app_yaml(repo_dir: Path) -> dict:
                                  # provision_dedicated_postgres()). The
                                  # instance's own superuser credentials are
                                  # never exposed to the app or the caller.
+        ai: true                 # wires this app up to the shared LLM
+                                 # gateway (AGENTS.md section 2) -- no new
+                                 # resource gets created (unlike database:
+                                 # true), it's an existing shared service,
+                                 # so this just injects LLM_BASE_URL (and a
+                                 # dummy LLM_API_KEY, see
+                                 # AI_GATEWAY_DUMMY_API_KEY's comment) into
+                                 # the app's env. Point any OpenAI SDK at
+                                 # LLM_BASE_URL and call POST .../chat/
+                                 # completions -- the gateway auto-picks a
+                                 # free provider (Groq/Google/OpenRouter,
+                                 # currently) and fails over between them,
+                                 # see zorc-ai-gateway's own README for the
+                                 # full contract (model gets substituted by
+                                 # the gateway, not the caller).
         env:
           JWT_SECRET:
             generate: hex        # zorc generates a random value itself,
@@ -619,7 +649,7 @@ def parse_app_yaml(repo_dir: Path) -> dict:
     true is what actually makes that promise real."""
     app_yaml_path = repo_dir / "app.yaml"
     if not app_yaml_path.exists():
-        return {"env": {}, "database": False}
+        return {"env": {}, "database": False, "ai": False, "persistent_storage": None}
     try:
         parsed = yaml.safe_load(app_yaml_path.read_text()) or {}
     except yaml.YAMLError as e:
@@ -638,13 +668,16 @@ def parse_app_yaml(repo_dir: Path) -> dict:
     database = parsed.get("database", False)
     if not isinstance(database, bool):
         raise ValueError(f"app.yaml database must be true or false, got {database!r}")
+    ai = parsed.get("ai", False)
+    if not isinstance(ai, bool):
+        raise ValueError(f"app.yaml ai must be true or false, got {ai!r}")
     persistent_storage = parsed.get("persistent_storage")
     if persistent_storage is not None:
         if not isinstance(persistent_storage, dict) or "mount_path" not in persistent_storage:
             raise ValueError(
                 f"app.yaml persistent_storage must be {{mount_path: /some/path}}, got {persistent_storage!r}"
             )
-    return {"env": env, "database": database, "persistent_storage": persistent_storage}
+    return {"env": env, "database": database, "ai": ai, "persistent_storage": persistent_storage}
 
 
 def resolve_env_vars(repo_dir: Path, env_overrides: dict[str, str] | None) -> tuple[dict[str, str], list[str]]:
@@ -1203,7 +1236,7 @@ def _zorc_agent_rollback(tailscale_ip: str, ssh_key: Path, user: str, container_
 
 
 def register_app(*, name: str, memory_mb: int, subdomain: str, repo: str, owner: str, target: str = "servingz",
-                  database: bool = False, redis: bool = False, critical: bool = False) -> None:
+                  database: bool = False, redis: bool = False, ai: bool = False, critical: bool = False) -> None:
     """Appends a new entry to registry.yaml and commits it — mirrors what a
     human did by hand for hello-app. target must be "pages" for static
     sites (memory_mb: 0) or a real node name from registry.yaml's `nodes`
@@ -1230,6 +1263,7 @@ def register_app(*, name: str, memory_mb: int, subdomain: str, repo: str, owner:
     subdomain: {subdomain}
     database: {"true" if database else "null"}
     redis_db: null
+    ai: {"true" if ai else "null"}
     storage_prefix: null
     repo: "{repo}"
     owner: "{owner}"
@@ -1318,7 +1352,7 @@ def git_commit_and_push(message: str) -> None:
 
 def _deploy_zorc_agent(*, step, log: list, node: dict, target_node: str, name: str, owner_repo: str, owner: str,
                         repo_dir: Path, classification: dict, memory_mb: int, env_vars_to_set: dict[str, str],
-                        needs_gpu: bool, needs_database: bool, postgres_container_name: str | None,
+                        needs_gpu: bool, needs_database: bool, needs_ai: bool, postgres_container_name: str | None,
                         domain: str, volumes: list[str] | None = None) -> dict:
     """The zorc-agent equivalent of deploy()'s Coolify branch below --
     everything from here down runs entirely over SSH against a non-root
@@ -1359,7 +1393,8 @@ def _deploy_zorc_agent(*, step, log: list, node: dict, target_node: str, name: s
         step("add_tunnel_route", add_tunnel_route, domain, service=service_url)
 
         step("register_app", register_app, name=name, memory_mb=memory_mb, subdomain=name,
-             repo=f"github.com/{owner_repo}", owner=owner, target=target_node, database=needs_database)
+             repo=f"github.com/{owner_repo}", owner=owner, target=target_node, database=needs_database,
+             ai=needs_ai)
         step("record_resource", record_resource, name, kind="zorc-agent", container_name=name,
              postgres_container_name=postgres_container_name, node=target_node)
         step("commit_and_push", git_commit_and_push, f"registry: add {name} (deployed via zorc-agent)")
@@ -1503,6 +1538,10 @@ def deploy(*, owner_repo: str, name: str, owner: str, git_branch: str = "main", 
     # the static budget check would pass on a number the deploy would then
     # exceed once provision_dedicated_postgres() actually runs.
     needs_database = classification["kind"] != "static" and parse_app_yaml(repo_dir).get("database", False)
+    # No new resource gets created for this one (unlike needs_database) --
+    # the LLM gateway already exists, this just injects env vars pointing
+    # at it, so it's not folded into memory_mb below either.
+    needs_ai = classification["kind"] != "static" and parse_app_yaml(repo_dir).get("ai", False)
     # Coolify-only today (zorc-agent has no app that needs this yet) -- see
     # add_coolify_persistent_storage(). {mount_path: "/opt/data"} in app.yaml.
     persistent_storage = parse_app_yaml(repo_dir).get("persistent_storage") if classification["kind"] != "static" else None
@@ -1549,6 +1588,10 @@ def deploy(*, owner_repo: str, name: str, owner: str, git_branch: str = "main", 
         postgres_uuid, database_url = step("provision_database", provision_dedicated_postgres, name, target_node)
         env_vars_to_set["DATABASE_URL"] = database_url
 
+    if needs_ai:
+        env_vars_to_set["LLM_BASE_URL"] = AI_GATEWAY_INTERNAL_URL
+        env_vars_to_set["LLM_API_KEY"] = AI_GATEWAY_DUMMY_API_KEY
+
     # Live re-check immediately before creating anything -- catches drift
     # from something already eating memory on the target node right now,
     # which the static budget_headroom_mb() check above can't see (it only
@@ -1569,7 +1612,7 @@ def deploy(*, owner_repo: str, name: str, owner: str, git_branch: str = "main", 
             step=step, log=log, node=node, target_node=target_node, name=name, owner_repo=owner_repo,
             owner=owner, repo_dir=repo_dir, classification=classification, memory_mb=memory_mb,
             env_vars_to_set=env_vars_to_set, needs_gpu=needs_gpu, needs_database=needs_database,
-            postgres_container_name=postgres_uuid, domain=domain, volumes=volumes,
+            needs_ai=needs_ai, postgres_container_name=postgres_uuid, domain=domain, volumes=volumes,
         )
 
     coolify_result = step(
@@ -1607,7 +1650,8 @@ def deploy(*, owner_repo: str, name: str, owner: str, git_branch: str = "main", 
             step("add_tunnel_route", add_tunnel_route, domain)
 
         step("register_app", register_app, name=name, memory_mb=memory_mb, subdomain=name,
-             repo=f"github.com/{owner_repo}", owner=owner, target=target_node, database=needs_database)
+             repo=f"github.com/{owner_repo}", owner=owner, target=target_node, database=needs_database,
+             ai=needs_ai)
         step("record_resource", record_resource, name, kind="coolify", coolify_uuid=coolify_result.get("uuid"),
              coolify_postgres_uuid=postgres_uuid)
         step("commit_and_push", git_commit_and_push, f"registry: add {name} (deployed via deploy agent)")
@@ -2190,6 +2234,81 @@ def redeploy(name: str) -> dict:
         raise ValueError(f"{name!r} has no recorded coolify_uuid in resource_map.json -- cannot redeploy")
     trigger_coolify_deploy(coolify_uuid)
     return {"redeployed": name, "kind": kind, "coolify_uuid": coolify_uuid}
+
+
+def resize_app_memory(name: str, new_memory_mb: int) -> dict:
+    """Applies a new memory_mb limit to an EXISTING, already-registered
+    app -- updates Coolify's declared limit, updates registry.yaml, and
+    triggers a redeploy so the change actually reaches the running
+    container. Confirmed live (zbots/zbots-dev's own memory bumps, done
+    by hand before this function existed): PATCH limits_memory alone does
+    NOT retroactively resize an already-running container -- Coolify,
+    like Docker, only applies it on (re)creation, same rule as env vars
+    and persistent storage.
+
+    Single-container Coolify applications only (kind "coolify" in
+    resource_map.json), same scope as redeploy() above and for the same
+    reason -- no zorc-agent app has needed a resize yet, and doing this
+    over SSH/docker directly would be a genuinely separate implementation,
+    not attempted here rather than guessed at.
+
+    Refuses (ValueError, never silently no-ops) if the app isn't
+    registered, isn't a Coolify app, or if the increase wouldn't actually
+    fit -- checks live_headroom_mb() on the app's own target node right
+    before applying, the same live-recheck deploy() itself does right
+    before creating a new app, so this can't silently overcommit a node
+    that got busier since whoever approved the request last looked."""
+    if not name_taken(name):
+        raise ValueError(f"{name!r} is not a registered app -- nothing to resize")
+    mapped = _load_resource_map().get(name, {})
+    kind = mapped.get("kind")
+    if kind != "coolify":
+        raise ValueError(
+            f"{name!r} is a {kind!r} app -- resize_app_memory() only supports single-container "
+            "Coolify apps (kind 'coolify') right now"
+        )
+    coolify_uuid = mapped.get("coolify_uuid")
+    if not coolify_uuid:
+        raise ValueError(f"{name!r} has no recorded coolify_uuid in resource_map.json -- cannot resize")
+
+    reg = load_registry()
+    app_entry = next((a for a in reg.get("apps", []) if a["name"] == name), None)
+    if app_entry is None:
+        raise ValueError(f"{name!r} has a resource_map.json entry but no registry.yaml entry -- inconsistent state")
+    old_memory_mb = app_entry["memory_mb"]
+    target_node = app_entry["target"]
+
+    delta = new_memory_mb - old_memory_mb
+    if delta > 0:
+        live = live_headroom_mb(target_node)
+        if delta > live:
+            raise RuntimeError(
+                f"{name!r} wants +{delta}MB (from {old_memory_mb}MB to {new_memory_mb}MB) but only "
+                f"{live:.0f}MB is actually free on {target_node!r} right now"
+            )
+
+    with httpx.Client(timeout=30) as client:
+        r = client.patch(f"{COOLIFY_URL}/applications/{coolify_uuid}",
+                          headers=_coolify_headers(), json={"limits_memory": f"{new_memory_mb}m"})
+        r.raise_for_status()
+
+    text = REGISTRY_PATH.read_text()
+    pattern = re.compile(
+        r"(- name: " + re.escape(name) + r"\n    target: \S+\n    memory_mb: )" + str(old_memory_mb) + r"\b"
+    )
+    new_text, n = pattern.subn(r"\g<1>" + str(new_memory_mb), text, count=1)
+    if n != 1:
+        raise RuntimeError(
+            f"could not find {name!r}'s memory_mb: {old_memory_mb} line in registry.yaml in the expected "
+            "shape -- refusing to guess at a blind replace; the Coolify limit was already updated above, "
+            "so registry.yaml needs a manual fix to match"
+        )
+    REGISTRY_PATH.write_text(new_text)
+
+    trigger_coolify_deploy(coolify_uuid)
+
+    return {"resized": name, "old_memory_mb": old_memory_mb, "new_memory_mb": new_memory_mb,
+            "target_node": target_node, "coolify_uuid": coolify_uuid}
 
 
 def remove_registry_entry(name: str) -> None:
