@@ -185,6 +185,18 @@ infrastructure:
 # Applications. Add new entries at the end. Keep alphabetical within groups.
 # ---------------------------------------------------------------------------
 apps:
+  - name: zbots-dev
+    target: servingz
+    memory_mb: 384
+    subdomain: zbots-dev
+    database: null
+    redis_db: null
+    storage_prefix: null
+    repo: "github.com/meanmachines/zbots"
+    owner: "zbots"
+    critical: false
+    depends_on: []
+
   - name: zbots
     target: servingz
     memory_mb: 384
