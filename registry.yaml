@@ -217,7 +217,7 @@ apps:
 
   - name: zbots-dev
     target: servingz
-    memory_mb: 384
+    memory_mb: 1024
     subdomain: zbots-dev
     database: null
     redis_db: null
