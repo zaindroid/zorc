@@ -302,6 +302,91 @@ def list_nodes() -> list[dict]:
 
 
 @mcp.tool()
+def gpu_fleet_status() -> dict:
+    """Phase 6.1: live per-accelerator view across the whole fleet --
+    utilization%, VRAM used/total/free, temperature -- for every node
+    that self-reports having a GPU. Read-only, unscoped by owner (this is
+    platform hardware status, not app data, same as list_nodes()).
+
+    Deliberately generic, not hardcoded to today's three GPU nodes
+    (rtx5090/jetson-thor/bitbots_gpu): this loops every node in
+    registry.yaml and includes any whose live telemetry (nodes/<name>.yaml,
+    refreshed by zorc-watchdog) reports an `accelerator` block, then
+    queries it live over nvidia-smi -- LOCAL (a subprocess) for whichever
+    node this process is actually running on, over SSH (the node's own
+    ssh_key/ssh_user for a zorc-agent node, or the shared
+    REMOTE_DEPLOY_KEY for a coolify node) for every other one. Adding a
+    new GPU node to registry.yaml needs NO new code here -- it shows up
+    automatically the moment its own watchdog cycle reports an
+    accelerator. Also deliberately NOT branching on accelerator "type"
+    (cuda vs tegra): confirmed live that jetson-thor's modern JetPack ships
+    a working nvidia-smi shim too, so the identical query works for every
+    accelerator type seen on this fleet so far -- if a genuinely different
+    accelerator (no nvidia-smi at all) joins later, it'll show up here
+    with live=false and a note, not a crash or a silent wrong number.
+
+    "busy" is a simple heuristic (utilization >5% OR >10% of VRAM used) --
+    read the raw numbers if you need precision, don't treat it as
+    authoritative. queue_depth is NOT included: there is no job queue on
+    this platform yet (that's Phase 6.2, which doesn't exist -- see the
+    top-level note in the response)."""
+    reg = agent.load_registry()
+    fleet = []
+    for node_name, node_cfg in reg.get("nodes", {}).items():
+        telemetry = _load_node_telemetry(node_name)
+        accel = telemetry.get("accelerator")
+        if not accel or not accel.get("name"):
+            continue  # no accelerator reported for this node -- not part of the GPU fleet
+
+        if node_name == agent.LOCAL_NODE:
+            live_cards = agent._nvidia_smi_query_local()
+        elif node_cfg.get("tailscale_ip") and node_cfg.get("backend") == "zorc-agent":
+            live_cards = agent._nvidia_smi_query_remote(
+                node_cfg["tailscale_ip"], agent.ZORC_DIR / node_cfg["ssh_key"], node_cfg.get("ssh_user", "root")
+            )
+        elif node_cfg.get("tailscale_ip"):
+            # A backend: coolify node with an accelerator, other than
+            # LOCAL_NODE -- none exist today (servingz's own legacy Quadro
+            # is the only coolify+accelerator case, and that's LOCAL_NODE,
+            # handled above), but a future one needs no new code, just
+            # the same REMOTE_DEPLOY_KEY every other coolify-node live
+            # check already uses (see live_headroom_mb/remote_node_probe).
+            live_cards = agent._nvidia_smi_query_remote(node_cfg["tailscale_ip"], agent.REMOTE_DEPLOY_KEY, "root")
+        else:
+            live_cards = None
+
+        node_entry = {
+            "node": node_name,
+            "reported_accelerator": {"type": accel.get("type"), "name": accel.get("name"),
+                                      "vram_mb": accel.get("vram_mb"), "count": accel.get("count")},
+            "live": live_cards is not None,
+        }
+        if live_cards:
+            total_util = round(sum(c["utilization_pct"] for c in live_cards) / len(live_cards), 1)
+            total_used_mb = sum(c["mem_used_mb"] for c in live_cards)
+            total_vram_mb = sum(c["mem_total_mb"] for c in live_cards)
+            node_entry.update({
+                "cards": live_cards,
+                "avg_utilization_pct": total_util,
+                "mem_used_mb": total_used_mb,
+                "mem_total_mb": total_vram_mb,
+                "mem_free_mb": total_vram_mb - total_used_mb,
+                "busy": total_util > 5 or (total_vram_mb > 0 and total_used_mb / total_vram_mb > 0.1),
+            })
+        else:
+            node_entry["note"] = ("no live GPU telemetry right now -- node may be unreachable, or nvidia-smi "
+                                   "isn't present/working there")
+        fleet.append(node_entry)
+
+    return {
+        "fleet": fleet,
+        "note": ("queue_depth isn't included -- there is no job queue on this platform yet (Phase 6.2, not "
+                 "built). 'busy' per node is a simple heuristic (utilization >5% or >10% of VRAM used), not "
+                 "authoritative -- read cards/avg_utilization_pct/mem_used_mb directly for precision."),
+    }
+
+
+@mcp.tool()
 def propose_node(hostname: str) -> dict:
     """Read-only capability report for a node that is NOT yet part of this
     platform -- reachability, hardware (arch/cpu/ram/power/accelerator,

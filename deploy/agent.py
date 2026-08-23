@@ -1717,6 +1717,74 @@ def _docker_stats_remote(tailscale_ip: str, ssh_key: Path, user: str) -> list[di
     return result
 
 
+_NVIDIA_SMI_QUERY_ARGS = [
+    "--query-gpu=index,name,temperature.gpu,utilization.gpu,memory.used,memory.total",
+    "--format=csv,noheader,nounits",
+]
+
+
+def _parse_nvidia_smi_csv(out: str) -> list[dict] | None:
+    """Shared by the local and remote query below -- one row per physical
+    card (a multi-GPU box like bitbots_gpu's dual 3090s prints two lines).
+    Returns None on anything unparseable rather than a partial/best-effort
+    list -- fail closed, same principle as everywhere else this codebase
+    parses an external command's output."""
+    if not out.strip():
+        return None
+    try:
+        cards = []
+        for line in out.strip().splitlines():
+            idx, name, temp, util, mem_used, mem_total = [x.strip() for x in line.split(",")]
+            cards.append({
+                "index": int(idx), "name": name, "temp_c": int(temp),
+                "utilization_pct": int(util), "mem_used_mb": int(mem_used), "mem_total_mb": int(mem_total),
+            })
+        return cards
+    except ValueError:
+        return None
+
+
+def _nvidia_smi_query_local() -> list[dict] | None:
+    """Live per-GPU temp/utilization/memory on THIS host (servingz) --
+    None if nvidia-smi isn't present or fails, never an exception. Same
+    query monitoring/checks.py's gpu_temp() health check already uses,
+    intentionally -- one place that defines what "live GPU telemetry"
+    means, not two definitions that could drift apart."""
+    try:
+        result = subprocess.run(["nvidia-smi", *_NVIDIA_SMI_QUERY_ARGS],
+                                 capture_output=True, text=True, timeout=15)
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        return None
+    if result.returncode != 0:
+        return None
+    return _parse_nvidia_smi_csv(result.stdout)
+
+
+def _nvidia_smi_query_remote(tailscale_ip: str, ssh_key: Path, user: str) -> list[dict] | None:
+    """Same as _nvidia_smi_query_local() but over SSH, for any OTHER node
+    -- deliberately generic over accelerator "type" (registry.yaml/
+    nodes/<name>.yaml label it "cuda" for a desktop/server GPU or "tegra"
+    for a Jetson-style SoC): confirmed live that jetson-thor ships a
+    working nvidia-smi shim too (JetPack 5+, unified-memory architecture),
+    so the SAME query works there as on a discrete-GPU box. This function
+    never branches on node name or accelerator type -- it just tries the
+    command and reports what it gets, which is what makes
+    gpu_fleet_status() (mcp_server.py) generic over the whole fleet: a
+    brand-new GPU node added to registry.yaml needs no new code here, only
+    a registry entry and a working nvidia-smi on the box itself. Returns
+    None (not an exception) for an unreachable node, a missing nvidia-smi,
+    or unparseable output -- callers report that as "no live data right
+    now" for this node, not a crash for the whole fleet status."""
+    try:
+        code, out, _ = _ssh_run(tailscale_ip, ssh_key, ["nvidia-smi", *_NVIDIA_SMI_QUERY_ARGS],
+                                 user=user, timeout=15)
+    except subprocess.TimeoutExpired:
+        return None
+    if code != 0:
+        return None
+    return _parse_nvidia_smi_csv(out)
+
+
 def _host_memory_mb() -> tuple[float, float]:
     """(total, available) in MB. MemAvailable (not MemFree) is the real
     "could still be used" number -- it already accounts for reclaimable
