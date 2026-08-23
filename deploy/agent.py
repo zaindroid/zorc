@@ -468,6 +468,32 @@ def name_taken(name: str) -> bool:
     return any(a["name"] == name for a in reg.get("apps", []))
 
 
+def owner_memory_total_mb(owner: str) -> int:
+    """Sum of memory_mb across every app this owner currently has
+    registered, PLATFORM-WIDE (every node, not just one) -- the number
+    Phase 5's soft per-owner budget check (see mcp_server.py's
+    analyze_deployment_requirements) compares against owner_budget_mb().
+    Deliberately different from budget_headroom_mb() above, which is
+    per-NODE and counts every app regardless of owner -- this is
+    per-OWNER and counts every node regardless of target."""
+    reg = load_registry()
+    return sum(a.get("memory_mb", 0) for a in reg.get("apps", []) if a.get("owner") == owner)
+
+
+def owner_budget_mb(owner: str) -> int:
+    """This owner's soft memory cap, platform-wide -- registry.yaml's
+    owner_budgets.overrides[owner] if set to a real number, else
+    owner_budgets.default_mb. Purely a registry.yaml lookup -- doesn't
+    know or care about roles; the caller decides separately whether an
+    admin is exempt from this check entirely (see
+    analyze_deployment_requirements(), which is)."""
+    reg = load_registry()
+    budgets = reg.get("owner_budgets") or {}
+    overrides = budgets.get("overrides") or {}
+    override = overrides.get(owner)
+    return override if override is not None else budgets.get("default_mb", 8192)
+
+
 def clone_repo(owner_repo: str, git_branch: str = "main") -> Path:
     """owner_repo like 'zaindroid/hello-app'. Uses gh CLI (already
     authenticated on this host) so it works for private repos too, not

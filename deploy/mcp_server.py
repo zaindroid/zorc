@@ -541,6 +541,7 @@ def _estimate_memory_from_repo(repo_dir, classification: dict) -> tuple[int, lis
 
 @mcp.tool()
 def analyze_deployment_requirements(
+    ctx: Context,
     owner_repo: str,
     architecture: Literal["single_service", "frontend_backend_split"],
     app_kind: Literal["static", "api", "full_stack_web", "background_worker", "realtime", "other"],
@@ -599,7 +600,17 @@ def analyze_deployment_requirements(
     justify the difference. If it's within a reasonable band, status is
     "approved" and you get a report_id valid for 1 hour -- pass that to
     deploy(), which uses this report's recommended_memory_mb and
-    recommended_node, not whatever you originally guessed."""
+    recommended_node, not whatever you originally guessed.
+
+    Phase 5: also checked against your own soft, platform-wide memory
+    budget (registry.yaml's owner_budgets) -- if this app's estimate would
+    push your existing apps' total over your cap, status is "blocked"
+    here too, same as a repo/estimate mismatch. Admin callers are exempt
+    entirely. This is advisory, not a hard infrastructure limit -- ask an
+    admin to raise your override in registry.yaml if a real need
+    outgrows it."""
+    caller = _caller_identity(ctx)
+
     if architecture == "frontend_backend_split":
         return {
             "status": "needs_split",
@@ -709,6 +720,31 @@ def analyze_deployment_requirements(
                   f"explain specifically why in reasoning and call this again."
             ),
         }
+
+    if caller.get("role") != "admin":
+        owner_name = caller.get("name")
+        current_total_mb = agent.owner_memory_total_mb(owner_name)
+        owner_cap_mb = agent.owner_budget_mb(owner_name)
+        projected_total_mb = current_total_mb + adjusted_estimate_mb
+        if projected_total_mb > owner_cap_mb:
+            return {
+                "status": "blocked",
+                "repo_kind": classification["kind"], "repo_language": classification["language"],
+                "concurrency_adjusted_estimate_mb": adjusted_estimate_mb,
+                "warnings": warnings,
+                "env_requirements": env_requirements,
+                "database_provisioned": database_requested,
+                "owner_current_total_mb": current_total_mb,
+                "owner_budget_mb": owner_cap_mb,
+                "reason": (
+                    f"{owner_name!r}'s apps already total {current_total_mb}MB across the platform; adding "
+                    f"this app's {adjusted_estimate_mb}MB would bring that to {projected_total_mb}MB, over "
+                    f"your {owner_cap_mb}MB soft per-owner budget (registry.yaml's owner_budgets). This is "
+                    f"separate from node budget -- there may be plenty of room on the target node, this is "
+                    f"specifically about how much YOU own platform-wide. Ask an admin to raise your override "
+                    f"in registry.yaml if this app genuinely needs it."
+                ),
+            }
 
     placement = _recommend_placement(adjusted_estimate_mb, needs_public_ip, needs_gpu=needs_gpu)
     if not placement["fits"]:
