@@ -1,0 +1,25 @@
+[Unit]
+Description=zorc MCP server -- guarded deploy-agent access for external coding agents (localhost only, reached via Cloudflare Tunnel)
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/home/zman/zorc/monitoring/.venv/bin/uvicorn mcp_server:app --host 127.0.0.1 --port 8081 --app-dir /home/zman/zorc/deploy
+WorkingDirectory=/home/zman/zorc/deploy
+User=zman
+Restart=always
+RestartSec=5
+TimeoutStopSec=10
+
+# Same hardening as zorc-status-server.service -- this process needs the
+# same real write access (registry.yaml, cloudflared/config.yml, git
+# commits, /etc/cloudflared via sudo, scratch dirs for clones under /tmp)
+# since it imports the exact same agent.py.
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/home/zman/zorc /etc/cloudflared
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target
