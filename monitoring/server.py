@@ -157,6 +157,20 @@ def api_resources():
 
 @app.get("/api/approvals")
 def list_approvals():
+    """Real bug found live: this used to do one unguarded raise_for_status()
+    per app inside the loop -- a SINGLE repo's GitHub API call failing
+    (confirmed live: the 'meanmachines' org rejects fine-grained PATs with
+    a lifetime over 366 days, 403ing every call for zbots/zbots-dev
+    specifically, while zaindroid/* repos on the same token worked fine)
+    took the whole endpoint down with an unhandled 500, hiding every OTHER
+    app's pending approvals too -- the frontend's fetch() then fails
+    entirely (see /approvals's load(), "Can't reach the approvals
+    service"). Fix: isolate failures per-app (and per-issue, for the
+    second API call) -- one repo's problem no longer blocks the rest. The
+    return type stays a plain list (the frontend does items.length/.map on
+    it directly), so a failure is logged server-side and that app's
+    approvals are simply omitted this cycle, not surfaced as an error
+    entry in the array."""
     headers = {
         "Authorization": f"Bearer {github_token()}",
         "Accept": "application/vnd.github+json",
@@ -164,25 +178,35 @@ def list_approvals():
     out = []
     with httpx.Client(timeout=10) as client:
         for a in apps_with_repos():
-            r = client.get(
-                f"https://api.github.com/repos/{a['repo']}/issues",
-                headers=headers,
-                params={"state": "open"},
-            )
-            r.raise_for_status()
-            for issue in r.json():
+            try:
+                r = client.get(
+                    f"https://api.github.com/repos/{a['repo']}/issues",
+                    headers=headers,
+                    params={"state": "open"},
+                )
+                r.raise_for_status()
+                issues = r.json()
+            except httpx.HTTPError as e:
+                print(f"[approvals] skipping {a['name']!r} ({a['repo']}): {e}", flush=True)
+                continue
+
+            for issue in issues:
                 if not issue["title"].startswith("Approve production deploy"):
                     continue
                 # manual-approval@v1 posts the custom issue-body as the
                 # FIRST COMMENT, not the issue body itself — the issue body
                 # is always its own fixed "pending manual review" template.
-                cr = client.get(
-                    issue["comments_url"],
-                    headers=headers,
-                    params={"per_page": 1},
-                )
-                cr.raise_for_status()
-                comments = cr.json()
+                try:
+                    cr = client.get(
+                        issue["comments_url"],
+                        headers=headers,
+                        params={"per_page": 1},
+                    )
+                    cr.raise_for_status()
+                    comments = cr.json()
+                except httpx.HTTPError as e:
+                    print(f"[approvals] skipping issue #{issue['number']} on {a['repo']}: {e}", flush=True)
+                    continue
                 review_text = comments[0]["body"] if comments else ""
                 fields = dict(FIELD_RE.findall(review_text))
                 out.append({
