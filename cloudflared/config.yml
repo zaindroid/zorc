@@ -61,4 +61,8 @@ ingress:
   service: https://localhost:443
   originRequest:
     noTLSVerify: true
+- hostname: ai-test-app-5.zaindroid.me
+  service: https://localhost:443
+  originRequest:
+    noTLSVerify: true
 - service: http_status:404
