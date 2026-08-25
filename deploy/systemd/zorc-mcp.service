@@ -3,6 +3,7 @@ Description=zorc MCP server -- guarded deploy-agent access for external coding a
 After=network.target
 
 [Service]
+Environment=ZORC_MCP_RATE_LIMITS_DISABLED=1
 Type=simple
 ExecStart=/home/zman/zorc/monitoring/.venv/bin/uvicorn mcp_server:app --host 127.0.0.1 --port 8081 --app-dir /home/zman/zorc/deploy
 WorkingDirectory=/home/zman/zorc/deploy
