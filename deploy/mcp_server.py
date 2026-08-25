@@ -105,6 +105,10 @@ RESTART_RATE_LIMIT = 10
 RESTART_RATE_WINDOW_SEC = 3600
 _restart_timestamps: deque[float] = deque()
 
+SET_ENV_RATE_LIMIT = 10
+SET_ENV_RATE_WINDOW_SEC = 3600
+_set_env_timestamps: deque[float] = deque()
+
 # Phase 4b: request_teardown() only ever queues -- own generous limit, it's
 # not destructive. approve_action() is where actual deletion happens, so
 # it gets the tightest budget on this server, tighter than redeploy's even
@@ -1374,6 +1378,62 @@ def restart(ctx: Context, name: str) -> dict:
         # dangling exception for the caller.
         outcome = {"status": "failed", "reason": str(e)}
         _audit("restart", params, outcome, client=caller)
+        return outcome
+
+
+@mcp.tool()
+def set_app_env_vars(ctx: Context, name: str, env_vars: dict[str, str]) -> dict:
+    """Sets or updates one or more env vars on an app you own (or any
+    app, if you're admin), then redeploys so the change actually reaches
+    the running container -- previously there was no way to do this at
+    all: deploy() only ever creates a new app, redeploy()/restart() reuse
+    whatever env vars Coolify already has, unchanged. Not restricted to
+    keys app.yaml declares -- this is an operational tool (rotate a
+    leaked key, add one the original app.yaml missed), not a re-run of
+    deploy()'s own declared-env resolution.
+
+    Same trust tier as redeploy()/restart(), not the request-and-approve
+    queue: owner-or-admin, immediate, no human-in-the-loop gate -- an
+    owner can already redeploy/restart their own app right now without
+    approval, and this changes strictly less than a full redeploy does.
+    Values are never logged -- only which keys were touched, same
+    convention as deploy()'s env_overrides_keys."""
+    caller = _caller_identity(ctx)
+    params = {"name": name, "keys": sorted((env_vars or {}).keys())}
+
+    gate = _require_owner_or_admin(caller, name)
+    if not gate["ok"]:
+        _audit("set_app_env_vars", params, gate, client=caller)
+        return gate
+
+    if not env_vars:
+        outcome = {"status": "rejected", "reason": "env_vars must not be empty"}
+        _audit("set_app_env_vars", params, outcome, client=caller)
+        return outcome
+
+    now = time.time()
+    while _set_env_timestamps and now - _set_env_timestamps[0] > SET_ENV_RATE_WINDOW_SEC:
+        _set_env_timestamps.popleft()
+    if len(_set_env_timestamps) >= SET_ENV_RATE_LIMIT:
+        outcome = {"status": "rejected",
+                   "reason": f"rate limit: {SET_ENV_RATE_LIMIT} env var updates per "
+                             f"{SET_ENV_RATE_WINDOW_SEC}s exceeded"}
+        _audit("set_app_env_vars", params, outcome, client=caller)
+        return outcome
+
+    try:
+        result = agent.set_app_env_vars(name, env_vars)
+        _set_env_timestamps.append(now)
+        outcome = {"status": "updated", "keys": result["keys"]}
+        _audit("set_app_env_vars", params, outcome, client=caller)
+        return outcome
+    except ValueError as e:
+        outcome = {"status": "rejected", "reason": str(e)}
+        _audit("set_app_env_vars", params, outcome, client=caller)
+        return outcome
+    except Exception as e:
+        outcome = {"status": "failed", "reason": str(e)}
+        _audit("set_app_env_vars", params, outcome, client=caller)
         return outcome
 
 

@@ -928,17 +928,34 @@ def create_coolify_app(*, name: str, git_repository: str, git_branch: str,
 
 def set_coolify_env_vars(coolify_uuid: str, vars_to_set: dict[str, str]) -> None:
     """Pushes each {key: value} to Coolify as a runtime env var on the
-    given application. Called after create_coolify_app (instant_deploy=
-    False) and before trigger_coolify_deploy, so the container's first
-    real start already has everything it needs."""
+    given application -- upserts: creates the var if the key doesn't
+    exist yet, updates it in place if it does. Real bug, found live: a
+    key that already exists gets a 409 from Coolify on POST ("use PATCH
+    to update it") -- silent no-op risk if that error had ever gone
+    unchecked. Coolify keeps a separate preview-environment copy of every
+    var; POST creates both copies from one call, but PATCH only touches
+    the one is_preview value in the request, so an update has to PATCH
+    both explicitly or they drift out of sync -- both confirmed live."""
     with httpx.Client(timeout=30) as client:
+        existing = client.get(f"{COOLIFY_URL}/applications/{coolify_uuid}/envs", headers=_coolify_headers())
+        existing.raise_for_status()
+        existing_keys = {e["key"] for e in existing.json()}
         for key, value in vars_to_set.items():
-            r = client.post(
-                f"{COOLIFY_URL}/applications/{coolify_uuid}/envs",
-                headers=_coolify_headers(),
-                json={"key": key, "value": value, "is_preview": False},
-            )
-            r.raise_for_status()
+            if key in existing_keys:
+                for is_preview in (False, True):
+                    r = client.patch(
+                        f"{COOLIFY_URL}/applications/{coolify_uuid}/envs",
+                        headers=_coolify_headers(),
+                        json={"key": key, "value": value, "is_preview": is_preview},
+                    )
+                    r.raise_for_status()
+            else:
+                r = client.post(
+                    f"{COOLIFY_URL}/applications/{coolify_uuid}/envs",
+                    headers=_coolify_headers(),
+                    json={"key": key, "value": value, "is_preview": False},
+                )
+                r.raise_for_status()
 
 
 def add_coolify_persistent_storage(coolify_uuid: str, name: str, mount_path: str) -> None:
@@ -2309,6 +2326,42 @@ def resize_app_memory(name: str, new_memory_mb: int) -> dict:
 
     return {"resized": name, "old_memory_mb": old_memory_mb, "new_memory_mb": new_memory_mb,
             "target_node": target_node, "coolify_uuid": coolify_uuid}
+
+
+def set_app_env_vars(name: str, env_vars: dict[str, str]) -> dict:
+    """Sets or updates one or more env vars on an EXISTING, already-
+    registered app, then redeploys so the change actually reaches the
+    running container -- an env var update alone does not retroactively
+    apply to an already-running container, same rule as memory limits.
+    Not restricted to keys app.yaml already declares -- this is an
+    operational tool (rotate a leaked key, add one the original app.yaml
+    missed), not a re-run of deploy()'s own declared-env resolution.
+
+    Single-container Coolify applications only (kind "coolify" in
+    resource_map.json), same scope as redeploy()/resize_app_memory() and
+    for the same reason -- no zorc-agent app has needed this yet.
+
+    Refuses (ValueError, never silently no-ops) if the app isn't
+    registered, isn't a Coolify app, or env_vars is empty."""
+    if not name_taken(name):
+        raise ValueError(f"{name!r} is not a registered app -- nothing to update")
+    if not env_vars:
+        raise ValueError("env_vars must not be empty")
+    mapped = _load_resource_map().get(name, {})
+    kind = mapped.get("kind")
+    if kind != "coolify":
+        raise ValueError(
+            f"{name!r} is a {kind!r} app -- set_app_env_vars() only supports single-container "
+            "Coolify apps (kind 'coolify') right now"
+        )
+    coolify_uuid = mapped.get("coolify_uuid")
+    if not coolify_uuid:
+        raise ValueError(f"{name!r} has no recorded coolify_uuid in resource_map.json -- cannot update")
+
+    set_coolify_env_vars(coolify_uuid, env_vars)
+    trigger_coolify_deploy(coolify_uuid)
+
+    return {"updated": name, "keys": sorted(env_vars.keys()), "coolify_uuid": coolify_uuid}
 
 
 def remove_registry_entry(name: str) -> None:
