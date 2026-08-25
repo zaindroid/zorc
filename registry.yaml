@@ -203,6 +203,19 @@ owner_budgets:
 # Applications. Add new entries at the end. Keep alphabetical within groups.
 # ---------------------------------------------------------------------------
 apps:
+  - name: env-test-app
+    target: servingz
+    memory_mb: 384
+    subdomain: env-test-app
+    database: null
+    redis_db: null
+    ai: true
+    storage_prefix: null
+    repo: "github.com/zaindroid/zorc-ai-test-app"
+    owner: "zainey"
+    critical: false
+    depends_on: []
+
   - name: ai-gateway
     target: servingz
     memory_mb: 384

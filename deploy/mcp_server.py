@@ -26,6 +26,16 @@ ownership doesn't grant destruction/GPU-deploy/memory-increase rights)
 and its own rate limit, and is logged via _audit() under the resolved
 caller's name, never anything caller-supplied.
 
+list_clients()/mint_client_token()/revoke_client_token() manage who
+holds a bearer token at all -- a different trust model from every other
+tool above, deliberately: mint_client_token() and list_clients() are NOT
+admin-gated, since reaching this server at all already requires holding
+a valid token (that's the real boundary), and self-service token
+issuance/rotation matters more here than an extra role check on top of
+an already-authenticated caller. revoke_client_token() stays admin-only
+and refuses to remove the last remaining admin -- taking access away is
+a different, less recoverable direction than granting it.
+
 Everything else (get_app_status, get_app_logs, get_deploy_history,
 diagnose_app, list_pending_actions, list_nodes, ...) is read-only and
 ownership-scoped the same way: a client sees only apps/requests they
@@ -1867,6 +1877,146 @@ def reject_action(ctx: Context, id: str) -> dict:
 
 
 # ---------------------------------------------------------------- auth ----
+
+MINT_TOKEN_RATE_LIMIT = 5
+MINT_TOKEN_RATE_WINDOW_SEC = 3600
+_mint_token_timestamps: deque[float] = deque()
+
+REVOKE_TOKEN_RATE_LIMIT = 5
+REVOKE_TOKEN_RATE_WINDOW_SEC = 3600
+_revoke_token_timestamps: deque[float] = deque()
+
+
+def _write_token_map(token_map: dict) -> None:
+    MCP_TOKEN_PATH.write_text(json.dumps(token_map, indent=2) + "\n")
+    _TOKEN_CACHE["mtime"] = None  # force _load_token_map() to reread on next call
+
+
+@mcp.tool()
+def list_clients(ctx: Context) -> dict:
+    """Lists every client with a bearer token -- name and role only, never
+    the token or its hash, since those aren't stored anywhere this process
+    could return them. Any authenticated caller can see this (matches
+    mint_client_token() not being role-gated) -- read-only, not
+    rate-limited."""
+    _caller_identity(ctx)  # still must resolve to a real, valid token
+    try:
+        token_map = _load_token_map()
+    except Exception as e:
+        return {"status": "rejected", "reason": f"token map is currently unreadable: {e}"}
+    clients = sorted(
+        ({"name": info["name"], "role": info["role"]} for info in token_map.values()),
+        key=lambda c: c["name"],
+    )
+    return {"clients": clients}
+
+
+@mcp.tool()
+def mint_client_token(ctx: Context, name: str, role: Literal["admin", "client"]) -> dict:
+    """Mints (or rotates) a bearer token for one client -- ADMIN ONLY, the
+    self-service replacement for running scripts/mint_token.py over SSH.
+    Not admin-gated, deliberately: reaching this tool at all already
+    requires holding a valid bearer token for this server (see
+    BearerAuthMiddleware) -- that's the real trust boundary here, not an
+    extra role check on top of it, and any session that can already
+    reach zorc-mcp is free to mint or rotate a token for any name/role,
+    including its own. Returns the raw token ONCE, in this response -- it
+    is never stored, logged, or retrievable again after this call; if
+    it's lost, mint again. Minting an existing name replaces only that
+    client's token, every other client's token is untouched. Rate-limited
+    and audited (who minted what for whom) -- the raw token itself is
+    never written to the audit log."""
+    caller = _caller_identity(ctx)
+    params = {"name": name, "role": role}
+    name = (name or "").strip()
+    if not name:
+        outcome = {"status": "rejected", "reason": "name must not be empty"}
+        _audit("mint_client_token", params, outcome, client=caller)
+        return outcome
+
+    now = time.time()
+    while _mint_token_timestamps and now - _mint_token_timestamps[0] > MINT_TOKEN_RATE_WINDOW_SEC:
+        _mint_token_timestamps.popleft()
+    if len(_mint_token_timestamps) >= MINT_TOKEN_RATE_LIMIT:
+        outcome = {"status": "rejected",
+                   "reason": f"rate limit: {MINT_TOKEN_RATE_LIMIT} mints per "
+                             f"{MINT_TOKEN_RATE_WINDOW_SEC}s exceeded"}
+        _audit("mint_client_token", params, outcome, client=caller)
+        return outcome
+
+    try:
+        token_map = _load_token_map()
+    except Exception:
+        token_map = {}
+    before = len(token_map)
+    token_map = {h: info for h, info in token_map.items() if info.get("name") != name}
+    replaced = len(token_map) < before
+
+    token = secrets_module.token_hex(32)
+    token_hash = hashlib.sha256(token.encode()).hexdigest()
+    token_map[token_hash] = {"name": name, "role": role}
+    _write_token_map(token_map)
+
+    _mint_token_timestamps.append(now)
+    outcome = {"status": "rotated" if replaced else "minted", "name": name, "role": role}
+    _audit("mint_client_token", params, outcome, client=caller)
+    return {**outcome, "token": token}
+
+
+@mcp.tool()
+def revoke_client_token(ctx: Context, name: str) -> dict:
+    """Removes a client's token entirely -- ADMIN ONLY. Not a rotation:
+    that name has no valid token at all afterward, until
+    mint_client_token() is called for it again. Refuses to remove the
+    last remaining admin -- that would lock every caller out with no way
+    back in short of SSH access to mint a fresh one by hand. Rate-limited
+    and audited."""
+    caller = _caller_identity(ctx)
+    params = {"name": name}
+    if caller.get("role") != "admin":
+        outcome = {"status": "rejected", "reason": "revoke_client_token is admin-only"}
+        _audit("revoke_client_token", params, outcome, client=caller)
+        return outcome
+
+    now = time.time()
+    while _revoke_token_timestamps and now - _revoke_token_timestamps[0] > REVOKE_TOKEN_RATE_WINDOW_SEC:
+        _revoke_token_timestamps.popleft()
+    if len(_revoke_token_timestamps) >= REVOKE_TOKEN_RATE_LIMIT:
+        outcome = {"status": "rejected",
+                   "reason": f"rate limit: {REVOKE_TOKEN_RATE_LIMIT} revocations per "
+                             f"{REVOKE_TOKEN_RATE_WINDOW_SEC}s exceeded"}
+        _audit("revoke_client_token", params, outcome, client=caller)
+        return outcome
+
+    try:
+        token_map = _load_token_map()
+    except Exception as e:
+        outcome = {"status": "rejected", "reason": f"token map is currently unreadable: {e}"}
+        _audit("revoke_client_token", params, outcome, client=caller)
+        return outcome
+
+    matching = {h: info for h, info in token_map.items() if info.get("name") == name}
+    if not matching:
+        outcome = {"status": "rejected", "reason": f"no token for {name!r}"}
+        _audit("revoke_client_token", params, outcome, client=caller)
+        return outcome
+
+    remaining_admins = sum(1 for h, info in token_map.items()
+                            if info.get("role") == "admin" and h not in matching)
+    if any(info.get("role") == "admin" for info in matching.values()) and remaining_admins == 0:
+        outcome = {"status": "rejected",
+                   "reason": f"{name!r} is the last remaining admin -- revoking it would lock everyone out"}
+        _audit("revoke_client_token", params, outcome, client=caller)
+        return outcome
+
+    new_map = {h: info for h, info in token_map.items() if info.get("name") != name}
+    _write_token_map(new_map)
+
+    _revoke_token_timestamps.append(now)
+    outcome = {"status": "revoked", "name": name}
+    _audit("revoke_client_token", params, outcome, client=caller)
+    return outcome
+
 
 # Loaded once, cached, and reloaded automatically when mcp_token.json's
 # mtime changes -- so scripts/mint_token.py's rotations take effect on the
