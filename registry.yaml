@@ -203,6 +203,19 @@ owner_budgets:
 # Applications. Add new entries at the end. Keep alphabetical within groups.
 # ---------------------------------------------------------------------------
 apps:
+  - name: loot-radar
+    target: servingz
+    memory_mb: 1110
+    subdomain: loot-radar
+    database: true
+    redis_db: null
+    ai: null
+    storage_prefix: null
+    repo: "github.com/meanmachines/loot-radar"
+    owner: "zbots"
+    critical: false
+    depends_on: []
+
   - name: ai-gateway
     target: servingz
     memory_mb: 384
