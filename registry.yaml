@@ -203,6 +203,19 @@ owner_budgets:
 # Applications. Add new entries at the end. Keep alphabetical within groups.
 # ---------------------------------------------------------------------------
 apps:
+  - name: lootrader
+    target: servingz
+    memory_mb: 576
+    subdomain: lootrader
+    database: null
+    redis_db: null
+    ai: null
+    storage_prefix: null
+    repo: "github.com/zaindroid/loot-radar"
+    owner: "hermes"
+    critical: false
+    depends_on: []
+
   - name: loot-radar
     target: servingz
     memory_mb: 1110
