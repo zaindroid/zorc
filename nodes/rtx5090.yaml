@@ -5,6 +5,7 @@ accelerator:
   type: cuda
   name: NVIDIA GeForce RTX 5090
   vram_mb: 32607
+  count: 1
   driver: 580.173.02
 cpu:
   model: AMD Ryzen 9 7900X 12-Core Processor
@@ -23,4 +24,4 @@ labels:
 - personal-workstation
 - gpu-node
 status: online
-last_seen: '2026-08-16T11:18:54.029084+00:00'
+last_seen: '2026-09-02T05:57:29.265374+00:00'

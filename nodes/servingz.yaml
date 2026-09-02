@@ -5,6 +5,7 @@ accelerator:
   type: cuda
   name: Quadro K2100M
   vram_mb: 1996
+  count: 1
   driver: 470.256.02
 cpu:
   model: Intel(R) Core(TM) i7-4810MQ CPU @ 2.80GHz
@@ -24,4 +25,4 @@ labels:
 - always-on
 - control-plane
 status: degraded
-last_seen: '2026-08-16T11:18:52.179203+00:00'
+last_seen: '2026-09-02T05:57:27.340402+00:00'

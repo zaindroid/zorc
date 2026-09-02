@@ -18,5 +18,74 @@
     "coolify_uuid": "u12lip63a9zi3g6hq4az83g0",
     "coolify_postgres_uuid": "yxwbfp5davvvc81kz9z4htkq",
     "domains": []
+  },
+  "ivay-caller-portal": {
+    "kind": "coolify",
+    "coolify_uuid": "g11yphleilq14s8gvbk0t98c",
+    "domains": [],
+    "coolify_postgres_uuid": "hlilzi00ok4nl35l8aqps0pe"
+  },
+  "hermes-sglang": {
+    "kind": "zorc-agent",
+    "coolify_uuid": null,
+    "domains": [],
+    "container_name": "hermes-sglang",
+    "node": "jetson-thor"
+  },
+  "hermes": {
+    "kind": "coolify",
+    "coolify_uuid": "crqb1m0fbm0t1b4q9chppya9",
+    "domains": []
+  },
+  "thor-platform": {
+    "kind": "coolify",
+    "coolify_uuid": "nphps30enibdkig92v1l387q",
+    "domains": [],
+    "coolify_postgres_uuid": "m28b4wvwp3aey9asmrgej9xb"
+  },
+  "hermes4-api": {
+    "kind": "zorc-agent",
+    "coolify_uuid": null,
+    "domains": [],
+    "container_name": "hermes4-api",
+    "node": "bitbots_gpu"
+  },
+  "hermes4-rtx": {
+    "kind": "zorc-agent",
+    "coolify_uuid": null,
+    "domains": [],
+    "container_name": "hermes4-rtx",
+    "node": "rtx5090"
+  },
+  "esp32-mesh": {
+    "kind": "coolify",
+    "coolify_uuid": "bv270pzwlpqfnelk17h8b3qp",
+    "domains": []
+  },
+  "zbots": {
+    "kind": "coolify",
+    "coolify_uuid": "j60y8eonc72djb6zr72rjog5",
+    "domains": []
+  },
+  "zbots-dev": {
+    "kind": "coolify",
+    "coolify_uuid": "fpjzye5oj9ua7421k9paiycz",
+    "domains": []
+  },
+  "ai-gateway": {
+    "kind": "coolify",
+    "coolify_uuid": "i12lvdfniy5ohtz66qu1oaw5",
+    "domains": []
+  },
+  "loot-radar": {
+    "kind": "coolify",
+    "coolify_uuid": "qhb0xdmhma81nrqmrvw4jwj1",
+    "domains": [],
+    "coolify_postgres_uuid": "ude5e2b1frqxeq2dgxq638ds"
+  },
+  "lootrader": {
+    "kind": "coolify",
+    "coolify_uuid": "zchkgxhnzyw4stu101tygmur",
+    "domains": []
   }
 }

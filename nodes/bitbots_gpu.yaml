@@ -4,8 +4,8 @@ arch: x86_64
 accelerator:
   type: cuda
   name: NVIDIA GeForce RTX 3090
-  vram_mb: 49152
-  count: 2
+  vram_mb: 24576
+  count: 1
   driver: 595.71.05
 cpu:
   model: AMD Ryzen 9 5900X 12-Core Processor
@@ -23,5 +23,5 @@ capabilities:
 labels:
 - personal-workstation
 - gpu-node
-status: online
-last_seen: '2026-08-20T17:05:25.176584+00:00'
+status: unreachable
+last_seen: '2026-08-21T00:43:02.196052+00:00'

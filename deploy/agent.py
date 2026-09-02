@@ -989,9 +989,11 @@ def add_coolify_persistent_storage(coolify_uuid: str, name: str, mount_path: str
 def trigger_coolify_deploy(coolify_uuid: str) -> None:
     """Explicitly starts the first real build+deploy -- the counterpart to
     create_coolify_app(instant_deploy=False). Coolify's own webhook-style
-    deploy-trigger endpoint, keyed by application uuid."""
+    deploy-trigger endpoint, keyed by application uuid. POST, not GET --
+    a Coolify version upgrade turned the old GET into a 405 (confirmed
+    live: GET /api/v1/deploy -> 405, POST -> 200, same params)."""
     with httpx.Client(timeout=30) as client:
-        r = client.get(f"{COOLIFY_URL}/deploy", headers=_coolify_headers(), params={"uuid": coolify_uuid})
+        r = client.post(f"{COOLIFY_URL}/deploy", headers=_coolify_headers(), params={"uuid": coolify_uuid})
         r.raise_for_status()
 
 
