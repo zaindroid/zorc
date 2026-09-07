@@ -49,6 +49,7 @@ import secrets as secrets_module
 import shutil
 import time
 from collections import deque
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from pathlib import Path
 from typing import Literal
@@ -1971,23 +1972,29 @@ def list_clients(ctx: Context) -> dict:
     return {"clients": clients}
 
 
+def _app_status_or_error(name: str) -> dict:
+    try:
+        return agent.app_status(name)
+    except Exception as e:
+        return {"name": name, "status": "error", "error": str(e)}
+
+
 @mcp.tool()
 def list_my_apps(ctx: Context) -> dict:
     """Every app the calling identity owns, each with a live
     agent.app_status() result, plus current owner-budget usage/cap.
     Always the caller's own name -- no owner param, so this can't be
-    used to browse anyone else's apps. Read-only, not rate-limited or
-    audited."""
+    used to browse anyone else's apps. Fetches every app's status
+    concurrently -- app_status() is one or more real, blocking
+    Coolify/SSH round-trips per app, and running those one at a time made
+    this tool take 30+ seconds for an owner with a dozen-plus apps
+    (measured live against zorc-portal's own dashboard). Read-only, not
+    rate-limited or audited."""
     caller = _caller_identity(ctx)
     owner = caller.get("name")
-    apps = []
-    for a in agent.load_registry().get("apps", []):
-        if a.get("owner") != owner:
-            continue
-        try:
-            apps.append(agent.app_status(a["name"]))
-        except Exception as e:
-            apps.append({"name": a["name"], "status": "error", "error": str(e)})
+    names = [a["name"] for a in agent.load_registry().get("apps", []) if a.get("owner") == owner]
+    with ThreadPoolExecutor(max_workers=min(len(names), 8) or 1) as pool:
+        apps = list(pool.map(_app_status_or_error, names))
     return {
         "owner": owner,
         "apps": apps,

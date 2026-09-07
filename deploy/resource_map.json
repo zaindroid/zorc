@@ -87,5 +87,15 @@
     "kind": "coolify",
     "coolify_uuid": "zchkgxhnzyw4stu101tygmur",
     "domains": []
+  },
+  "zorc-portal": {
+    "kind": "coolify",
+    "coolify_uuid": "rkq1n7t8bc1fgnzc88fmrbfc",
+    "domains": []
+  },
+  "purepak": {
+    "kind": "coolify",
+    "coolify_uuid": "eollunnvhfekycbxgwjanorx",
+    "domains": []
   }
 }
