@@ -198,6 +198,7 @@ infrastructure:
 owner_budgets:
   default_mb: 8192
   overrides:
+    portal-ui-check: 4096
     portal-e2e-test2: 4096
     saleeta: 4096
 
