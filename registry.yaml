@@ -198,7 +198,6 @@ infrastructure:
 owner_budgets:
   default_mb: 8192
   overrides:
-    design-review-live: 4096
     saleeta: 4096
 
 # ---------------------------------------------------------------------------
