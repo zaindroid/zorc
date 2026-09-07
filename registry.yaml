@@ -198,7 +198,6 @@ infrastructure:
 owner_budgets:
   default_mb: 8192
   overrides:
-    portal-verification-test: 4096
 
 # ---------------------------------------------------------------------------
 # Applications. Add new entries at the end. Keep alphabetical within groups.
