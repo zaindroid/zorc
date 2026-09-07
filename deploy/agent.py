@@ -509,6 +509,28 @@ def owner_budget_mb(owner: str) -> int:
     return override if override is not None else budgets.get("default_mb", 8192)
 
 
+def set_owner_budget(owner: str, memory_mb: int) -> None:
+    """Sets or replaces owner_budgets.overrides[owner] in registry.yaml --
+    the write side of owner_budget_mb(). Until now the only way to raise
+    or lower one was a normal reviewed registry.yaml edit; this gives
+    admins an API for it instead. Does not commit -- callers push, same
+    as register_app()."""
+    if memory_mb <= 0:
+        raise ValueError("memory_mb must be positive")
+    text = REGISTRY_PATH.read_text()
+    entry_line = f"    {owner}: {memory_mb}"
+    existing = re.search(rf"^    {re.escape(owner)}: \d+$", text, re.MULTILINE)
+    if existing:
+        text = text[:existing.start()] + entry_line + text[existing.end():]
+    elif "  overrides: {}" in text:
+        text = text.replace("  overrides: {}", "  overrides:\n" + entry_line, 1)
+    elif "  overrides:" in text:
+        text = text.replace("  overrides:", "  overrides:\n" + entry_line, 1)
+    else:
+        raise RuntimeError("registry.yaml owner_budgets.overrides marker not found")
+    REGISTRY_PATH.write_text(text)
+
+
 def clone_repo(owner_repo: str, git_branch: str = "main") -> Path:
     """owner_repo like 'zaindroid/hello-app'. Uses gh CLI (already
     authenticated on this host) so it works for private repos too, not

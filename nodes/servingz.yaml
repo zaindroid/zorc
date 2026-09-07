@@ -24,5 +24,5 @@ capabilities:
 labels:
 - always-on
 - control-plane
-status: degraded
-last_seen: '2026-09-02T05:57:27.340402+00:00'
+status: online
+last_seen: '2026-09-07T09:28:01.534832+00:00'

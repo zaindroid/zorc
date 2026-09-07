@@ -1972,6 +1972,31 @@ def list_clients(ctx: Context) -> dict:
 
 
 @mcp.tool()
+def list_my_apps(ctx: Context) -> dict:
+    """Every app the calling identity owns, each with a live
+    agent.app_status() result, plus current owner-budget usage/cap.
+    Always the caller's own name -- no owner param, so this can't be
+    used to browse anyone else's apps. Read-only, not rate-limited or
+    audited."""
+    caller = _caller_identity(ctx)
+    owner = caller.get("name")
+    apps = []
+    for a in agent.load_registry().get("apps", []):
+        if a.get("owner") != owner:
+            continue
+        try:
+            apps.append(agent.app_status(a["name"]))
+        except Exception as e:
+            apps.append({"name": a["name"], "status": "error", "error": str(e)})
+    return {
+        "owner": owner,
+        "apps": apps,
+        "owner_current_total_mb": agent.owner_memory_total_mb(owner),
+        "owner_budget_mb": agent.owner_budget_mb(owner),
+    }
+
+
+@mcp.tool()
 def mint_client_token(ctx: Context, name: str, role: Literal["admin", "client"]) -> dict:
     """Mints (or rotates) a bearer token for one client -- ADMIN ONLY, the
     self-service replacement for running scripts/mint_token.py over SSH.
@@ -2071,6 +2096,47 @@ def revoke_client_token(ctx: Context, name: str) -> dict:
     _revoke_token_timestamps.append(now)
     outcome = {"status": "revoked", "name": name}
     _audit("revoke_client_token", params, outcome, client=caller)
+    return outcome
+
+
+SET_OWNER_BUDGET_RATE_LIMIT = 20
+SET_OWNER_BUDGET_RATE_WINDOW_SEC = 3600
+_set_owner_budget_timestamps: deque[float] = deque()
+
+
+@mcp.tool()
+def set_owner_budget(ctx: Context, owner: str, memory_mb: int) -> dict:
+    """Sets an owner's soft per-owner memory budget in registry.yaml --
+    ADMIN ONLY. The write side of the cap analyze_deployment_requirements()
+    already enforces (agent.owner_budget_mb()); until now the only way to
+    change one was a normal reviewed registry.yaml edit. Rate-limited and
+    audited."""
+    caller = _caller_identity(ctx)
+    params = {"owner": owner, "memory_mb": memory_mb}
+    if caller.get("role") != "admin":
+        outcome = {"status": "rejected", "reason": "set_owner_budget is admin-only"}
+        _audit("set_owner_budget", params, outcome, client=caller)
+        return outcome
+
+    now = time.time()
+    if _rate_limited(_set_owner_budget_timestamps, SET_OWNER_BUDGET_RATE_LIMIT, SET_OWNER_BUDGET_RATE_WINDOW_SEC):
+        outcome = {"status": "rejected",
+                   "reason": f"rate limit: {SET_OWNER_BUDGET_RATE_LIMIT} changes per "
+                             f"{SET_OWNER_BUDGET_RATE_WINDOW_SEC}s exceeded"}
+        _audit("set_owner_budget", params, outcome, client=caller)
+        return outcome
+
+    try:
+        agent.set_owner_budget(owner, memory_mb)
+    except Exception as e:
+        outcome = {"status": "rejected", "reason": str(e)}
+        _audit("set_owner_budget", params, outcome, client=caller)
+        return outcome
+
+    agent.git_commit_and_push(f"registry: set {owner}'s owner budget to {memory_mb}MB")
+    _set_owner_budget_timestamps.append(now)
+    outcome = {"status": "set", "owner": owner, "memory_mb": memory_mb}
+    _audit("set_owner_budget", params, outcome, client=caller)
     return outcome
 
 

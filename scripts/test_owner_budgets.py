@@ -12,7 +12,10 @@ Usage:
     python3 scripts/test_owner_budgets.py
 """
 import sys
+import tempfile
 from pathlib import Path
+
+import yaml
 
 ZORC_DIR = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ZORC_DIR / "deploy"))
@@ -149,12 +152,123 @@ def test_analyze_deployment_requirements_budget_gate(agent, m) -> None:
         __import__("shutil").rmtree = original["rmtree"]
 
 
+def test_agent_set_owner_budget(agent) -> None:
+    # Real file, real text surgery -- not mocked, since this is exactly
+    # the kind of edit that silently corrupts on a wrong marker or a bad
+    # regex (see write_registry()'s bare "apps:" bug for why this repo
+    # tests these against a real temp file instead of trusting the logic
+    # by inspection).
+    original_path = agent.REGISTRY_PATH
+    tmp = Path(tempfile.mktemp(suffix=".yaml"))
+    tmp.write_text(
+        "owner_budgets:\n"
+        "  default_mb: 8192\n"
+        "  overrides: {}\n"
+        "apps: []\n"
+    )
+    agent.REGISTRY_PATH = tmp
+    try:
+        agent.set_owner_budget("new-user", 4096)
+        reg = yaml.safe_load(tmp.read_text())
+        check("first override on an empty {} lands correctly",
+              reg["owner_budgets"]["overrides"] == {"new-user": 4096}, str(reg))
+
+        agent.set_owner_budget("second-user", 2048)
+        reg = yaml.safe_load(tmp.read_text())
+        check("a second override is added alongside the first, not replacing it",
+              reg["owner_budgets"]["overrides"] == {"new-user": 4096, "second-user": 2048}, str(reg))
+
+        agent.set_owner_budget("new-user", 8000)
+        reg = yaml.safe_load(tmp.read_text())
+        check("re-setting an existing owner replaces their value, doesn't duplicate the key",
+              reg["owner_budgets"]["overrides"] == {"new-user": 8000, "second-user": 2048}, str(reg))
+
+        raised = False
+        try:
+            agent.set_owner_budget("bad", 0)
+        except ValueError:
+            raised = True
+        check("zero or negative memory_mb is rejected", raised)
+    finally:
+        agent.REGISTRY_PATH = original_path
+        tmp.unlink(missing_ok=True)
+
+
+def test_mcp_set_owner_budget_and_list_my_apps(agent, m) -> None:
+    original = {
+        "load_registry": agent.load_registry,
+        "app_status": agent.app_status,
+        "owner_memory_total_mb": agent.owner_memory_total_mb,
+        "owner_budget_mb": agent.owner_budget_mb,
+        "set_owner_budget": agent.set_owner_budget,
+        "git_commit_and_push": agent.git_commit_and_push,
+        "caller_identity": m._caller_identity,
+        "enabled": m.RATE_LIMITS_ENABLED,
+    }
+    m.RATE_LIMITS_ENABLED = True
+    fixture_registry = {
+        "owner_budgets": {"default_mb": 8192, "overrides": {}},
+        "apps": [
+            {"name": "mine-a", "owner": "portal-user", "memory_mb": 256},
+            {"name": "mine-b", "owner": "portal-user", "memory_mb": 512},
+            {"name": "someone-elses-app", "owner": "other-user", "memory_mb": 999},
+        ],
+    }
+    agent.load_registry = lambda: fixture_registry
+    agent.app_status = lambda name: {"name": name, "status": "running"}
+    pushed_messages = []
+    agent.git_commit_and_push = lambda message: pushed_messages.append(message)
+    set_calls = []
+    agent.set_owner_budget = lambda owner, mb: set_calls.append((owner, mb))
+
+    def call_set(name: str, role: str, owner: str, memory_mb: int) -> dict:
+        m._caller_identity = lambda ctx: {"name": name, "role": role}
+        return m.set_owner_budget(ctx=object(), owner=owner, memory_mb=memory_mb)
+
+    def call_list(name: str, role: str) -> dict:
+        m._caller_identity = lambda ctx: {"name": name, "role": role}
+        return m.list_my_apps(ctx=object())
+
+    try:
+        r = call_set("portal-user", "client", "portal-user", 4096)
+        check("set_owner_budget refuses a non-admin caller",
+              r.get("status") == "rejected" and "admin" in r.get("reason", ""), f"got {r}")
+        check("...and never calls agent.set_owner_budget when refused", set_calls == [])
+
+        m._set_owner_budget_timestamps.clear()
+        r = call_set("zainey", "admin", "new-portal-user", 4096)
+        check("set_owner_budget succeeds for an admin caller",
+              r.get("status") == "set" and set_calls == [("new-portal-user", 4096)], f"got {r}, calls={set_calls}")
+        check("...and commits+pushes the change", len(pushed_messages) == 1, str(pushed_messages))
+
+        r = call_list("portal-user", "client")
+        names = sorted(a["name"] for a in r["apps"])
+        check("list_my_apps returns only the caller's own apps", names == ["mine-a", "mine-b"], f"got {names}")
+        check("...never another owner's app", "someone-elses-app" not in names)
+        check("...and reports current total + budget for that owner",
+              r["owner_current_total_mb"] == 768 and r["owner_budget_mb"] == 8192, f"got {r}")
+
+        r = call_list("nobody-owns-anything", "client")
+        check("an owner with no apps gets an empty list, not an error", r["apps"] == [], f"got {r}")
+    finally:
+        agent.load_registry = original["load_registry"]
+        agent.app_status = original["app_status"]
+        agent.owner_memory_total_mb = original["owner_memory_total_mb"]
+        agent.owner_budget_mb = original["owner_budget_mb"]
+        agent.set_owner_budget = original["set_owner_budget"]
+        agent.git_commit_and_push = original["git_commit_and_push"]
+        m._caller_identity = original["caller_identity"]
+        m.RATE_LIMITS_ENABLED = original["enabled"]
+
+
 def main() -> int:
     import agent
     import mcp_server as m
 
     test_owner_memory_total_and_budget(agent)
     test_analyze_deployment_requirements_budget_gate(agent, m)
+    test_agent_set_owner_budget(agent)
+    test_mcp_set_owner_budget_and_list_my_apps(agent, m)
 
     print()
     if FAILURES:
