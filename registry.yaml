@@ -203,6 +203,19 @@ owner_budgets:
 # Applications. Add new entries at the end. Keep alphabetical within groups.
 # ---------------------------------------------------------------------------
 apps:
+  - name: purepak
+    target: servingz
+    memory_mb: 384
+    subdomain: purepak
+    database: null
+    redis_db: null
+    ai: null
+    storage_prefix: null
+    repo: "github.com/zaindroid/purepak"
+    owner: "zainey"
+    critical: false
+    depends_on: []
+
   - name: zorc-portal
     target: servingz
     memory_mb: 768

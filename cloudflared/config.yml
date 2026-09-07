@@ -73,4 +73,8 @@ ingress:
   service: https://localhost:443
   originRequest:
     noTLSVerify: true
+- hostname: purepak.zaindroid.me
+  service: https://localhost:443
+  originRequest:
+    noTLSVerify: true
 - service: http_status:404
