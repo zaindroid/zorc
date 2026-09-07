@@ -759,7 +759,8 @@ def _provision_postgres_coolify(app_name: str, node: dict, target_node: str,
         r.raise_for_status()
         db_uuid = r.json()["uuid"]
 
-        r = client.get(f"{COOLIFY_URL}/databases/{db_uuid}/start", headers=_coolify_headers())
+        # POST, not GET -- same Coolify API change as trigger_coolify_deploy's.
+        r = client.post(f"{COOLIFY_URL}/databases/{db_uuid}/start", headers=_coolify_headers())
         r.raise_for_status()
 
     deadline = time.time() + 90
@@ -864,10 +865,15 @@ def provision_dedicated_postgres(app_name: str, target_node: str,
 
     post_create_sql -- run against the NEW app database (not the
     maintenance "postgres" database the initial connection lands on) right
-    after it's created, via a `\\c {db_role}` reconnect -- e.g.
-    "CREATE EXTENSION IF NOT EXISTS vector;" for an app using image=
-    pgvector/pgvector. Runs as the new role's own owner privileges are
-    already in place by this point, so no separate grant is needed."""
+    after it's created, via a `\\c {db_role} {db_role}` reconnect (database
+    AND role -- `\\c dbname` alone keeps the current session's role, which
+    is the connecting superuser, not the new app role; confirmed live: a
+    first version of this used `\\c {db_role}` alone and every table it
+    created came out owned by the superuser, so the app's own scoped role
+    got "permission denied" on its own schema the first time it queried
+    anything) -- e.g. "CREATE EXTENSION IF NOT EXISTS vector;" for an app
+    using image=pgvector/pgvector. Runs as the new role's own owner
+    privileges, so no separate grant is needed."""
     node = node_config(target_node)
     if node.get("backend") == "zorc-agent":
         container_name, exec_prefix = _provision_postgres_zorc_agent(app_name, node, image=image)
@@ -878,7 +884,7 @@ def provision_dedicated_postgres(app_name: str, target_node: str,
     db_password = secrets.token_hex(24)
     sql = f"CREATE ROLE {db_role} WITH LOGIN PASSWORD '{db_password}'; CREATE DATABASE {db_role} OWNER {db_role};"
     if post_create_sql:
-        sql += f"\n\\c {db_role}\n{post_create_sql}"
+        sql += f"\n\\c {db_role} {db_role}\n{post_create_sql}"
 
     proc = subprocess.run(exec_prefix, input=sql, capture_output=True, text=True, timeout=20)
     if proc.returncode != 0:
