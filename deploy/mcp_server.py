@@ -355,13 +355,29 @@ def get_platform_contract() -> dict:
             "static": "index.html with no backend manifest -> Cloudflare Pages, zero node memory",
             "node / python / go / dockerfile": "-> Coolify on the chosen node, real memory_mb budget applies",
         },
+        "known_incompatibilities": (
+            "deploy() automatically checks for these before creating any Coolify resource and refuses "
+            "to proceed if it finds one -- each traces to a real app that built fine and still got "
+            "silently rolled back by Coolify, diagnosed only after the fact: (1) package-lock.json "
+            "regenerated with a different npm major version than Coolify's build environment runs, "
+            "which `npm ci` rejects even when the lockfile is valid under the npm that wrote it; "
+            "(2) a Next.js app with output: \"standalone\" in next.config -- incompatible with the "
+            "plain `next start` Nixpacks runs by default; (3) a start script that hardcodes a port "
+            "other than 8080, which Coolify's healthcheck always targets; (4) a Dockerfile whose final "
+            "image has neither curl nor wget, so Coolify's in-container healthcheck itself fails even "
+            "when the app started fine (warning, not blocking). Call check_deploy_compatibility() to "
+            "run these same checks standalone -- do this after fixing a deploy() failure that traced "
+            "to one of these, to confirm the fix before spending another attempt against the 5/hour "
+            "rate limit."
+        ),
         "deploy_workflow": (
             "Once your repo exists and pushes to GitHub: call analyze_deployment_requirements() -- "
             "REQUIRED before deploy(), not optional. It clones the repo, cross-checks your own stated "
             "requirements against what the code actually looks like, and either approves (returns a "
             "report_id) or blocks with the specific reason if your estimate doesn't hold up. deploy() "
             "then takes that report_id and derives memory/node placement from it, not from anything "
-            "passed directly."
+            "passed directly, and separately runs check_deploy_compatibility() automatically -- see "
+            "known_incompatibilities above."
         ),
         "note": "This mirrors deploy/agent.py's classify() and AGENTS.md's app contract exactly -- "
                 "classify_repo() will tell you which kind your actual repo will be detected as.",
@@ -546,6 +562,37 @@ def classify_repo(owner_repo: str) -> dict:
         return agent.classify(repo_dir)
     finally:
         shutil.rmtree(repo_dir, ignore_errors=True)
+
+
+@mcp.tool()
+def check_deploy_compatibility(owner_repo: str) -> dict:
+    """Dry-run: clones the repo and runs the same known-incompatibility
+    checks deploy() runs automatically before creating any Coolify
+    resource -- npm/lockfile version mismatches, Next.js standalone
+    output misconfiguration, hardcoded ports that don't match Coolify's
+    fixed 8080, Dockerfile healthchecks with no curl/wget available.
+    Each one traces to a real app that built fine and still got silently
+    rolled back by Coolify with no obvious error (see agent.py's
+    check_deploy_compatibility() docstring for the specific incidents).
+
+    Call this to iterate on a fix without spending deploy()'s 5/hour
+    rate limit on a build that would just fail the same way again --
+    especially useful right after a deploy() failure traced back to one
+    of these, to confirm a fix before burning another attempt.
+
+    Each issue is either "blocking" (deploy() will refuse to proceed --
+    fix it before calling deploy()) or "warning" (deploy() proceeds but
+    the result notes it). An empty issues list does NOT guarantee a
+    successful build -- this only catches known, previously-diagnosed
+    failure classes, not every way a build can fail. Read-only, not
+    rate-limited."""
+    repo_dir = agent.clone_repo(owner_repo)
+    try:
+        classification = agent.classify(repo_dir)
+        issues = agent.check_deploy_compatibility(repo_dir, classification)
+    finally:
+        shutil.rmtree(repo_dir, ignore_errors=True)
+    return {"owner_repo": owner_repo, "classification": classification, "issues": issues}
 
 
 NODES_DIR = agent.ZORC_DIR / "nodes"

@@ -8,8 +8,10 @@ criteria rather than a model guessing. Ambiguous cases are surfaced to a
 human, never silently decided.
 """
 import json
+import os
 import re
 import secrets
+import shutil
 import subprocess
 import tempfile
 import time
@@ -73,6 +75,11 @@ def record_resource(name: str, *, kind: str, coolify_uuid: str | None = None,
 COOLIFY_PROJECT_UUID = "p81uewe25gri9vdgtbt4kx7c"
 COOLIFY_ENVIRONMENT_NAME = "production"
 COOLIFY_ENVIRONMENT_UUID = "bn4ub336dd38hhe59qq04xtg"
+# The GitHub App Coolify already has installed for private-repo access
+# (confirmed live: iht-news deploys through it). create_coolify_app() uses
+# this instead of the public/unauthenticated source whenever the target
+# repo turns out to be private -- see _is_private_repo().
+COOLIFY_GITHUB_APP_UUID = "rsvvq99zjr09l2n4hiji1rnl"
 PLATFORM_ROOT_DOMAIN = "zaindroid.me"
 
 # The shared LLM gateway (zorc-ai-gateway, AGENTS.md section 2's "LLM
@@ -554,6 +561,21 @@ def clone_repo(owner_repo: str, git_branch: str = "main") -> Path:
     return workdir
 
 
+def _is_private_repo(owner_repo: str) -> bool:
+    """Real bug found live: create_coolify_app() always used Coolify's
+    default "Public GitHub" source, which clones over plain unauthenticated
+    HTTPS -- works for clone_repo() above (gh CLI's own auth covers both
+    public and private repos identically), but Coolify's own build-time
+    clone has no such credential, so a private repo's first deploy always
+    failed at "git ls-remote" with no useful error pointing at the real
+    cause (purepak, and zorc-portal before its repo was made public, both
+    hit this). This is what deploy() checks before choosing which Coolify
+    creation endpoint to use."""
+    r = subprocess.run(["gh", "api", f"repos/{owner_repo}", "--jq", ".private"],
+                        check=True, capture_output=True, text=True, timeout=15)
+    return r.stdout.strip() == "true"
+
+
 def classify(repo_dir: Path) -> dict:
     """No LLM: deterministic detection, same order Nixpacks uses internally.
     Returns {kind: static|app|unknown, language, memory_mb, reason, ...}."""
@@ -616,6 +638,200 @@ def classify(repo_dir: Path) -> dict:
 
     return {"kind": "unknown", "language": None, "memory_mb": None,
             "reason": "no recognizable manifest — needs a human decision"}
+
+
+# Coolify's Nixpacks node image bundles this specific npm version --
+# confirmed live from blylinks-crm's build log (an EBADENGINE warning
+# on an unrelated package names the running npm/node exactly). A
+# lockfile regenerated with a newer npm can be internally valid under
+# that newer npm and still fail `npm ci` under this one -- update this
+# constant if Coolify's base image ever changes.
+COOLIFY_BUILD_NPM_VERSION = "10.9.0"
+
+
+def _check_npm_lockfile_compat(repo_dir: Path, classification: dict) -> list[dict]:
+    """Real incident: blylinks-crm's package-lock.json was regenerated
+    with npm 11.x -- internally consistent under npm 11, but missing
+    entries npm 10.x's stricter sync check expects (esbuild's
+    per-platform optional packages, specifically). `npm ci` under npm
+    11 passed clean locally while the identical commit failed on
+    Coolify three separate times, because Coolify's actual build
+    environment runs COOLIFY_BUILD_NPM_VERSION, not whatever npm a
+    developer's own machine happens to have. Diagnosed by literally
+    running that exact npm version against the same files and
+    reproducing the failure -- this check automates that diagnosis.
+
+    Uses `npm ci --dry-run`, not a real install -- confirmed live this
+    still triggers the lockfile-sync check (which happens before any
+    package is actually fetched) in ~4s instead of a full install.
+    Only applies to node apps with both package.json and
+    package-lock.json that will build via Nixpacks specifically -- a
+    custom Dockerfile controls its own npm version, not zorc's
+    business, and there's nothing to check without a lockfile (`npm
+    install` would run instead of `npm ci`, a different code path)."""
+    if classification.get("language") != "node" or classification.get("kind") == "dockerfile":
+        return []
+    if not (repo_dir / "package.json").exists() or not (repo_dir / "package-lock.json").exists():
+        return []
+    # A dedicated cache dir, not npm's default (~/.npm/_cacache) -- real
+    # bug found live: zorc-mcp's own systemd unit runs with
+    # ProtectHome=read-only (see zorc-mcp.service), so the default cache
+    # location is read-only to this exact process even though it runs as
+    # a user who could normally write there. npm_config_cache overrides
+    # this for both npx's own package-fetch and the inner `npm ci` it
+    # runs, since it's npm's standard cache-location env var, not a
+    # ci-specific flag.
+    npm_cache_dir = tempfile.mkdtemp(prefix="npm-cache-")
+    try:
+        proc = subprocess.run(
+            ["npx", "-y", f"npm@{COOLIFY_BUILD_NPM_VERSION}", "ci", "--dry-run"],
+            cwd=repo_dir, capture_output=True, text=True, timeout=90,
+            env={**os.environ, "npm_config_cache": npm_cache_dir},
+        )
+    except (subprocess.TimeoutExpired, FileNotFoundError):
+        # npx/npm unavailable wherever this check happens to run --
+        # best-effort: skip rather than block a real deploy over a
+        # missing local tool that has nothing to do with the repo itself.
+        return []
+    finally:
+        shutil.rmtree(npm_cache_dir, ignore_errors=True)
+    if proc.returncode == 0:
+        return []
+    # Head, not tail -- npm's actually useful content (EUSAGE, the "Missing:
+    # X from lock file" lines) comes first; `npm ci`'s own CLI usage/help
+    # text always gets appended after it, so tailing the raw output cuts
+    # off exactly the part worth showing (confirmed live against this
+    # exact error).
+    detail = (proc.stderr or proc.stdout).strip()[:800]
+    return [{
+        "check": "npm_lockfile_compat", "severity": "blocking",
+        "message": (
+            f"package-lock.json is out of sync with package.json under npm "
+            f"{COOLIFY_BUILD_NPM_VERSION} (Coolify's actual build npm version) -- "
+            f"`npm ci` will fail during the real build the same way it just failed "
+            f"here. This usually means the lockfile was last regenerated with a "
+            f"different npm major version. Fix: run `npx npm@{COOLIFY_BUILD_NPM_VERSION} "
+            f"install` locally, commit the regenerated package-lock.json, and push "
+            f"before deploying.\n\n{detail}"
+        ),
+    }]
+
+
+def _check_nextjs_standalone_output(repo_dir: Path, classification: dict) -> list[dict]:
+    """Real incident: zorc-portal's next.config.mjs set output:
+    "standalone", which requires running `node
+    .next/standalone/server.js` -- incompatible with the plain `next
+    start` that Nixpacks' own Next.js detection runs by default. The
+    build succeeded and looked completely fine; the container just
+    never passed its healthcheck, and Coolify silently rolled back to
+    the previous version with nothing pointing at the real cause.
+    Doesn't apply to a custom Dockerfile, which controls its own start
+    command."""
+    if classification.get("kind") == "dockerfile":
+        return []
+    for name in ("next.config.js", "next.config.mjs", "next.config.ts"):
+        config_path = repo_dir / name
+        if not config_path.exists():
+            continue
+        if re.search(r'output\s*:\s*["\']standalone["\']', config_path.read_text(errors="replace")):
+            return [{
+                "check": "nextjs_standalone_output", "severity": "blocking",
+                "message": (
+                    f'{name} sets output: "standalone", which requires running `node '
+                    f".next/standalone/server.js` instead of the plain `next start` "
+                    f"this app will actually run under (no custom Dockerfile declared) "
+                    f"-- the container will build and look fine, but never pass its "
+                    f'healthcheck. Fix: remove output: "standalone" from {name}, or add '
+                    f"a Dockerfile that actually runs the standalone server."
+                ),
+            }]
+    return []
+
+
+def _check_hardcoded_port(repo_dir: Path, classification: dict) -> list[dict]:
+    """Real incident: zorc-portal's package.json had `"start": "next
+    start -p 3000"` -- Coolify's healthcheck always targets port 8080
+    (create_coolify_app's fixed ports_exposes, see AGENTS.md's app
+    contract), so the container started fine on 3000 but the
+    healthcheck hit a closed port and Coolify rolled back, again with
+    nothing pointing at the real cause. Deliberately narrow -- only
+    checks package.json's own start script, not arbitrary server code
+    for a listen() call, which would false-positive constantly."""
+    if classification.get("kind") == "dockerfile":
+        return []
+    package_json_path = repo_dir / "package.json"
+    if not package_json_path.exists():
+        return []
+    try:
+        pkg = json.loads(package_json_path.read_text())
+    except (json.JSONDecodeError, OSError):
+        return []
+    start_script = (pkg.get("scripts") or {}).get("start", "")
+    m = re.search(r'(?:-p|--port)[\s=](\d+)', start_script)
+    if m and m.group(1) != "8080":
+        return [{
+            "check": "hardcoded_port", "severity": "blocking",
+            "message": (
+                f'package.json\'s start script ("{start_script}") explicitly binds '
+                f"port {m.group(1)}, but Coolify's healthcheck always targets 8080 "
+                f"(the platform contract's fixed port). The container will start fine "
+                f"and still get rolled back on a failed healthcheck. Fix: change the "
+                f"start script to bind 8080 instead."
+            ),
+        }]
+    return []
+
+
+def _check_dockerfile_healthcheck_tools(repo_dir: Path, classification: dict) -> list[dict]:
+    """Real incident: purepak's Dockerfile builds and starts fine, but
+    its final-stage base image has neither curl nor wget -- Coolify's
+    healthcheck runs one of those INSIDE the container to hit /health,
+    so with neither installed the healthcheck itself fails ("command
+    not found") and Coolify rolls back a container that was actually
+    working. A warning, not blocking -- a false positive here (a
+    later `RUN apt-get install curl` this simple scan misses, or a
+    base image that already bundles one of these) is plausible enough
+    that refusing to deploy over it would be too aggressive."""
+    if classification.get("kind") != "dockerfile":
+        return []
+    dockerfile_path = repo_dir / "Dockerfile"
+    if not dockerfile_path.exists():
+        return []
+    if re.search(r'\b(curl|wget)\b', dockerfile_path.read_text(errors="replace")):
+        return []
+    return [{
+        "check": "dockerfile_healthcheck_tools", "severity": "warning",
+        "message": (
+            "Dockerfile has no obvious curl or wget install -- Coolify's healthcheck "
+            "runs one of those inside the container to hit /health, and if neither is "
+            "present the healthcheck fails even when the app itself started fine, so "
+            "Coolify rolls back a genuinely working container. Fix: add curl or wget "
+            "to the final image (e.g. `RUN apk add curl` on Alpine, `RUN apt-get "
+            "install -y curl` on Debian-based images), or disable health_check_enabled "
+            "for this app if that's not acceptable."
+        ),
+    }]
+
+
+def check_deploy_compatibility(repo_dir: Path, classification: dict) -> list[dict]:
+    """Runs the accumulated set of known zorc/Coolify build-time
+    incompatibility checks against a cloned repo, BEFORE any Coolify
+    resource is created -- each one traces to a real deploy that
+    silently built-then-rolled-back, diagnosed only after the fact.
+    deploy() runs this automatically and refuses to proceed on any
+    "blocking" issue; check_deploy_compatibility() (the MCP tool) lets
+    an agent run the exact same checks standalone, without spending
+    deploy()'s 5/hour rate limit on a build that would just fail the
+    same way again. This is the one place to keep adding to as new
+    failure classes get diagnosed -- not scattered ad-hoc checks
+    elsewhere. An empty list doesn't guarantee a successful build,
+    only that none of the currently-known failure classes apply."""
+    issues = []
+    issues += _check_npm_lockfile_compat(repo_dir, classification)
+    issues += _check_nextjs_standalone_output(repo_dir, classification)
+    issues += _check_hardcoded_port(repo_dir, classification)
+    issues += _check_dockerfile_healthcheck_tools(repo_dir, classification)
+    return issues
 
 
 # Only generation strategy supported for now -- a 256-bit random hex
@@ -911,7 +1127,8 @@ def build_pack_for(language: str) -> str:
 def create_coolify_app(*, name: str, git_repository: str, git_branch: str,
                         build_pack: str, memory_mb: int, domain: str, server_uuid: str,
                         instant_deploy: bool = True, install_command: str | None = None,
-                        build_command: str | None = None, start_command: str | None = None) -> dict:
+                        build_command: str | None = None, start_command: str | None = None,
+                        private: bool = False) -> dict:
     """instant_deploy=False when the app declares env vars that must be set
     (see resolve_env_vars) -- Coolify's default behaviour builds and starts
     the container immediately on creation, before there's any chance to
@@ -924,7 +1141,14 @@ def create_coolify_app(*, name: str, git_repository: str, git_branch: str,
     tooling-plus-server-script detection), override Nixpacks' own
     auto-detection -- left blank, Nixpacks can independently misdetect an
     app classify() already correctly identified as a real server (see
-    create_coolify_app's docstring history / blylinks-crm)."""
+    create_coolify_app's docstring history / blylinks-crm).
+
+    private -- see _is_private_repo(); switches both the endpoint AND the
+    payload shape (Coolify's private-repo creation route wants
+    github_app_uuid, the public one doesn't accept it at all), not just a
+    query flag on the same call. Caller (deploy()) checks this once per
+    repo and passes the result in -- create_coolify_app() itself has no
+    reason to know about GitHub credentials."""
     payload = {
         "project_uuid": COOLIFY_PROJECT_UUID,
         "server_uuid": server_uuid,
@@ -942,14 +1166,22 @@ def create_coolify_app(*, name: str, git_repository: str, git_branch: str,
         "health_check_path": "/health",
         "instant_deploy": instant_deploy,
     }
+    if private:
+        # Coolify's OpenAPI schema lists both environment_name and
+        # environment_uuid as "required" on this endpoint even though the
+        # description says "at least one" -- pass both rather than assume
+        # which check its validator actually runs.
+        payload["environment_uuid"] = COOLIFY_ENVIRONMENT_UUID
+        payload["github_app_uuid"] = COOLIFY_GITHUB_APP_UUID
     if install_command:
         payload["install_command"] = install_command
     if build_command:
         payload["build_command"] = build_command
     if start_command:
         payload["start_command"] = start_command
+    endpoint = "private-github-app" if private else "public"
     with httpx.Client(timeout=30) as client:
-        r = client.post(f"{COOLIFY_URL}/applications/public", headers=_coolify_headers(), json=payload)
+        r = client.post(f"{COOLIFY_URL}/applications/{endpoint}", headers=_coolify_headers(), json=payload)
         r.raise_for_status()
         return r.json()
 
@@ -1561,6 +1793,18 @@ def deploy(*, owner_repo: str, name: str, owner: str, git_branch: str = "main", 
     if classification["kind"] == "unknown":
         raise DeployError("classify", classification["reason"] + " — cannot proceed automatically")
 
+    # Coolify/Nixpacks-specific -- static sites go to Cloudflare Pages and
+    # zorc-agent nodes have no Nixpacks/Coolify healthcheck at all, so none
+    # of these known failure classes apply to either. See
+    # check_deploy_compatibility()'s own docstring for what each check
+    # traces back to.
+    compat_issues = []
+    if classification["kind"] != "static" and node.get("backend") != "zorc-agent":
+        compat_issues = step("check_deploy_compatibility", check_deploy_compatibility, repo_dir, classification)
+        blocking = [i["message"] for i in compat_issues if i["severity"] == "blocking"]
+        if blocking:
+            raise DeployError("check_deploy_compatibility", "; ".join(blocking))
+
     # zorc-agent nodes have no Nixpacks/buildpack tooling at all (deliberately
     # not installed -- new dependencies on these machines are exactly the
     # footprint zorc-agent exists to avoid). A genuine new constraint versus
@@ -1662,6 +1906,7 @@ def deploy(*, owner_repo: str, name: str, owner: str, git_branch: str = "main", 
             needs_ai=needs_ai, postgres_container_name=postgres_uuid, domain=domain, volumes=volumes,
         )
 
+    is_private = step("check_repo_visibility", _is_private_repo, owner_repo)
     coolify_result = step(
         "create_coolify_app", create_coolify_app,
         name=name, git_repository=f"https://github.com/{owner_repo}",
@@ -1669,6 +1914,7 @@ def deploy(*, owner_repo: str, name: str, owner: str, git_branch: str = "main", 
         server_uuid=node["server_uuid"], instant_deploy=not env_vars_to_set and not persistent_storage,
         build_command=classification.get("build_command"),
         start_command=classification.get("start_command"),
+        private=is_private,
     )
 
     try:
@@ -1735,7 +1981,7 @@ def deploy(*, owner_repo: str, name: str, owner: str, git_branch: str = "main", 
                 log.append({"step": "rollback_postgres", "ok": False, "error": str(cleanup_err)})
         raise
 
-    return {
+    result = {
         "log": log,
         "classification": classification,
         "status": "deployed",
@@ -1746,6 +1992,10 @@ def deploy(*, owner_repo: str, name: str, owner: str, git_branch: str = "main", 
         "message": f"{name} created in Coolify on {target_node}, routed at https://{domain}, "
                     f"registered in registry.yaml. First build is running in Coolify now.",
     }
+    warnings = [i["message"] for i in compat_issues if i["severity"] == "warning"]
+    if warnings:
+        result["compatibility_warnings"] = warnings
+    return result
 
 
 # ============================================================ management
