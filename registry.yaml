@@ -453,18 +453,6 @@ apps:
     critical: false
     depends_on: []
 
-  - name: hello-app
-    target: servingz
-    memory_mb: 256
-    subdomain: hello
-    database: null
-    redis_db: null
-    storage_prefix: null
-    repo: "github.com/zaindroid/hello-app"
-    owner: "zainey"
-    critical: false
-    depends_on: []
-
   - name: zorc-mcp
     target: servingz
     memory_mb: 128
