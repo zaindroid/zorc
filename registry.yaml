@@ -205,6 +205,19 @@ owner_budgets:
 # Applications. Add new entries at the end. Keep alphabetical within groups.
 # ---------------------------------------------------------------------------
 apps:
+  - name: voice-clone-extract
+    target: rtx5090
+    memory_mb: 768
+    subdomain: voice-clone-extract
+    database: null
+    redis_db: null
+    ai: null
+    storage_prefix: null
+    repo: "github.com/zaindroid/voice-clone-extract"
+    owner: "zainey"
+    critical: false
+    depends_on: []
+
   - name: call-editing-tool
     target: servingz
     memory_mb: 384
