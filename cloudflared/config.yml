@@ -91,4 +91,8 @@ ingress:
     noTLSVerify: true
 - hostname: voice-clone-extract.zaindroid.me
   service: http://100.124.93.99:20000
+- hostname: stirling-pdf.zaindroid.me
+  service: https://localhost:443
+  originRequest:
+    noTLSVerify: true
 - service: http_status:404
