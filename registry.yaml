@@ -207,7 +207,7 @@ owner_budgets:
 apps:
   - name: stirling-pdf
     target: servingz
-    memory_mb: 384
+    memory_mb: 2048
     subdomain: stirling-pdf
     database: null
     redis_db: null
