@@ -1556,6 +1556,19 @@ def register_app(*, name: str, memory_mb: int, subdomain: str, repo: str, owner:
     REGISTRY_PATH.write_text(text)
 
 
+def _tunnel_base_config(repo_config_path: Path, live_config_path: Path = Path("/etc/cloudflared/config.yml")) -> dict:
+    """The cloudflared config to change is the LIVE one, not the repo copy. Routes added by hand
+    (mailzchat.de for MailZ) exist only in the live file: rebuilding it from the repo copy erased them
+    on the next deploy and took the site offline. The repo copy is then a mirror of the result."""
+    try:
+        cfg = yaml.safe_load(live_config_path.read_text())
+        if isinstance(cfg, dict) and cfg.get("ingress"):
+            return cfg
+    except (OSError, yaml.YAMLError):
+        pass
+    return yaml.safe_load(repo_config_path.read_text())
+
+
 def add_tunnel_route(hostname: str, service: str = "https://localhost:443") -> None:
     """Every Coolify-managed app routes through the same Traefik hop --
     Traefik dispatches to the right container by Host() header, using the
@@ -1591,7 +1604,7 @@ def add_tunnel_route(hostname: str, service: str = "https://localhost:443") -> N
     if any(r.get("hostname") == hostname for r in live_cfg["ingress"]):
         return  # genuinely already serving this route -- nothing to do
 
-    cfg = yaml.safe_load(repo_config_path.read_text())
+    cfg = _tunnel_base_config(repo_config_path)
     if not any(r.get("hostname") == hostname for r in cfg["ingress"]):
         new_rule = {"hostname": hostname, "service": service}
         if service.startswith("https://"):
@@ -2691,7 +2704,7 @@ def delete_app(name: str) -> dict:
         rollback_results = _zorc_agent_rollback(tailscale_ip, ssh_key, user, rollback_targets)
 
         repo_config_path = ZORC_DIR / "cloudflared" / "config.yml"
-        cfg = yaml.safe_load(repo_config_path.read_text())
+        cfg = _tunnel_base_config(repo_config_path)
         cfg["ingress"] = [r_ for r_ in cfg["ingress"] if r_.get("hostname") != hostname]
         repo_config_path.write_text(yaml.dump(cfg, sort_keys=False))
         # No sudo -- see add_tunnel_route()'s comment on why (NoNewPrivileges
@@ -2727,7 +2740,7 @@ def delete_app(name: str) -> dict:
                     r.raise_for_status()
         domains = mapped.get("domains") or []
         repo_config_path = ZORC_DIR / "cloudflared" / "config.yml"
-        cfg = yaml.safe_load(repo_config_path.read_text())
+        cfg = _tunnel_base_config(repo_config_path)
         service_hostnames = {f"{d}.{PLATFORM_ROOT_DOMAIN}" for d in domains}
         cfg["ingress"] = [r_ for r_ in cfg["ingress"] if r_.get("hostname") not in service_hostnames]
         repo_config_path.write_text(yaml.dump(cfg, sort_keys=False))
@@ -2781,7 +2794,7 @@ def delete_app(name: str) -> dict:
                     r.raise_for_status()
         # remove the tunnel ingress rule
         repo_config_path = ZORC_DIR / "cloudflared" / "config.yml"
-        cfg = yaml.safe_load(repo_config_path.read_text())
+        cfg = _tunnel_base_config(repo_config_path)
         cfg["ingress"] = [r_ for r_ in cfg["ingress"] if r_.get("hostname") != hostname]
         repo_config_path.write_text(yaml.dump(cfg, sort_keys=False))
         # No sudo -- see add_tunnel_route()'s comment on why (NoNewPrivileges
