@@ -99,7 +99,23 @@ ingress:
   service: https://localhost:443
   originRequest:
     noTLSVerify: true
-- hostname: zorc-search.zaindroid.me
+- hostname: mailzchat.de
+  service: https://localhost:443
+  originRequest:
+    noTLSVerify: true
+- hostname: www.mailzchat.de
+  service: https://localhost:443
+  originRequest:
+    noTLSVerify: true
+- hostname: mailzchat.com
+  service: https://localhost:443
+  originRequest:
+    noTLSVerify: true
+- hostname: www.mailzchat.com
+  service: https://localhost:443
+  originRequest:
+    noTLSVerify: true
+- hostname: forge.zaindroid.me
   service: https://localhost:443
   originRequest:
     noTLSVerify: true
