@@ -205,6 +205,19 @@ owner_budgets:
 # Applications. Add new entries at the end. Keep alphabetical within groups.
 # ---------------------------------------------------------------------------
 apps:
+  - name: ivay-voice-agent
+    target: rtx5090
+    memory_mb: 704
+    subdomain: ivay-voice-agent
+    database: null
+    redis_db: null
+    ai: null
+    storage_prefix: null
+    repo: "github.com/zaindroid/ivay-voice-agent"
+    owner: "zainey"
+    critical: false
+    depends_on: []
+
   - name: ivay-voice-portal
     target: servingz
     memory_mb: 534
