@@ -205,6 +205,19 @@ owner_budgets:
 # Applications. Add new entries at the end. Keep alphabetical within groups.
 # ---------------------------------------------------------------------------
 apps:
+  - name: mailz-dev
+    target: rtx5090
+    memory_mb: 512
+    subdomain: mailz-dev
+    database: null
+    redis_db: null
+    ai: true
+    storage_prefix: null
+    repo: "github.com/zaindroid/mailz"
+    owner: "zainey"
+    critical: false
+    depends_on: []
+
   - name: ivay-voice-portal
     target: servingz
     memory_mb: 534
