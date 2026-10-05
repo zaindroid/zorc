@@ -127,4 +127,6 @@ ingress:
   service: https://localhost:443
   originRequest:
     noTLSVerify: true
+- hostname: call-recreator-portal.zaindroid.me
+  service: http://100.124.93.99:20002
 - service: http_status:404
