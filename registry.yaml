@@ -205,6 +205,19 @@ owner_budgets:
 # Applications. Add new entries at the end. Keep alphabetical within groups.
 # ---------------------------------------------------------------------------
 apps:
+  - name: call-recreator-portal-2
+    target: rtx5090
+    memory_mb: 384
+    subdomain: call-recreator-portal-2
+    database: null
+    redis_db: null
+    ai: null
+    storage_prefix: null
+    repo: "github.com/zaindroid/call-recreator-portal"
+    owner: "zainey"
+    critical: false
+    depends_on: []
+
   - name: call-recreator-portal
     target: rtx5090
     memory_mb: 384

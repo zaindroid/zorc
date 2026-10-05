@@ -129,4 +129,6 @@ ingress:
     noTLSVerify: true
 - hostname: call-recreator-portal.zaindroid.me
   service: http://100.124.93.99:20002
+- hostname: call-recreator-portal-2.zaindroid.me
+  service: http://100.124.93.99:20003
 - service: http_status:404
