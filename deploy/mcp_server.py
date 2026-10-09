@@ -658,6 +658,18 @@ def _score_node(node_name: str, node_cfg: dict, memory_mb: int,
                     "reasons": [f"has an accelerator but backend={node_cfg.get('backend')!r} "
                                 "doesn't implement GPU passthrough"]}
 
+    # Reverse of the gate above: a zorc-agent node is the user's own GPU
+    # machine, borrowed for spare capacity, not a general-purpose web host.
+    # request_gpu_service() + admin approve_action() is the intended, gated
+    # path onto it -- without this, a plain non-GPU app's huge headroom
+    # advantage (idle GPU boxes report far more free memory than servingz)
+    # steamrolls the "control-plane preferred" nudge below and deploy()
+    # lands directly on someone's GPU rig with no approval step at all.
+    if not needs_gpu and node_cfg.get("backend") == "zorc-agent":
+        return {"eligible": False, "score": 0.0,
+                "reasons": ["zorc-agent GPU-fleet node -- only eligible for needs_gpu requests via "
+                            "the gated request_gpu_service() path, not direct deploy()"]}
+
     if telemetry.get("status") == "unreachable":
         return {"eligible": False, "score": 0.0, "reasons": ["node is currently unreachable"]}
 
