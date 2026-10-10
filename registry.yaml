@@ -205,6 +205,19 @@ owner_budgets:
 # Applications. Add new entries at the end. Keep alphabetical within groups.
 # ---------------------------------------------------------------------------
 apps:
+  - name: blylinks-records
+    target: hostinger-vps
+    memory_mb: 662
+    subdomain: blylinks-records
+    database: true
+    redis_db: null
+    ai: null
+    storage_prefix: null
+    repo: "github.com/zaindroid/blylinks-records"
+    owner: "zainey"
+    critical: false
+    depends_on: []
+
   - name: ivay-launch-board
     target: servingz
     memory_mb: 384
