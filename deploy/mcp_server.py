@@ -130,16 +130,25 @@ SET_ENV_RATE_LIMIT = 10
 SET_ENV_RATE_WINDOW_SEC = 3600
 _set_env_timestamps: deque[float] = deque()
 
-# Phase 4b: request_teardown() only ever queues -- own generous limit, it's
-# not destructive. approve_action() is where actual deletion happens, so
-# it gets the tightest budget on this server, tighter than redeploy's even
-# -- a mistaken/compromised admin session looping approvals is the one
-# failure mode that can't be undone. reject_action() is harmless (declines
-# a request) and gets a loose limit, mostly to satisfy "every mutating
-# tool has SOME rate limit" rather than because it's a real risk.
+# Phase 4b: request_teardown(confirm_teardown=False), the default, only
+# ever queues -- own generous limit, it's not destructive. approve_action()
+# is where actual deletion happens for a QUEUED request, so it gets the
+# tightest budget on this server, tighter than redeploy's even -- a
+# mistaken/compromised admin session looping approvals is the one failure
+# mode that can't be undone. reject_action() is harmless (declines a
+# request) and gets a loose limit, mostly to satisfy "every mutating tool
+# has SOME rate limit" rather than because it's a real risk.
 TEARDOWN_REQUEST_RATE_LIMIT = 5
 TEARDOWN_REQUEST_RATE_WINDOW_SEC = 3600
 _teardown_request_timestamps: deque[float] = deque()
+
+# Phase 7: request_teardown(confirm_teardown=True) -- an owner tearing down
+# their OWN app immediately, same trust tier as redeploy()/restart() below,
+# no admin in the loop. Its own tight budget, same as approve_action's,
+# since this is the same real deletion that used to only happen there.
+TEARDOWN_RATE_LIMIT = 3
+TEARDOWN_RATE_WINDOW_SEC = 3600
+_teardown_timestamps: deque[float] = deque()
 
 APPROVE_ACTION_RATE_LIMIT = 3
 APPROVE_ACTION_RATE_WINDOW_SEC = 3600
@@ -1509,25 +1518,39 @@ def set_app_env_vars(ctx: Context, name: str, env_vars: dict[str, str]) -> dict:
         return outcome
 
 
-# ------------------------------------------------- Phase 4/6.2: gated actions ----
-# The shared request/approve/reject queue -- deliberately two steps for
-# anything consequential enough to need a human before it happens, per
-# explicit user instruction, rather than the simpler confirm=True pattern
-# deploy()/redeploy()/restart() use for less risky actions. Two action
-# types share this same queue and the same approve_action()/reject_action():
-#   - "teardown" (Phase 4b): the ONE destructive capability on this server.
+# ------------------------------------------------- Phase 4/6.2/7: gated actions ----
+# The shared request/approve/reject queue -- originally deliberately two
+# steps for anything consequential enough to need a human before it
+# happens, per explicit user instruction. Phase 7 relaxed this for
+# teardown specifically (see request_teardown()'s own docstring, and the
+# user's own later instruction superseding the original one): an owner
+# can now tear down their OWN app immediately, same trust tier as
+# deploy()/redeploy()/restart()/set_app_env_vars(), via
+# confirm_teardown=True. An admin can still tear down anything, same as
+# always. The queue (confirm_teardown=False, the default) still exists
+# for whoever wants the review step rather than acting alone.
+# Two action types share this queue and approve_action()/reject_action():
+#   - "teardown" (Phase 4b, relaxed Phase 7): queued only when the caller
+#     explicitly asks for review instead of acting immediately.
 #   - "gpu_service_deploy" (Phase 6.2): a new deploy landing on one of the
 #     user's own GPU machines (rtx5090/jetson-thor/bitbots_gpu) -- not
 #     dedicated to zorc, borrowed for spare capacity only, so nothing new
-#     lands there without a human saying yes. deploy()/redeploy()/restart()
-#     themselves are UNCHANGED and still act immediately, even for a
-#     needs_gpu=True deploy -- this is an additional, safer, opt-in path,
-#     not a restriction bolted onto the existing ones.
-# Both request_*() tools only ever queue; approve_action() is the sole
-# place either agent.delete_app() or agent.deploy() actually runs for a
-# queued request, and it's admin-only regardless of who requested it or
-# who owns the app. A human is in the loop for both, full stop -- there is
-# no path from a client's own call straight to either one.
+#     lands there without a human saying yes. UNCHANGED by Phase 7:
+#     deploy()/redeploy()/restart() themselves still act immediately even
+#     for a needs_gpu=True deploy, but landing on a GPU box specifically
+#     still always queues -- a separate, still-gated concern from an
+#     owner deleting their own already-deployed app.
+#   - "memory_increase": also UNCHANGED by Phase 7, still admin-approved
+#     only, for the same reason gpu_service_deploy is.
+# request_memory_increase() and request_gpu_service() only ever queue;
+# approve_action() is the sole place agent.deploy() (gpu_service_deploy)
+# or agent.resize_app_memory() (memory_increase) actually runs for one of
+# their queued requests, and it's admin-only regardless of who requested
+# it or who owns the app -- a human is in the loop for both, full stop.
+# request_teardown() is the one exception now: confirm_teardown=True calls
+# agent.delete_app() directly, no queue, no approval, same as any other
+# owner-or-admin immediate tool on this server -- and _require_owner_or_admin
+# is still the only gate, so a client can only ever name an app they own.
 
 def _load_pending_actions() -> dict:
     if not PENDING_ACTIONS_PATH.exists():
@@ -1540,25 +1563,58 @@ def _save_pending_actions(actions: dict) -> None:
 
 
 @mcp.tool()
-def request_teardown(ctx: Context, name: str) -> dict:
-    """Queues a teardown request for an app you own (or any app, if
-    you're admin) -- does NOT delete anything. Returns the request's id;
-    an ADMIN must separately call approve_action(id) to actually execute
-    it (see that tool's docstring for why this is two steps). Use
-    list_pending_actions() to check a request's status.
+def request_teardown(ctx: Context, name: str, confirm_teardown: bool = False) -> dict:
+    """Tears down an app you own (or any app, if you're admin).
 
-    Refuses a second pending request for the same app -- returns the
-    existing id instead of creating a duplicate. Rate-limited and
-    audited like every mutating tool here, even though this specific
-    call never deletes anything itself; the actual destruction is
-    entirely inside approve_action()."""
+    confirm_teardown=True executes immediately -- same trust tier as
+    deploy()/redeploy()/restart()/set_app_env_vars(): owner-or-admin, no
+    human-in-the-loop gate. Calls agent.delete_app(name) directly,
+    genuinely irreversible: the Coolify resource (or Pages project), its
+    DNS record, its tunnel route, the resource_map entry, and the
+    registry.yaml entry are all removed, and the registry change is
+    committed. _require_owner_or_admin is still the only gate -- a client
+    (non-admin) can only ever name an app it actually owns; an admin can
+    tear down anything. Rate-limited tighter than every other immediate
+    tool on this server (3/hour platform-wide) because it's the one
+    destructive one.
+
+    confirm_teardown=False (the default) instead only QUEUES a teardown
+    request and returns its id -- does NOT delete anything. An ADMIN can
+    then call approve_action(id) to execute it, or reject_action(id) to
+    decline it; list_pending_actions() checks status. This was previously
+    the only path; it still exists for a caller that wants a second set
+    of eyes before anything happens, it's just no longer the only way in.
+
+    Refuses a second pending QUEUED request for the same app -- returns
+    the existing id instead of creating a duplicate (confirm_teardown=True
+    is unaffected by an existing queued request; they're independent).
+    Rate-limited and audited either way."""
     caller = _caller_identity(ctx)
-    params = {"name": name}
+    params = {"name": name, "confirm_teardown": confirm_teardown}
 
     gate = _require_owner_or_admin(caller, name)
     if not gate["ok"]:
         _audit("request_teardown", params, gate, client=caller)
         return gate
+
+    if confirm_teardown:
+        now = time.time()
+        if _rate_limited(_teardown_timestamps, TEARDOWN_RATE_LIMIT, TEARDOWN_RATE_WINDOW_SEC):
+            outcome = {"status": "rejected",
+                       "reason": f"rate limit: {TEARDOWN_RATE_LIMIT} teardowns per "
+                                 f"{TEARDOWN_RATE_WINDOW_SEC}s exceeded"}
+            _audit("request_teardown", params, outcome, client=caller)
+            return outcome
+        try:
+            result = agent.delete_app(name)
+            _teardown_timestamps.append(now)
+            outcome = {"status": "torn_down", "name": name, "result": result}
+            _audit("request_teardown", params, outcome, client=caller)
+            return outcome
+        except Exception as e:
+            outcome = {"status": "failed", "name": name, "reason": str(e)}
+            _audit("request_teardown", params, outcome, client=caller)
+            return outcome
 
     now = time.time()
     if _rate_limited(_teardown_request_timestamps, TEARDOWN_REQUEST_RATE_LIMIT, TEARDOWN_REQUEST_RATE_WINDOW_SEC):
@@ -1844,13 +1900,18 @@ def approve_action(ctx: Context, id: str) -> dict:
     """Executes a pending action queued by request_teardown(),
     request_gpu_service(), or request_memory_increase() -- ADMIN ONLY,
     full stop, regardless of who requested it or who owns the app. This
-    is the ONE place any of these three kinds of consequential change
-    actually happens on this server: real destruction (teardown), a real
-    deploy landing on one of the user's own GPU machines
-    (gpu_service_deploy), or a bigger memory allocation for an existing
-    app (memory_increase) -- deploy()/redeploy()/restart() only ever
-    create or re-apply on servingz/hostinger-vps, immediately, no
-    approval gate. Refuses cleanly (never a stack trace) for a non-admin
+    is the place a QUEUED instance of any of these three kinds of
+    consequential change actually happens on this server: real
+    destruction (teardown), a real deploy landing on one of the user's
+    own GPU machines (gpu_service_deploy), or a bigger memory allocation
+    for an existing app (memory_increase) -- deploy()/redeploy()/
+    restart()/set_app_env_vars() only ever create or re-apply on
+    servingz/hostinger-vps, immediately, no approval gate, and (as of
+    Phase 7) request_teardown(confirm_teardown=True) tears down an
+    owner's own app immediately too, same tier, bypassing this queue
+    entirely -- this tool is no longer the ONLY place teardown can
+    happen, only the only place a QUEUED one is resolved. Refuses
+    cleanly (never a stack trace) for a non-admin
     caller, an unknown id, or an id that's already been resolved
     (approved/rejected already) -- never silently no-ops or re-executes
     something twice.
