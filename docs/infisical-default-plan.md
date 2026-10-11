@@ -1,7 +1,8 @@
 # Plan: make Infisical the default secret path across zorc
 
-Status: **design only, nothing implemented, needs sign-off** (written
-2026-10-12). Follows `docs/infisical-plan.md`, which shipped Redis,
+Status: **design agreed (2026-10-12), decisions recorded at the end; P0
+partly in progress, auto-reuse (P3) held until the backup restore drill is
+proven.** Written 2026-10-12. Follows `docs/infisical-plan.md`, which shipped Redis,
 the Infisical deployment, and opt-in `from_infisical` references. This
 document scopes the next layer, which changes how every future deploy
 handles secrets and, in part 3, touches the platform's own live
@@ -112,11 +113,15 @@ quietly receive the owner's real key. Mitigations, all required:
 - `analyze_deployment_requirements()` lists exactly which keys would be
   auto-resolved and from which path (names and paths, never values), and
   `deploy()` rejects a report where that list changed after analysis.
-- Open question for the user: should `/shared` reuse require a per-name
-  allowlist on the app (`app.yaml` is not trusted for this, so it would
-  live in zorc config or the report approval)? Default proposal: no
-  allowlist, rely on the visibility above, since the owner reviews the
-  report.
+- **Decided: `/shared` reuse requires an explicit allowlist**, not just
+  report review (review fatigue makes the latter weaker than it sounds). The
+  allowlist is owner-configured, not read from the repo's `app.yaml`
+  (untrusted), and is per app and per name:
+  `"shared_reuse": {"<owner>": {"<app-name>": ["GEMINI_API_KEY"]}}` in
+  `infisical.json`. A name not on the list is never auto-resolved from
+  `/shared`, whatever the repo declares. `/apps/<app-name>` needs no
+  allowlist: placing a secret under the app's own folder is already the
+  deliberate act.
 
 ### Failure behaviour
 
@@ -205,17 +210,32 @@ band, and rotated by hand. Everything else can be a reference.
 
 Each phase is its own PR; P0 is largely human/operational.
 
-## Decisions needed
+## Decisions (recorded 2026-10-12, relayed from the user)
 
-1. **Scope of migration (part 3):** agree that Coolify token, SSH keys,
-   `infisical.json` and `mcp_token.json` stay as files (break-glass), and
-   only Cloudflare and app-level credentials move?
-2. **Auto-reuse folders:** `/apps/<app-name>` then `/shared`, as above, or a
-   different convention?
-3. **Untrusted repos:** is "owner reviews the analysis report" sufficient,
-   or should `/shared` reuse need an explicit allowlist?
-4. **Outage behaviour:** fail loudly (proposed) or fall back to raw
-   `env_overrides` automatically when Infisical is unreachable?
-5. **P0:** who owns backup/escrow of Infisical's `ENCRYPTION_KEY` and
-   database, and is a restore drill acceptable before P3?
-6. **Order:** P1 and P2 are safe to start now; hold P3 until P0 is done?
+1. **Scope of migration:** Coolify token, SSH keys, `infisical.json` and
+   `mcp_token.json` stay as files (break-glass tier). Only Cloudflare and
+   app-level credentials move.
+2. **Auto-reuse folders:** `/apps/<app-name>` then `/shared`, as above.
+3. **Untrusted repos:** `/shared` reuse needs an explicit per-owner, per-app,
+   per-name allowlist (see above); report review alone is not enough.
+4. **Outage behaviour:** fail loudly when Infisical is unreachable; never
+   fall back to a raw value silently. Matches the platform's existing
+   "fail loudly, never silently default" rule.
+5. **Backup:** required before anything depends on Infisical being
+   load-bearing. Use the existing `zorc-backup` pipeline (do not invent a
+   new mechanism): confirm Infisical's dedicated Postgres is in it (it was
+   not; see #18), then do one real restore drill.
+6. **Order:** P1 and P2 start now; P3 (auto-reuse) is held until the
+   restore drill in point 5 has actually been run and passed.
+
+## P0 status
+
+| Item | State |
+|---|---|
+| Infisical Postgres in the nightly backup | PR #18 (generic dump of every dedicated Postgres on servingz) |
+| Infisical `ENCRYPTION_KEY`/`AUTH_SECRET` recoverable | Yes: stored as Coolify env, covered by the Coolify Postgres dump plus `APP_KEY` in `coolify_data.tar.gz` |
+| Restore drill | Not done; run after #18 is merged and one backup has completed |
+| Remote nodes' dedicated Postgres (hostinger-vps) | Not covered; separate follow-up |
+| Pin Infisical image version | Open |
+| Rotate machine-identity client secret | Open |
+| `owner_defaults` / `shared_reuse` config | Open (needed for P3) |
