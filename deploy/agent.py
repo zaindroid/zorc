@@ -2657,6 +2657,96 @@ def set_app_env_vars(name: str, env_vars: dict[str, str]) -> dict:
     return {"updated": name, "keys": sorted(env_vars.keys()), "coolify_uuid": coolify_uuid}
 
 
+def set_custom_domain(name: str, domain: str, replace: bool = False) -> dict:
+    """Attaches a real custom domain to an EXISTING, already-registered
+    single-container Coolify app -- the same mechanism blylinks-crm's
+    portal.blylinks.com already uses by hand: Coolify's own Traefik picks
+    up the domain and issues its own Let's Encrypt cert once DNS actually
+    points at the node, same as any other Coolify-managed FQDN.
+
+    Only works for apps on a has_public_ip node (hostinger-vps, ovh, any
+    future one) -- a domain can only be pointed at a node with a real IP
+    to receive it. servingz has no public IP of its own (home network,
+    reachable only via the existing Cloudflare Tunnel); a custom domain
+    for a servingz app needs the tunnel mechanism instead (a CNAME to the
+    tunnel + a cloudflared public-hostname route, see mailzchat.com/.de
+    for the existing hand-set-up example) -- this function refuses
+    cleanly rather than silently doing the wrong thing for a servingz app.
+
+    replace=False (default) ADDS the domain alongside whatever Coolify
+    already serves this app on (its {subdomain}.zaindroid.me keeps
+    working); replace=True drops every existing domain and serves only
+    the new one, matching how blylinks-crm itself is set up (subdomain:
+    null in registry.yaml -- the platform subdomain was deliberately
+    given up, not kept as a fallback).
+
+    This only attaches the domain on Coolify's side and redeploys so the
+    FQDN/Traefik config actually takes it -- it does NOT touch DNS at
+    all. The caller is responsible for pointing the domain's own A record
+    (and AAAA, for IPv6) at the target node's public IP; until that
+    propagates and Let's Encrypt can validate it, Coolify will show the
+    app as unreachable over the new domain even though this call
+    succeeded.
+
+    Refuses (ValueError, never silently no-ops) if the app isn't
+    registered, isn't a Coolify app, or its target node has no public IP."""
+    if not name_taken(name):
+        raise ValueError(f"{name!r} is not a registered app -- nothing to update")
+    if not domain or "/" in domain or " " in domain:
+        raise ValueError(f"{domain!r} doesn't look like a bare domain (e.g. 'example.com', no scheme/path)")
+    mapped = _load_resource_map().get(name, {})
+    kind = mapped.get("kind")
+    if kind != "coolify":
+        raise ValueError(
+            f"{name!r} is a {kind!r} app -- set_custom_domain() only supports single-container "
+            "Coolify apps (kind 'coolify') right now"
+        )
+    coolify_uuid = mapped.get("coolify_uuid")
+    if not coolify_uuid:
+        raise ValueError(f"{name!r} has no recorded coolify_uuid in resource_map.json -- cannot update")
+
+    reg = load_registry()
+    app_entry = next((a for a in reg.get("apps", []) if a["name"] == name), None)
+    if app_entry is None:
+        raise ValueError(f"{name!r} has a resource_map.json entry but no registry.yaml entry -- inconsistent state")
+    target_node = app_entry["target"]
+    node_cfg = reg["nodes"].get(target_node, {})
+    if not node_cfg.get("has_public_ip"):
+        raise ValueError(
+            f"{name!r} is on {target_node!r}, which has no public IP of its own -- a custom domain can't "
+            f"point directly at it. Either move this app to a public-IP node (hostinger-vps or ovh), or use "
+            f"the Cloudflare Tunnel mechanism instead (CNAME to the tunnel + a cloudflared public-hostname "
+            f"route, see mailzchat.com's setup) -- that path isn't automated by this function yet."
+        )
+    node_ip = node_cfg.get("ip")
+
+    with httpx.Client(timeout=30) as client:
+        existing = client.get(f"{COOLIFY_URL}/applications/{coolify_uuid}", headers=_coolify_headers())
+        existing.raise_for_status()
+        current_domains = [d.strip() for d in (existing.json().get("fqdn") or "").split(",") if d.strip()]
+
+        new_domain_url = f"https://{domain}"
+        domains_list = [new_domain_url] if replace else (
+            current_domains if new_domain_url in current_domains else current_domains + [new_domain_url]
+        )
+
+        r = client.patch(f"{COOLIFY_URL}/applications/{coolify_uuid}",
+                          headers=_coolify_headers(), json={"domains": ",".join(domains_list)})
+        r.raise_for_status()
+
+    trigger_coolify_deploy(coolify_uuid)
+
+    return {
+        "updated": name, "domain": domain, "target_node": target_node, "node_ip": node_ip,
+        "all_domains": [d.replace("https://", "") for d in domains_list], "coolify_uuid": coolify_uuid,
+        "dns_todo": (f"Point {domain}'s DNS A record (and AAAA for IPv6) at {node_ip}. Coolify issues a "
+                     f"Let's Encrypt cert automatically once that resolves and is reachable -- can take a "
+                     f"few minutes after DNS propagates." if node_ip else
+                     f"Point {domain}'s DNS A record at {target_node}'s public IP (not recorded in "
+                     f"registry.yaml for this node -- check it directly)."),
+    }
+
+
 def remove_registry_entry(name: str) -> None:
     text = REGISTRY_PATH.read_text()
     lines = text.split("\n")

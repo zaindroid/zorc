@@ -130,6 +130,10 @@ SET_ENV_RATE_LIMIT = 10
 SET_ENV_RATE_WINDOW_SEC = 3600
 _set_env_timestamps: deque[float] = deque()
 
+SET_DOMAIN_RATE_LIMIT = 10
+SET_DOMAIN_RATE_WINDOW_SEC = 3600
+_set_domain_timestamps: deque[float] = deque()
+
 # Phase 4b: request_teardown(confirm_teardown=False), the default, only
 # ever queues -- own generous limit, it's not destructive. approve_action()
 # is where actual deletion happens for a QUEUED request, so it gets the
@@ -1580,6 +1584,67 @@ def set_app_env_vars(ctx: Context, name: str, env_vars: dict[str, str]) -> dict:
     except Exception as e:
         outcome = {"status": "failed", "reason": str(e)}
         _audit("set_app_env_vars", params, outcome, client=caller)
+        return outcome
+
+
+@mcp.tool()
+def add_custom_domain(ctx: Context, name: str, domain: str, replace: bool = False) -> dict:
+    """Attaches a real custom domain (not a {subdomain}.zaindroid.me one)
+    to an app you own (or any app, if you're admin), then redeploys so
+    Coolify's Traefik actually picks it up -- the same mechanism
+    blylinks-crm's portal.blylinks.com already uses by hand, now reachable
+    through zorc instead of the Coolify dashboard directly.
+
+    Only works for apps on a public-IP node (hostinger-vps, ovh, any
+    future one) -- a domain's DNS has to point somewhere real, and
+    servingz has no public IP of its own (home network, Cloudflare Tunnel
+    only). Rejected with a clear reason for a servingz app; use the
+    Cloudflare Tunnel mechanism by hand for that case (see mailzchat.com's
+    existing setup) until that path gets its own automation too.
+
+    replace=False (default) ADDS the domain alongside the app's existing
+    {subdomain}.zaindroid.me, which keeps working. replace=True drops
+    every other domain and serves only this one.
+
+    This does NOT touch DNS -- the response's dns_todo field says exactly
+    what A/AAAA record to create and where. Until that's done and
+    propagates, Coolify can't issue the domain's Let's Encrypt cert, so
+    the domain will show as unreachable even though this call succeeded.
+
+    Same trust tier as set_app_env_vars()/redeploy()/restart(), not the
+    request-and-approve queue: owner-or-admin, immediate, no human-in-
+    the-loop gate -- attaching a domain to your own app is strictly less
+    consequential than a full redeploy, which you can already do without
+    approval."""
+    caller = _caller_identity(ctx)
+    params = {"name": name, "domain": domain, "replace": replace}
+
+    gate = _require_owner_or_admin(caller, name)
+    if not gate["ok"]:
+        _audit("add_custom_domain", params, gate, client=caller)
+        return gate
+
+    now = time.time()
+    if _rate_limited(_set_domain_timestamps, SET_DOMAIN_RATE_LIMIT, SET_DOMAIN_RATE_WINDOW_SEC):
+        outcome = {"status": "rejected",
+                   "reason": f"rate limit: {SET_DOMAIN_RATE_LIMIT} domain updates per "
+                             f"{SET_DOMAIN_RATE_WINDOW_SEC}s exceeded"}
+        _audit("add_custom_domain", params, outcome, client=caller)
+        return outcome
+
+    try:
+        result = agent.set_custom_domain(name, domain, replace=replace)
+        _set_domain_timestamps.append(now)
+        outcome = {"status": "updated", **result}
+        _audit("add_custom_domain", params, outcome, client=caller)
+        return outcome
+    except ValueError as e:
+        outcome = {"status": "rejected", "reason": str(e)}
+        _audit("add_custom_domain", params, outcome, client=caller)
+        return outcome
+    except Exception as e:
+        outcome = {"status": "failed", "reason": str(e)}
+        _audit("add_custom_domain", params, outcome, client=caller)
         return outcome
 
 
