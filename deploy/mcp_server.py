@@ -714,14 +714,47 @@ def _score_node(node_name: str, node_cfg: dict, memory_mb: int,
 
 
 def _recommend_placement(memory_mb: int, needs_public_ip: bool, required_arch: str | None = None,
-                          needs_gpu: bool = False) -> dict:
+                          needs_gpu: bool = False, preferred_node: str | None = None) -> dict:
     """Scores every node in registry.yaml against this placement request,
     combining the policy layer (registry.yaml: budget, is_control_plane,
     has_public_ip) with the live layer (nodes/*.yaml: architecture,
     accelerator, reachability, telemetry freshness). Replaces the old
     two-node hardcoded fallback -- this is meant to keep working correctly
-    as the fleet grows past two nodes, not just for today's two."""
+    as the fleet grows past two nodes, not just for today's two.
+
+    preferred_node, when set, is a hard request, not a hint: skip scoring
+    every node and check only this one against the same hard-requirement
+    gates _score_node always enforces (budget headroom, public IP, arch,
+    GPU/backend match, reachability). If it's eligible, it's returned,
+    full stop -- never outscored by a "better" node. If it ISN'T eligible,
+    this returns fits=False with the specific reason, and never silently
+    substitutes a different node -- an explicit host request is honored
+    or refused, not quietly overridden by the auto-placement policy below."""
     reg = agent.load_registry()
+
+    if preferred_node is not None:
+        node_cfg = reg["nodes"].get(preferred_node)
+        if node_cfg is None:
+            return {
+                "recommended_node": None, "fits": False,
+                "reason": f"preferred_node {preferred_node!r} is not a registered node -- "
+                          f"known nodes: {sorted(reg['nodes'])}",
+            }
+        scored_one = _score_node(preferred_node, node_cfg, memory_mb, needs_public_ip, required_arch, needs_gpu)
+        if not scored_one["eligible"]:
+            return {
+                "recommended_node": None, "fits": False,
+                "reason": f"preferred_node {preferred_node!r} was requested but can't take this app: "
+                          f"{'; '.join(scored_one['reasons'])}. Not falling back to another node -- "
+                          f"ask the human whether to pick a different host or adjust this app's requirements.",
+            }
+        return {
+            "recommended_node": preferred_node,
+            "fits": True,
+            "reason": f"user-specified host, honored as requested: {'; '.join(scored_one['reasons'])}",
+            "candidates_considered": {preferred_node: {"eligible": True, "score": round(scored_one["score"], 2)}},
+        }
+
     scored = {
         node_name: _score_node(node_name, node_cfg, memory_mb, needs_public_ip, required_arch, needs_gpu)
         for node_name, node_cfg in reg["nodes"].items()
@@ -746,7 +779,7 @@ def _recommend_placement(memory_mb: int, needs_public_ip: bool, required_arch: s
 
 @mcp.tool()
 def recommend_placement(memory_mb: int, needs_public_ip: bool = False, required_arch: str | None = None,
-                         needs_gpu: bool = False) -> dict:
+                         needs_gpu: bool = False, preferred_node: str | None = None) -> dict:
     """Recommends which node to target by scoring every registered node
     against this request -- budget fit, public-IP requirement, optional
     architecture match, GPU availability, and live reachability/telemetry
@@ -757,8 +790,17 @@ def recommend_placement(memory_mb: int, needs_public_ip: bool = False, required_
     (candidates_considered), not just the winner. For an actual deploy(),
     use analyze_deployment_requirements() instead, which does this same
     scoring but from a properly-derived memory estimate rather than a
-    number you supply directly."""
-    return _recommend_placement(memory_mb, needs_public_ip, required_arch, needs_gpu)
+    number you supply directly.
+
+    preferred_node names a specific node to check instead of scoring the
+    whole fleet -- use this when a human has already said where they want
+    something deployed. It's still a real check, not a rubber stamp: the
+    same hard-requirement gates apply (budget, public IP, arch, GPU), so
+    fits can come back False with a specific reason if that node genuinely
+    can't take this request. It never falls back to a different node on
+    its own -- an explicit host request is honored or refused, never
+    silently overridden."""
+    return _recommend_placement(memory_mb, needs_public_ip, required_arch, needs_gpu, preferred_node)
 
 
 def _estimate_memory_from_repo(repo_dir, classification: dict) -> tuple[int, list[str]]:
@@ -817,6 +859,7 @@ def analyze_deployment_requirements(
     needs_gpu: bool,
     estimated_memory_mb: int,
     reasoning: str,
+    preferred_node: str | None = None,
 ) -> dict:
     """REQUIRED before deploy() -- deploy() will reject any call that
     doesn't reference an approved report_id from here. Submit your actual
@@ -884,7 +927,23 @@ def analyze_deployment_requirements(
     here too, same as a repo/estimate mismatch. Admin callers are exempt
     entirely. This is advisory, not a hard infrastructure limit -- ask an
     admin to raise your override in registry.yaml if a real need
-    outgrows it."""
+    outgrows it.
+
+    preferred_node: if a human names a specific host ("put this on ovh",
+    "deploy it to hostinger"), pass that node's exact registry.yaml name
+    here -- it is honored as a hard request, not a hint. Only this node is
+    checked (the automatic fleet-wide scorer in recommend_placement() is
+    skipped entirely), and if it's eligible it's used regardless of
+    whether another node would score better. If the named node genuinely
+    can't take this app (not enough headroom, no public IP, GPU/backend
+    mismatch, unreachable), status is "blocked" with that specific reason
+    -- this never silently falls back to a different node on its own; ask
+    the human how they want to proceed. Leave this unset (the default) to
+    let the platform pick automatically via the same fitness scoring
+    recommend_placement() exposes for preview -- budget headroom, public-
+    IP fit, GPU/arch match, live reachability and telemetry freshness,
+    with a nudge toward control-plane nodes when there's no public-IP
+    requirement forcing the choice."""
     caller = _caller_identity(ctx)
 
     if architecture == "frontend_backend_split":
@@ -1042,7 +1101,8 @@ def analyze_deployment_requirements(
                 ),
             }
 
-    placement = _recommend_placement(adjusted_estimate_mb, needs_public_ip, needs_gpu=needs_gpu)
+    placement = _recommend_placement(adjusted_estimate_mb, needs_public_ip, needs_gpu=needs_gpu,
+                                      preferred_node=preferred_node)
     if not placement["fits"]:
         return {
             "status": "blocked",
@@ -1054,7 +1114,10 @@ def analyze_deployment_requirements(
             "ai_provisioned": ai_requested,
             **({"ai_gateway": ai_gateway_info} if ai_gateway_info else {}),
             "needs_gpu": needs_gpu,
-            "reason": f"requirements are consistent, but nothing fits: {placement['reason']}",
+            "preferred_node": preferred_node,
+            "reason": (f"requested host {preferred_node!r} can't take this app: {placement['reason']}"
+                       if preferred_node else
+                       f"requirements are consistent, but nothing fits: {placement['reason']}"),
         }
 
     report_id = secrets_module.token_hex(8)
@@ -1066,6 +1129,8 @@ def analyze_deployment_requirements(
         "warnings": warnings,
         "recommended_memory_mb": adjusted_estimate_mb,
         "recommended_node": placement["recommended_node"],
+        "node_selection": "user_specified" if preferred_node else "auto",
+        "placement_reason": placement["reason"],
         "recommended_build_tool": "dockerfile" if classification["language"] == "dockerfile" else "nixpacks",
         "app_kind": app_kind,
         "framework": framework,
