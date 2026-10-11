@@ -54,6 +54,19 @@ nodes:
     backend: coolify
     is_control_plane: false
 
+  ovh:
+    total_memory_mb: 3814
+    reserved_mb: 800         # Docker + coolify-proxy/sentinel + OS (observed ~607MB live baseline,
+                              # budgeted above that for growth -- no shared Postgres/Redis here)
+    usable_mb: 3014
+    max_utilisation: 0.80    # never allocate beyond ~2411 MB
+    server_uuid: zzul4u2bbawhudsecnbqlzd2
+    has_public_ip: true      # real public IPv4+IPv6 -- can take direct ingress
+    ip: 149.56.142.170
+    provider: ovhcloud
+    backend: coolify
+    is_control_plane: false
+
   rtx5090:
     # Personal GPU workstation, NOT zorc-owned -- already runs 40+ of the
     # user's own containers (Supabase, n8n, Langfuse, inference services)
