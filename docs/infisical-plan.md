@@ -1,107 +1,122 @@
-# Plan: Redis as a first-class resource + Infisical shared secrets platform
+# Redis as a first-class resource + Infisical shared secrets platform
 
-Status: architecture only, not yet implemented. Written 2026-10-11 after a
-session that shipped `preferred_node` placement, `add_custom_domain`, and the
-public-IP node-probing fix (PRs #2/#3/#5) — this is the next piece of work,
-picked up fresh so it gets proper budget (a secrets manager is the most
-security-sensitive thing on the platform; not worth rushing).
+Status: **shipped and verified live** (2026-10-12). This began as a plan
+written 2026-10-11 and is now the reference for what was built, what
+differs from the original plan, and what is still manual. Each step landed
+as its own PR.
 
-Companion repo for the Infisical image itself:
-github.com/zaindroid/infisical-selfhost (just `FROM infisical/infisical:latest`
-for now — not deployable yet, see step 2 below).
+| Step | PR | State |
+|---|---|---|
+| 1. `redis: true` dedicated Redis per app | #8 | merged, live-verified |
+| 2. `health_path` + `generate: hex16`, Infisical deployed | #12 (+ deploy) | merged; Infisical running at https://infisical.zaindroid.me |
+| 3. `from_infisical` references | #14 | merged, verified end to end against the real instance |
+| Infisical's own error text in failures | #15 | see PR |
 
-## 1. Redis as a first-class resource (build this first — Infisical needs it)
+## 1. Redis as a first-class resource
 
-Mirrors `database: true` exactly, not the half-built `redis_db` field that
-currently exists in registry.yaml's app schema with zero provisioning code
-behind it (confirmed: `grep -i redis deploy/agent.py` turns up nothing but
-that one dead field). Replace it with one real model instead of two
-half-built ones.
+`app.yaml` takes a top-level `redis: true`, same shape as `database: true`.
+`deploy()` provisions a **dedicated** Redis per app (never shared), generates
+its password, verifies it with an authenticated `PING`, and sets `REDIS_URL`
+before the app's first start. The caller never sees the credential.
 
-- `app.yaml` gains top-level `redis: true` (same shape as `database: true`).
-- `deploy()` provisions a DEDICATED Redis container per app (not shared —
-  same "no cross-app access" principle `database: true` already follows),
-  sets `REDIS_URL` before the container's first real start, generate-and-set
-  pattern, caller never sees credentials — same contract as DATABASE_URL.
-- New code needed, mirroring the existing Postgres functions exactly:
-  - `_provision_redis_coolify()` (Coolify-backend nodes) — likely
-    `redis:7-alpine` via Coolify's database-resource API if it supports
-    Redis as a first-class type, else a plain `docker run` over SSH same as
-    `_provision_postgres_zorc_agent()` does for its backend.
-  - `_provision_redis_zorc_agent()` (zorc-agent nodes) — direct `docker run`,
-    generated `--requirepass`, matches `_provision_postgres_zorc_agent()`'s
-    shape.
-  - Wire both into `deploy()`'s existing provisioning sequence, same place
-    `database: true` already hooks in.
-- `registry.yaml` schema: replace `redis_db: null` with `redis: true/false`
-  in every app entry, update the schema comment block, update
-  `analyze_deployment_requirements()`'s report to surface `redis_provisioned`
-  the same way it already surfaces `database_provisioned`/`ai_provisioned`.
+- Coolify nodes: `POST /databases/redis` with a generated `redis_password`.
+- zorc-agent nodes: `docker run redis:7-alpine`, password passed by env var
+  and expanded by the container's shell so it never appears in process args.
+- 64 MB is added to the app's memory for the budget check
+  (`DEDICATED_REDIS_MEMORY_MB`).
+- A failed deploy rolls Redis back (and the Postgres created just before it,
+  if Redis is what failed). `delete_app` removes it on teardown.
+- `registry.yaml`'s dead `redis_db: null` field was replaced by `redis`;
+  `analyze_deployment_requirements()` reports `redis_provisioned`.
+
+Not changed: `delete_app` on the Coolify path still does not remove an app's
+dedicated Postgres (pre-existing behaviour, deliberately left alone).
 
 ## 2. Infisical deployment
 
-**Known gap, resolve first:** zorc's `deploy()` only builds from a GitHub
-repo (Nixpacks or the repo's own Dockerfile) — there's no "deploy this exact
-registry image" path. A wrapper repo (`FROM infisical/infisical:latest`,
-nothing else) is the straightforward fix, already created at
-github.com/zaindroid/infisical-selfhost.
+Deployed from `github.com/zaindroid/infisical-selfhost` (a thin wrapper
+around `infisical/infisical`) on servingz as app `infisical`.
 
-**Second known gap:** `create_coolify_app()` hardcodes
-`"health_check_path": "/health"` in its Coolify payload. Infisical's actual
-health endpoint needs confirming before this "just works" — if it's
-something else (e.g. `/api/status`), either teach `create_coolify_app()` to
-accept a configurable `health_check_path` (the more honest, reusable fix —
-this will bite again for any future prebuilt-image deploy, not just this
-one), or add a tiny shim in the wrapper repo's Dockerfile.
+What the original plan did not anticipate, all handled:
 
-**app.yaml** (once Redis support from step 1 exists):
-```yaml
-name: infisical
-memory_mb: 512   # placeholder, needs a real analyze_deployment_requirements() estimate
-database: true
-redis: true
-env:
-  ENCRYPTION_KEY:
-    generate: hex
-  AUTH_SECRET:
-    generate: hex
+- **Health route:** Infisical's is `/api/status`, not `/health`.
+  `create_coolify_app()` now takes `health_check_path`, driven by
+  `app.yaml`'s optional `health_path` (default `/health`, validated).
+- **Key size:** `ENCRYPTION_KEY` is a 16-byte hex value; the existing
+  `generate: hex` yields 32 bytes. Added `generate: hex16`.
+- **DB variable name:** Infisical reads `DB_CONNECTION_URI`, zorc injects
+  `DATABASE_URL`. The wrapper's entrypoint maps one to the other.
+- **Heap:** upstream defaults to a 2 GB Node heap; the wrapper lowers it
+  (`--max-old-space-size=640`) to fit the container limit.
+- **`SITE_URL`:** chicken-and-egg as planned; set with `set_app_env_vars()`
+  after the first deploy, which triggers a rolling redeploy.
+
+Wrapper `app.yaml`: `database: true`, `redis: true`,
+`health_path: /api/status`, `ENCRYPTION_KEY: {generate: hex16}`,
+`AUTH_SECRET: {generate: hex}`. Reported memory ~918 MB (704 analysed plus
+the dedicated Postgres and Redis).
+
+Manual, one-time (not automatable by design): the first admin account, a
+project, and a Universal Auth machine identity added to that project.
+
+The wrapper image is still `FROM infisical/infisical:latest`; pinning a
+version is advisable.
+
+## 3. Secret resolution at deploy time
+
+`env_overrides` (`deploy()`, `request_gpu_service()`) and `set_app_env_vars()`
+accept, instead of a literal string:
+
+```json
+{"STRIPE_KEY": {"from_infisical": "<project-id>/<folders>/<SECRET_NAME>",
+                "environment": "prod"}}
 ```
-`SITE_URL` is chicken-and-egg (depends on the subdomain deploy() assigns) —
-two-step: deploy first, then `set_app_env_vars()` with the real URL, then
-`redeploy()`. Same pattern already proven working this session.
 
-**Target node:** `hostinger-vps` or `ovh` if a custom domain via
-`add_custom_domain()` matters later; `servingz` is fine for internal-only use.
+`environment` is optional (default `prod`). The first segment is the project
+**ID** (the UUID from the project's settings, not its name or slug), the
+last is the secret name, anything between is the folder path.
 
-## 3. The actual payoff: seamless secret resolution at deploy time
+- Resolved server-side with Universal Auth login, then
+  `GET /api/v4/secrets/{name}?projectId&environment&secretPath`.
+- In `deploy()` this runs in the `resolve_env_vars` step, before anything is
+  created, and only for keys `app.yaml` declares `required: true`.
+- Values never appear in logs or errors; the audit log records reference
+  paths and key names only.
 
-This is the part that makes it "seamless" rather than just another app with
-its own env vars.
+### Config
 
-- Infisical exposes machine-identity auth + a REST API to read secrets by
-  project/path.
-- New zorc capability: `env_overrides` (or a new `secret_refs` param) accepts
-  `{"KEY": {"from_infisical": "project/path/SECRET_NAME"}}` instead of (or
-  alongside) a raw value. `deploy()`/`set_app_env_vars()` resolves it
-  server-side at deploy/set time using a zorc-held Infisical machine-identity
-  token — same trust tier as the existing Coolify API token in
-  `deploy/secrets/`, no new credential-handling pattern invented.
-- This is the real win: type a credential into Infisical once, every app
-  that needs it references it by name, rotation happens in one place instead
-  of hunting down every app.yaml/env_overrides call site that has a copy.
-- Build this LAST, as its own PR, once Infisical itself is actually running
-  and steps 1–2 are proven live.
+`deploy/secrets/infisical.json`, placed by a human like `coolify.json`:
 
-## Suggested sequencing for the next session
+```json
+{"url": "https://infisical.zaindroid.me",
+ "client_id": "...", "client_secret": "...",
+ "project_access": {"<project-id>": ["owner-name", ...]}}
+```
 
-1. Confirm Infisical's real health endpoint (quick live check against the
-   public image, or read its source/docs precisely).
-2. Build and ship Redis provisioning (step 1) — testable independently of
-   Infisical, lower risk, unblocks step 2.
-3. Deploy Infisical itself (step 2), verify it's actually reachable and
-   healthy, create a first real secret in it by hand to confirm the whole
-   stack works before building any automation on top of it.
-4. Build the `from_infisical` resolution layer (step 3) last.
+### Authorization (added beyond the original plan)
 
-Each step is independently shippable and testable — don't try to land all
-three in one PR.
+The machine identity can read every project it is granted, so without a gate
+any caller able to `deploy()` could pull any such secret into an app they
+own. Admins may reference anything; any other caller may only reference
+projects that list their owner name in `project_access`. A project not
+listed is admin-only. Malformed references (including `.`/`..` segments)
+are rejected up front.
+
+### Gotchas found during the live test
+
+- `project_access` keys and references use the project **ID**. An org ID
+  (easy to copy from the URL) fails with `Project ... not found during bot
+  lookup`.
+- Environment slugs are the short ones (`dev`, `staging`, `prod`), not the
+  display names.
+- The machine identity must be added to the project (Access Control, then
+  Machine Identities) before it can read anything in it.
+- The client secret should be rotated if it was ever pasted into a chat or
+  message.
+
+## Verification record
+
+2026-10-12: with a real secret in the `zorc` project, one
+`set_app_env_vars()` call using a `from_infisical` reference was accepted
+and, after the rolling redeploy, the target container's environment held the
+secret's value.
