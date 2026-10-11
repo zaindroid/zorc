@@ -307,7 +307,14 @@ def get_platform_contract() -> dict:
         "required_endpoints": {
             "GET /health": "200 {'status':'ok'} -- must NOT touch the database "
                             "(a slow query here can cascade into every app on the "
-                            "node getting marked unhealthy at once)",
+                            "node getting marked unhealthy at once). This is Coolify's "
+                            "default healthcheck path; override it with app.yaml's "
+                            "(optional) health_check_path field if you're deploying a "
+                            "prebuilt third-party image that doesn't implement this "
+                            "contract (e.g. a wrapper repo around someone else's Docker "
+                            "image with its own, different health route) -- only do "
+                            "this for a genuinely prebuilt image, not to avoid writing "
+                            "/health in your own app.",
             "GET /ready": "200 once dependencies (DB etc) are actually reachable",
             "GET /version": "{'sha':..., 'built':...}",
             "GET /openapi.json": "your API spec",

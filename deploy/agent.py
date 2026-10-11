@@ -812,7 +812,8 @@ def _check_hardcoded_port(repo_dir: Path, classification: dict) -> list[dict]:
 def _check_dockerfile_healthcheck_tools(repo_dir: Path, classification: dict) -> list[dict]:
     """Real incident: purepak's Dockerfile builds and starts fine, but
     its final-stage base image has neither curl nor wget -- Coolify's
-    healthcheck runs one of those INSIDE the container to hit /health,
+    healthcheck runs one of those INSIDE the container to hit its
+    configured health_check_path,
     so with neither installed the healthcheck itself fails ("command
     not found") and Coolify rolls back a container that was actually
     working. A warning, not blocking -- a false positive here (a
@@ -830,7 +831,7 @@ def _check_dockerfile_healthcheck_tools(repo_dir: Path, classification: dict) ->
         "check": "dockerfile_healthcheck_tools", "severity": "warning",
         "message": (
             "Dockerfile has no obvious curl or wget install -- Coolify's healthcheck "
-            "runs one of those inside the container to hit /health, and if neither is "
+            "runs one of those inside the container to hit its configured health_check_path, and if neither is "
             "present the healthcheck fails even when the app itself started fine, so "
             "Coolify rolls back a genuinely working container. Fix: add curl or wget "
             "to the final image (e.g. `RUN apk add curl` on Alpine, `RUN apt-get "
@@ -905,6 +906,15 @@ def parse_app_yaml(repo_dir: Path) -> dict:
                                   # supplied via deploy()'s env_overrides,
                                   # deploy() fails loudly (before creating
                                   # anything) if it's missing.
+        health_check_path: /health   # optional, defaults to "/health" --
+                                      # only needed when deploying someone
+                                      # else's prebuilt image (not a repo
+                                      # built via Nixpacks/your own
+                                      # Dockerfile) whose real health route
+                                      # is different, e.g. Infisical's
+                                      # /api/status. Leave unset for a
+                                      # normal app that implements
+                                      # GET /health per the app contract.
 
     Missing app.yaml, or a missing/empty env: section, or no database:
     flag, is not an error -- most apps only need the platform-provided
@@ -914,7 +924,8 @@ def parse_app_yaml(repo_dir: Path) -> dict:
     true is what actually makes that promise real."""
     app_yaml_path = repo_dir / "app.yaml"
     if not app_yaml_path.exists():
-        return {"env": {}, "database": False, "ai": False, "persistent_storage": None}
+        return {"env": {}, "database": False, "ai": False, "persistent_storage": None,
+                "health_check_path": "/health"}
     try:
         parsed = yaml.safe_load(app_yaml_path.read_text()) or {}
     except yaml.YAMLError as e:
@@ -942,7 +953,13 @@ def parse_app_yaml(repo_dir: Path) -> dict:
             raise ValueError(
                 f"app.yaml persistent_storage must be {{mount_path: /some/path}}, got {persistent_storage!r}"
             )
-    return {"env": env, "database": database, "ai": ai, "persistent_storage": persistent_storage}
+    health_check_path = parsed.get("health_check_path", "/health")
+    if not isinstance(health_check_path, str) or not health_check_path.startswith("/"):
+        raise ValueError(
+            f"app.yaml health_check_path must be a string starting with '/', got {health_check_path!r}"
+        )
+    return {"env": env, "database": database, "ai": ai, "persistent_storage": persistent_storage,
+            "health_check_path": health_check_path}
 
 
 def resolve_env_vars(repo_dir: Path, env_overrides: dict[str, str] | None) -> tuple[dict[str, str], list[str]]:
@@ -1153,7 +1170,7 @@ def create_coolify_app(*, name: str, git_repository: str, git_branch: str,
                         build_pack: str, memory_mb: int, domain: str, server_uuid: str,
                         instant_deploy: bool = True, install_command: str | None = None,
                         build_command: str | None = None, start_command: str | None = None,
-                        private: bool = False) -> dict:
+                        private: bool = False, health_check_path: str = "/health") -> dict:
     """instant_deploy=False when the app declares env vars that must be set
     (see resolve_env_vars) -- Coolify's default behaviour builds and starts
     the container immediately on creation, before there's any chance to
@@ -1173,7 +1190,20 @@ def create_coolify_app(*, name: str, git_repository: str, git_branch: str,
     github_app_uuid, the public one doesn't accept it at all), not just a
     query flag on the same call. Caller (deploy()) checks this once per
     repo and passes the result in -- create_coolify_app() itself has no
-    reason to know about GitHub credentials."""
+    reason to know about GitHub credentials.
+
+    health_check_path defaults to "/health" -- AGENTS.md's app contract
+    convention for every app built FROM a repo (Nixpacks or the repo's
+    own Dockerfile), which is where this default comes from and where it
+    stays correct. It stops being correct the moment a deploy() caller
+    points at someone else's prebuilt image with its own health route
+    (e.g. a wrapper repo that's just `FROM infisical/infisical:latest` --
+    Infisical's real health endpoint is `/api/status`, not `/health`;
+    confirmed against its own source, backend/src/server/routes/index.ts).
+    Hardcoding "/health" unconditionally meant every such deploy would
+    build fine and then get marked unhealthy forever -- this parameter is
+    the fix, threaded through from app.yaml's own (optional)
+    health_check_path field, see parse_app_yaml()."""
     payload = {
         "project_uuid": COOLIFY_PROJECT_UUID,
         "server_uuid": server_uuid,
@@ -1188,7 +1218,7 @@ def create_coolify_app(*, name: str, git_repository: str, git_branch: str,
         "is_auto_deploy_enabled": True,
         "is_force_https_enabled": True,
         "health_check_enabled": True,
-        "health_check_path": "/health",
+        "health_check_path": health_check_path,
         "instant_deploy": instant_deploy,
     }
     if private:
@@ -1874,6 +1904,14 @@ def deploy(*, owner_repo: str, name: str, owner: str, git_branch: str = "main", 
     # Coolify-only today (zorc-agent has no app that needs this yet) -- see
     # add_coolify_persistent_storage(). {mount_path: "/opt/data"} in app.yaml.
     persistent_storage = parse_app_yaml(repo_dir).get("persistent_storage") if classification["kind"] != "static" else None
+    # Coolify-only (zorc-agent's healthcheck is just "is the container
+    # running", no HTTP path involved -- see _zorc_agent_wait_healthy).
+    # Defaults to "/health" (AGENTS.md's app contract) unless app.yaml
+    # overrides it -- see create_coolify_app()'s docstring for why this
+    # needs to be overridable at all (a prebuilt third-party image, e.g.
+    # Infisical, doesn't implement AGENTS.md's contract).
+    health_check_path = (parse_app_yaml(repo_dir).get("health_check_path", "/health")
+                          if classification["kind"] != "static" else "/health")
 
     memory_mb = memory_mb_override if memory_mb_override is not None else classification["memory_mb"]
     if needs_database:
@@ -1952,7 +1990,7 @@ def deploy(*, owner_repo: str, name: str, owner: str, git_branch: str = "main", 
         server_uuid=node["server_uuid"], instant_deploy=not env_vars_to_set and not persistent_storage,
         build_command=classification.get("build_command"),
         start_command=classification.get("start_command"),
-        private=is_private,
+        private=is_private, health_check_path=health_check_path,
     )
 
     try:
