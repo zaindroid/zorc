@@ -873,7 +873,14 @@ def check_deploy_compatibility(repo_dir: Path, classification: dict) -> list[dic
 # values tied to an external account (API keys, third-party credentials)
 # -- those can't be conjured locally and must come through as
 # "required" instead, supplied by whoever calls deploy().
-_ENV_GENERATE_STRATEGIES = {"hex": lambda: secrets.token_hex(32)}
+# hex16 -- 16 random bytes (32 hex chars), for software that wants a
+# 128-bit key rather than 256 (e.g. Infisical's ENCRYPTION_KEY).
+_ENV_GENERATE_STRATEGIES = {"hex": lambda: secrets.token_hex(32), "hex16": lambda: secrets.token_hex(16)}
+
+
+# The app contract's required liveness endpoint (AGENTS.md). Overridable per
+# app via app.yaml's health_path for images whose health route can't change.
+DEFAULT_HEALTH_CHECK_PATH = "/health"
 
 
 def parse_app_yaml(repo_dir: Path) -> dict:
@@ -894,6 +901,12 @@ def parse_app_yaml(repo_dir: Path) -> dict:
                                  # before the app's first start (see
                                  # provision_dedicated_redis()). Never
                                  # shared across apps.
+        health_path: /api/status # path Coolify's container healthcheck
+                                 # probes. Defaults to /health (the app
+                                 # contract's required endpoint). Only
+                                 # needed for a prebuilt/third-party image
+                                 # whose own health route differs and
+                                 # can't be changed.
         ai: true                 # wires this app up to the shared LLM
                                  # gateway (AGENTS.md section 2) -- no new
                                  # resource gets created (unlike database:
@@ -928,7 +941,8 @@ def parse_app_yaml(repo_dir: Path) -> dict:
     true is what actually makes that promise real."""
     app_yaml_path = repo_dir / "app.yaml"
     if not app_yaml_path.exists():
-        return {"env": {}, "database": False, "redis": False, "ai": False, "persistent_storage": None}
+        return {"env": {}, "database": False, "redis": False, "ai": False, "persistent_storage": None,
+                "health_path": DEFAULT_HEALTH_CHECK_PATH}
     try:
         parsed = yaml.safe_load(app_yaml_path.read_text()) or {}
     except yaml.YAMLError as e:
@@ -953,6 +967,11 @@ def parse_app_yaml(repo_dir: Path) -> dict:
     ai = parsed.get("ai", False)
     if not isinstance(ai, bool):
         raise ValueError(f"app.yaml ai must be true or false, got {ai!r}")
+    health_path = parsed.get("health_path", DEFAULT_HEALTH_CHECK_PATH)
+    if not isinstance(health_path, str) or not re.fullmatch(r"/[A-Za-z0-9._~/\-]*", health_path):
+        raise ValueError(
+            f"app.yaml health_path must be an absolute URL path like /api/status, got {health_path!r}"
+        )
     persistent_storage = parsed.get("persistent_storage")
     if persistent_storage is not None:
         if not isinstance(persistent_storage, dict) or "mount_path" not in persistent_storage:
@@ -960,7 +979,7 @@ def parse_app_yaml(repo_dir: Path) -> dict:
                 f"app.yaml persistent_storage must be {{mount_path: /some/path}}, got {persistent_storage!r}"
             )
     return {"env": env, "database": database, "redis": redis, "ai": ai,
-            "persistent_storage": persistent_storage}
+            "persistent_storage": persistent_storage, "health_path": health_path}
 
 
 def resolve_env_vars(repo_dir: Path, env_overrides: dict[str, str] | None) -> tuple[dict[str, str], list[str]]:
@@ -1301,7 +1320,7 @@ def create_coolify_app(*, name: str, git_repository: str, git_branch: str,
                         build_pack: str, memory_mb: int, domain: str, server_uuid: str,
                         instant_deploy: bool = True, install_command: str | None = None,
                         build_command: str | None = None, start_command: str | None = None,
-                        private: bool = False) -> dict:
+                        private: bool = False, health_check_path: str = DEFAULT_HEALTH_CHECK_PATH) -> dict:
     """instant_deploy=False when the app declares env vars that must be set
     (see resolve_env_vars) -- Coolify's default behaviour builds and starts
     the container immediately on creation, before there's any chance to
@@ -1321,7 +1340,12 @@ def create_coolify_app(*, name: str, git_repository: str, git_branch: str,
     github_app_uuid, the public one doesn't accept it at all), not just a
     query flag on the same call. Caller (deploy()) checks this once per
     repo and passes the result in -- create_coolify_app() itself has no
-    reason to know about GitHub credentials."""
+    reason to know about GitHub credentials.
+
+    health_check_path -- what Coolify's container healthcheck probes.
+    Defaults to the app contract's /health; app.yaml's health_path
+    overrides it for prebuilt/third-party images (e.g. Infisical's is
+    /api/status)."""
     payload = {
         "project_uuid": COOLIFY_PROJECT_UUID,
         "server_uuid": server_uuid,
@@ -1336,7 +1360,7 @@ def create_coolify_app(*, name: str, git_repository: str, git_branch: str,
         "is_auto_deploy_enabled": True,
         "is_force_https_enabled": True,
         "health_check_enabled": True,
-        "health_check_path": "/health",
+        "health_check_path": health_check_path,
         "instant_deploy": instant_deploy,
     }
     if private:
@@ -2030,6 +2054,7 @@ def deploy(*, owner_repo: str, name: str, owner: str, git_branch: str = "main", 
     # Coolify-only today (zorc-agent has no app that needs this yet) -- see
     # add_coolify_persistent_storage(). {mount_path: "/opt/data"} in app.yaml.
     persistent_storage = parse_app_yaml(repo_dir).get("persistent_storage") if classification["kind"] != "static" else None
+    health_check_path = parse_app_yaml(repo_dir).get("health_path", DEFAULT_HEALTH_CHECK_PATH)
 
     memory_mb = memory_mb_override if memory_mb_override is not None else classification["memory_mb"]
     if needs_database:
@@ -2127,7 +2152,7 @@ def deploy(*, owner_repo: str, name: str, owner: str, git_branch: str = "main", 
         server_uuid=node["server_uuid"], instant_deploy=not env_vars_to_set and not persistent_storage,
         build_command=classification.get("build_command"),
         start_command=classification.get("start_command"),
-        private=is_private,
+        private=is_private, health_check_path=health_check_path,
     )
 
     try:
