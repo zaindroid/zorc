@@ -282,16 +282,35 @@ def live_headroom_mb(node_name: str) -> float:
     if node_name == LOCAL_NODE:
         _, available_mb = _host_memory_mb()
     else:
-        tailscale_ip = node.get("tailscale_ip")
-        if not tailscale_ip:
-            raise RuntimeError(f"{node_name!r} has no tailscale_ip in registry.yaml -- cannot live-check it")
+        address = _node_probe_address(node_name, node)
         if node.get("backend") == "zorc-agent":
             ssh_key = ZORC_DIR / node["ssh_key"]
             user = node.get("ssh_user", "root")
-            _, available_mb = _remote_host_memory_mb(tailscale_ip, ssh_key, user)
+            _, available_mb = _remote_host_memory_mb(address, ssh_key, user)
         else:
-            _, available_mb = _remote_host_memory_mb(tailscale_ip)
+            _, available_mb = _remote_host_memory_mb(address)
     return available_mb
+
+
+def _node_probe_address(node_name: str, node: dict) -> str:
+    """The address to SSH a node at for live checks (remote_node_probe(),
+    live_headroom_mb()) -- tailscale_ip when the node has one (works for
+    every backend, including a has_public_ip node that ALSO joined
+    Tailscale, like hostinger-vps), else the node's own public ip when
+    has_public_ip is true (a backend: coolify node with a real IP and no
+    Tailscale -- e.g. a freshly-registered VPS before anyone's bothered
+    installing Tailscale on it, see the ovh node). Raises for anything
+    with neither, same as the old unconditional tailscale_ip requirement
+    this replaces -- a zorc-agent node genuinely needs Tailscale (no
+    public IP by definition), so that case is unchanged."""
+    tailscale_ip = node.get("tailscale_ip")
+    if tailscale_ip:
+        return tailscale_ip
+    if node.get("has_public_ip") and node.get("ip"):
+        return node["ip"]
+    raise RuntimeError(
+        f"{node_name!r} has no tailscale_ip and no public ip in registry.yaml -- cannot probe it remotely"
+    )
 
 
 def _probe_hardware_over_ssh(tailscale_ip: str, ssh_key: Path, user: str = "root") -> dict:
@@ -383,16 +402,24 @@ def remote_node_probe(node_name: str) -> dict:
     were registered (rtx5090's nodes/rtx5090.yaml silently flipped to
     status: unreachable, jetson-thor's was reduced to a bare stub), since
     root SSH is blocked on both by Tailscale ACL policy. Same fix as
-    live_headroom_mb(): use the node's own credentials when it has them."""
+    live_headroom_mb(): use the node's own credentials when it has them.
+
+    Second real bug found live: this unconditionally required
+    tailscale_ip even for a backend: coolify node with a real public IP
+    and no Tailscale at all -- permanently marked the freshly-registered
+    ovh node status: unreachable (and so permanently ineligible in
+    _score_node's placement scoring) despite being perfectly reachable
+    over its own public IP with REMOTE_DEPLOY_KEY. Fixed the same way as
+    the first bug: use what the node actually has, via
+    _node_probe_address(), instead of assuming every node is on
+    Tailscale."""
     node = node_config(node_name)
-    tailscale_ip = node.get("tailscale_ip")
-    if not tailscale_ip:
-        raise RuntimeError(f"{node_name!r} has no tailscale_ip in registry.yaml -- cannot probe it remotely")
+    address = _node_probe_address(node_name, node)
     if node.get("backend") == "zorc-agent":
         ssh_key = ZORC_DIR / node["ssh_key"]
         user = node.get("ssh_user", "root")
-        return _probe_hardware_over_ssh(tailscale_ip, ssh_key, user)
-    return _probe_hardware_over_ssh(tailscale_ip, REMOTE_DEPLOY_KEY)
+        return _probe_hardware_over_ssh(address, ssh_key, user)
+    return _probe_hardware_over_ssh(address, REMOTE_DEPLOY_KEY)
 
 
 CANDIDATES_PATH = ZORC_DIR / "nodes" / "candidates.yaml"
@@ -999,11 +1026,9 @@ def _provision_postgres_coolify(app_name: str, node: dict, target_node: str,
     if target_node == LOCAL_NODE:
         exec_prefix = ["docker", "exec", "-i", container_name, "psql", "-U", "postgres"]
     else:
-        tailscale_ip = node.get("tailscale_ip")
-        if not tailscale_ip:
-            raise RuntimeError("node has no tailscale_ip in registry.yaml -- cannot reach it")
+        address = _node_probe_address(target_node, node)
         exec_prefix = ["ssh", "-o", "StrictHostKeyChecking=accept-new", "-o", "ConnectTimeout=10",
-                        "-i", str(REMOTE_DEPLOY_KEY), f"root@{tailscale_ip}",
+                        "-i", str(REMOTE_DEPLOY_KEY), f"root@{address}",
                         "docker", "exec", "-i", container_name, "psql", "-U", "postgres"]
     return container_name, exec_prefix
 
