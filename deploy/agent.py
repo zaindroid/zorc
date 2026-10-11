@@ -45,7 +45,7 @@ def record_resource(name: str, *, kind: str, coolify_uuid: str | None = None,
                      domains: list[str] | None = None, coolify_postgres_uuid: str | None = None,
                      container_name: str | None = None, postgres_container_name: str | None = None,
                      node: str | None = None, coolify_redis_uuid: str | None = None,
-                     redis_container_name: str | None = None) -> None:
+                     redis_container_name: str | None = None, infisical_refs: dict | None = None) -> None:
     """kind: 'coolify' | 'coolify-service' | 'pages' | 'zorc-agent'. domains is only
     needed for 'coolify-service' -- a docker-compose stack can expose
     several subdomains that don't derive from `name` the way a normal
@@ -57,11 +57,16 @@ def record_resource(name: str, *, kind: str, coolify_uuid: str | None = None,
     the zorc-agent equivalents -- no UUIDs exist on that backend, teardown
     needs the container name plus which node it's actually on.
     coolify_redis_uuid/redis_container_name are the same two shapes for a
-    dedicated Redis (provision_dedicated_redis())."""
+    dedicated Redis (provision_dedicated_redis()).
+    infisical_refs is {ENV_KEY: {"from_infisical": ref, "environment": env}}
+    for every var this app was given by reference -- the reference path
+    only, never a value -- so refresh_app_secrets() can re-resolve them."""
     m = _load_resource_map()
     entry = {"kind": kind, "coolify_uuid": coolify_uuid, "domains": domains or []}
     if coolify_postgres_uuid:
         entry["coolify_postgres_uuid"] = coolify_postgres_uuid
+    if infisical_refs:
+        entry["infisical_refs"] = infisical_refs
     if coolify_redis_uuid:
         entry["coolify_redis_uuid"] = coolify_redis_uuid
     if redis_container_name:
@@ -2225,6 +2230,13 @@ def deploy(*, owner_repo: str, name: str, owner: str, git_branch: str = "main", 
             "(these are tied to an external account/service, zorc cannot generate them itself)",
         )
 
+    # Which vars were supplied by reference (reference path only), recorded
+    # below so refresh_app_secrets() can re-resolve them after a rotation.
+    infisical_refs_used = {
+        k: dict(v) for k, v in (env_overrides or {}).items()
+        if is_infisical_ref(v) and k in env_vars_to_set
+    }
+
     postgres_uuid = None
     if needs_database:
         postgres_uuid, database_url = step("provision_database", provision_dedicated_postgres, name, target_node)
@@ -2314,7 +2326,8 @@ def deploy(*, owner_repo: str, name: str, owner: str, git_branch: str = "main", 
              repo=f"github.com/{owner_repo}", owner=owner, target=target_node, database=needs_database,
              redis=needs_redis, ai=needs_ai)
         step("record_resource", record_resource, name, kind="coolify", coolify_uuid=coolify_result.get("uuid"),
-             coolify_postgres_uuid=postgres_uuid, coolify_redis_uuid=redis_uuid)
+             coolify_postgres_uuid=postgres_uuid, coolify_redis_uuid=redis_uuid,
+             infisical_refs=infisical_refs_used)
         step("commit_and_push", git_commit_and_push, f"registry: add {name} (deployed via deploy agent)")
     except DeployError:
         # create_coolify_app already succeeded above -- a real app now
@@ -3016,9 +3029,76 @@ def set_app_env_vars(name: str, env_vars: dict) -> dict:
 
     resolved = resolve_infisical_refs(env_vars)
     set_coolify_env_vars(coolify_uuid, resolved)
+    _record_infisical_refs(
+        name,
+        {k: v for k, v in env_vars.items() if is_infisical_ref(v)},
+        [k for k, v in env_vars.items() if not is_infisical_ref(v)],
+    )
     trigger_coolify_deploy(coolify_uuid)
 
     return {"updated": name, "keys": sorted(env_vars.keys()), "coolify_uuid": coolify_uuid}
+
+
+def _record_infisical_refs(name: str, new_refs: dict, replaced_keys: list[str]) -> None:
+    """Keeps resource_map.json's per-app infisical_refs in step with what
+    was just set: a key given by reference is (re)recorded, a key later set
+    to a literal value is forgotten, so refresh_app_secrets() never
+    overwrites a value someone deliberately set by hand."""
+    m = _load_resource_map()
+    entry = m.get(name)
+    if entry is None:
+        return
+    refs = dict(entry.get("infisical_refs") or {})
+    for key in replaced_keys:
+        refs.pop(key, None)
+    refs.update({k: dict(v) for k, v in new_refs.items()})
+    if refs:
+        entry["infisical_refs"] = refs
+    else:
+        entry.pop("infisical_refs", None)
+    RESOURCE_MAP_PATH.write_text(json.dumps(m, indent=2))
+
+
+def get_recorded_infisical_refs(name: str) -> dict:
+    """{ENV_KEY: {"from_infisical": ref, "environment": env}} recorded for
+    this app (reference paths only), or {}."""
+    return dict((_load_resource_map().get(name) or {}).get("infisical_refs") or {})
+
+
+def refresh_app_secrets(name: str) -> dict:
+    """Re-resolves every from_infisical reference recorded for an EXISTING
+    Coolify app, pushes the current values, and redeploys so they reach the
+    running container. This is what makes rotating a secret in Infisical
+    reach the apps using it -- changing it there alone changes nothing for
+    an already-deployed app.
+
+    Only vars that were given by reference are touched (see
+    _record_infisical_refs); anything set as a literal is left alone. Always
+    redeploys: current values are not compared with what is already set.
+
+    Refuses (ValueError, never silently no-ops) if the app isn't
+    registered, isn't a single-container Coolify app, or has no recorded
+    references. A reference that no longer resolves raises
+    InfisicalRefError before anything is changed."""
+    if not name_taken(name):
+        raise ValueError(f"{name!r} is not a registered app -- nothing to refresh")
+    mapped = _load_resource_map().get(name, {})
+    if mapped.get("kind") != "coolify":
+        raise ValueError(
+            f"{name!r} is a {mapped.get('kind')!r} app -- refresh_app_secrets() only supports "
+            "single-container Coolify apps (kind 'coolify')"
+        )
+    coolify_uuid = mapped.get("coolify_uuid")
+    if not coolify_uuid:
+        raise ValueError(f"{name!r} has no recorded coolify_uuid in resource_map.json -- cannot refresh")
+    refs = get_recorded_infisical_refs(name)
+    if not refs:
+        raise ValueError(f"{name!r} has no recorded from_infisical references -- nothing to refresh")
+
+    resolved = resolve_infisical_refs(refs)
+    set_coolify_env_vars(coolify_uuid, resolved)
+    trigger_coolify_deploy(coolify_uuid)
+    return {"refreshed": name, "keys": sorted(refs.keys()), "coolify_uuid": coolify_uuid}
 
 
 def set_custom_domain(name: str, domain: str, replace: bool = False) -> dict:

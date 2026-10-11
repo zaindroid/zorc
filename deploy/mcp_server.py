@@ -1663,6 +1663,61 @@ def set_app_env_vars(ctx: Context, name: str, env_vars: dict[str, str | dict]) -
 
 
 @mcp.tool()
+def refresh_app_secrets(ctx: Context, name: str) -> dict:
+    """Re-fetches every secret an app was given by from_infisical reference
+    (at deploy() or set_app_env_vars() time) and redeploys it, so a secret
+    rotated in Infisical actually reaches the running app -- changing it in
+    Infisical alone does nothing for an already-deployed app.
+
+    Owner-or-admin, immediate, same trust tier and rate limit as
+    set_app_env_vars(). Only vars that were given by reference are touched;
+    a var later set to a literal value is left alone. Authorization is
+    re-checked at refresh time: if the app's owner is no longer permitted
+    to reference a recorded project, the refresh is rejected. Values are
+    never logged -- only key names and reference paths."""
+    caller = _caller_identity(ctx)
+    params = {"name": name}
+
+    gate = _require_owner_or_admin(caller, name)
+    if not gate["ok"]:
+        _audit("refresh_app_secrets", params, gate, client=caller)
+        return gate
+
+    refs = agent.get_recorded_infisical_refs(name)
+    if refs:
+        params["keys"] = sorted(refs.keys())
+        params["infisical_refs"] = _infisical_ref_names(refs)
+        denied = _infisical_refs_denied(caller, refs)
+        if denied:
+            outcome = {"status": "rejected", "reason": denied}
+            _audit("refresh_app_secrets", params, outcome, client=caller)
+            return outcome
+
+    now = time.time()
+    if _rate_limited(_set_env_timestamps, SET_ENV_RATE_LIMIT, SET_ENV_RATE_WINDOW_SEC):
+        outcome = {"status": "rejected",
+                   "reason": f"rate limit: {SET_ENV_RATE_LIMIT} env var updates per "
+                             f"{SET_ENV_RATE_WINDOW_SEC}s exceeded"}
+        _audit("refresh_app_secrets", params, outcome, client=caller)
+        return outcome
+
+    try:
+        result = agent.refresh_app_secrets(name)
+        _set_env_timestamps.append(now)
+        outcome = {"status": "refreshed", "keys": result["keys"]}
+        _audit("refresh_app_secrets", params, outcome, client=caller)
+        return outcome
+    except ValueError as e:
+        outcome = {"status": "rejected", "reason": str(e)}
+        _audit("refresh_app_secrets", params, outcome, client=caller)
+        return outcome
+    except Exception as e:
+        outcome = {"status": "failed", "reason": str(e)}
+        _audit("refresh_app_secrets", params, outcome, client=caller)
+        return outcome
+
+
+@mcp.tool()
 def add_custom_domain(ctx: Context, name: str, domain: str, replace: bool = False) -> dict:
     """Attaches a real custom domain (not a {subdomain}.zaindroid.me one)
     to an app you own (or any app, if you're admin), then redeploys so
