@@ -861,12 +861,21 @@ def check_deploy_compatibility(repo_dir: Path, classification: dict) -> list[dic
     return issues
 
 
-# Only generation strategy supported for now -- a 256-bit random hex
-# string, the right shape for JWT/session/signing secrets. Not meant for
+# "hex" -- a 256-bit random hex string, the right shape for most JWT/
+# session/signing secrets. "hex16" -- a 128-bit random hex string (32
+# characters): added for Infisical's ENCRYPTION_KEY, which (confirmed
+# against its own source, resolveInstanceEncryptionKeyBuffer() in
+# backend/src/services/kms/kms-fns.ts) is used as literal UTF-8 bytes,
+# not hex-decoded, and hard-asserts exactly 32 bytes/characters -- "hex"
+# at 64 characters is silently too long and crash-loops the container on
+# first boot with an AES key-length error. Neither strategy is meant for
 # values tied to an external account (API keys, third-party credentials)
 # -- those can't be conjured locally and must come through as
 # "required" instead, supplied by whoever calls deploy().
-_ENV_GENERATE_STRATEGIES = {"hex": lambda: secrets.token_hex(32)}
+_ENV_GENERATE_STRATEGIES = {
+    "hex": lambda: secrets.token_hex(32),
+    "hex16": lambda: secrets.token_hex(16),
+}
 
 
 def parse_app_yaml(repo_dir: Path) -> dict:
