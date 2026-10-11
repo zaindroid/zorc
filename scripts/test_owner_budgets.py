@@ -90,7 +90,7 @@ def test_analyze_deployment_requirements_budget_gate(agent, m) -> None:
     agent.classify = lambda repo_dir: {"kind": "python", "language": "python", "reason": "requirements.txt found"}
     agent.parse_app_yaml = lambda repo_dir: {"env": {}, "database": False, "ai": False, "persistent_storage": None}
     m._estimate_memory_from_repo = lambda repo_dir, classification: (512, [])
-    m._recommend_placement = lambda memory_mb, needs_public_ip, needs_gpu=False: {
+    m._recommend_placement = lambda memory_mb, needs_public_ip, needs_gpu=False, preferred_node=None: {
         "recommended_node": "servingz", "fits": True, "reason": "plenty of headroom",
         "candidates_considered": {},
     }

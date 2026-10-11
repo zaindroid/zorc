@@ -150,6 +150,12 @@ one, not self-service. Connection details arrive as `DATABASE_URL`/
 hostnames above directly in app code — use the env vars so credentials and
 routing can change without an app redeploy.
 
+Self-service alternative: set `redis: true` (or `database: true`) at the
+top level of the app's `app.yaml` and `deploy()` provisions a **dedicated**
+instance for that app, generates its password, and sets `REDIS_URL`
+(`DATABASE_URL`) before the first start. Nothing is shared with other apps
+and the caller never sees the credentials.
+
 The LLM gateway is OpenAI-compatible — set app.yaml's `ai: true` and
 deploy() injects `LLM_BASE_URL`/`LLM_API_KEY` automatically (same pattern
 as `database: true`, see section 5). Point any OpenAI SDK at
