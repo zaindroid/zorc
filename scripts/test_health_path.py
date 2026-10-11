@@ -89,10 +89,7 @@ def test_generate_strategies(agent) -> None:
     check("generate: hex is 64 hex chars", len(gens["hex"]()) == 64)
     check("generate: hex16 is 32 hex chars", len(gens["hex16"]()) == 32 and int(gens["hex16"](), 16) >= 0)
     d = Path(tempfile.mkdtemp())
-    (d / "app.yaml").write_text("env:
-  K:
-    generate: hex16
-")
+    (d / "app.yaml").write_text("env:\n  K:\n    generate: hex16\n")
     check("app.yaml accepts generate: hex16", agent.parse_app_yaml(d)["env"]["K"] == {"generate": "hex16"})
 
 
