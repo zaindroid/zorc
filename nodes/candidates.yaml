@@ -41,3 +41,16 @@ candidates:
       -- shared/partial node, not fully zorc-owned. Reachable over
       Tailscale only (no public IP); intended for GPU-based AI apps/APIs
       and AI app testing, exposed via Cloudflare Tunnel if/when needed.
+
+  - hostname: ovh
+    ip: 149.56.142.170
+    ssh_key: deploy/secrets/ovh-vps_deploy_key
+    user: root
+    note: >
+      New OVHcloud VPS-1 2027, Beauharnois (BHS) Canada. 2 vCores, ~3.8GB RAM,
+      40GB storage, real public IPv4 (149.56.142.170) and IPv6. Ubuntu 26.04 LTS,
+      fresh -- no Docker/Coolify installed yet. Default cloud-init admin user is
+      'ubuntu' (passwordless sudo); root SSH was disabled by default and has been
+      re-enabled key-only (PermitRootLogin prohibit-password) to match the
+      hostinger-vps pattern. Intended as a second general-purpose Coolify deploy
+      target.
