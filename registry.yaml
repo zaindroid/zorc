@@ -218,6 +218,19 @@ owner_budgets:
 # Applications. Add new entries at the end. Keep alphabetical within groups.
 # ---------------------------------------------------------------------------
 apps:
+  - name: infisical
+    target: servingz
+    memory_mb: 918
+    subdomain: infisical
+    database: true
+    redis: true
+    ai: null
+    storage_prefix: null
+    repo: "github.com/zaindroid/infisical-selfhost"
+    owner: "zainey"
+    critical: false
+    depends_on: []
+
   - name: amtsampel
     target: servingz
     memory_mb: 384
