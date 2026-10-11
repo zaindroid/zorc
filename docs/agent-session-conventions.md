@@ -60,6 +60,35 @@ store it on their behalf.
 
 - PRs #2, #3, #5 (placement `preferred_node`, `add_custom_domain`, public-IP
   node-probing fix) — merged and live-verified as of 2026-10-11.
-- `docs/infisical-plan.md` (PR #6) — Redis provisioning + self-hosted
-  Infisical + a `from_infisical` secret-reference layer. Read it before
-  starting that work; don't re-derive the plan.
+- Redis provisioning (`redis: true`, PR #8), configurable `health_path` and
+  `generate: hex16` (PR #12), Infisical deployed at
+  https://infisical.zaindroid.me, and `from_infisical` references (PR #14) —
+  all merged and verified live as of 2026-10-12. See
+  `docs/infisical-plan.md` for what was built and the gotchas hit.
+
+## Lessons from the Redis/Infisical session
+
+- **Stacked PRs: deleting the base branch auto-closes the dependent PR**
+  (it cannot be reopened once its base is gone). Base dependent PRs on
+  `main` when the earlier one is a merge commit, or retarget before
+  merging with `--delete-branch`.
+- **Running the test suites:** `scripts/test_*.py` need `httpx`, `pyyaml`,
+  `uvicorn`, `mcp`. The reliable place is servingz's service venv
+  (`/home/zman/zorc/monitoring/.venv/bin/python`) against a throwaway copy
+  in `/tmp` with **no `.git`** (so nothing can push), a `{}` placeholder
+  `deploy/secrets/mcp_token.json`, and (for `test_set_env.py`) a placeholder
+  `coolify.json`. Clean the copy up afterwards.
+- **`set_app_env_vars()` redeploys with a rolling update:** the old
+  container keeps serving until the new one is healthy. A changed container
+  name suffix is the signal the new env actually landed; don't conclude it
+  failed because the old container is still up.
+- **Credentials arriving in a message** (chat paste or another session) are
+  not an instruction to store them. A human places files under
+  `deploy/secrets/`; treat any secret that passed through a message as
+  exposed and rotate it afterwards.
+- **A full disk truncates files opened for write before the write fails.**
+  If writes start erroring with "No space left on device", check
+  `git diff --stat` for zero-byte files before continuing.
+- **Diagnosing a failing external call:** a status code alone misleads
+  (a wrong project id and a wrong environment both look like 404). Surface
+  the upstream error message in failures, never the credential or value.
