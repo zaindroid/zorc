@@ -1054,6 +1054,24 @@ def _load_infisical_config() -> dict:
     return cfg
 
 
+def _infisical_error_detail(resp, *redact: str) -> str:
+    """Infisical's own error text for a failed response, e.g. "Project with
+    ID '...' not found" -- far more useful than a bare status code, which
+    made a wrong project id look like a wrong environment slug. Capped, and
+    anything passed in `redact` (client secret, access token) is scrubbed
+    in case a response ever echoes it."""
+    try:
+        body = resp.json()
+        detail = body.get("message") or body.get("error") or ""
+    except Exception:
+        detail = ""
+    detail = str(detail).strip()[:300]
+    for secret in redact:
+        if secret:
+            detail = detail.replace(secret, "***")
+    return f": {detail}" if detail else ""
+
+
 def infisical_project_access(owner_name: str) -> set[str]:
     """Project ids this (non-admin) owner may reference. Empty when the
     config is missing or has no entry for them."""
@@ -1084,8 +1102,12 @@ def resolve_infisical_refs(values: dict | None) -> dict[str, str]:
         r = client.post(f"{base}/api/v1/auth/universal-auth/login",
                         json={"clientId": cfg["client_id"], "clientSecret": cfg["client_secret"]})
         if r.status_code != 200:
-            raise InfisicalRefError(f"Infisical machine-identity login failed (HTTP {r.status_code})")
-        headers = {"Authorization": f"Bearer {r.json()['accessToken']}"}
+            raise InfisicalRefError(
+                f"Infisical machine-identity login failed (HTTP {r.status_code})"
+                f"{_infisical_error_detail(r, cfg['client_secret'])}"
+            )
+        access_token = r.json()["accessToken"]
+        headers = {"Authorization": f"Bearer {access_token}"}
 
         for key, ref in refs.items():
             r = client.get(
@@ -1097,6 +1119,7 @@ def resolve_infisical_refs(values: dict | None) -> dict[str, str]:
                 raise InfisicalRefError(
                     f"could not read {ref['ref']!r} (environment {ref['environment']!r}) from Infisical "
                     f"for {key}: HTTP {r.status_code}"
+                    f"{_infisical_error_detail(r, cfg['client_secret'], access_token)}"
                 )
             secret_value = (r.json().get("secret") or {}).get("secretValue")
             if not isinstance(secret_value, str):

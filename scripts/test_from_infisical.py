@@ -72,7 +72,8 @@ def _fake_client(calls, login=(200, {"accessToken": "tok"}), secrets=None, fail=
             calls.append(("GET", url, params, headers))
             name = url.rsplit("/", 1)[1]
             if name in fail:
-                return _Resp(404, {})
+                return _Resp(404, {"message": "Project with ID 'p1' not found during bot lookup "
+                                              "(echoing csecret and tok to test scrubbing)"})
             return _Resp(200, {"secret": {"secretValue": secrets.get(name, "v-" + name)}})
 
     return FakeClient
@@ -136,7 +137,9 @@ def test_resolve(agent) -> None:
             msg = str(e)
             check("missing secret raises, naming the reference and status",
                   "p1/MISSING" in msg and "404" in msg, msg)
-            check("error never leaks the client secret", "csecret" not in msg, msg)
+            check("error includes Infisical's own message", "not found during bot lookup" in msg, msg)
+            check("error never leaks the client secret or access token",
+                  "csecret" not in msg and "tok" not in msg, msg)
 
         agent.httpx.Client = _fake_client(calls, login=(401, {}))
         try:
