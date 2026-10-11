@@ -296,7 +296,8 @@ def get_platform_contract() -> dict:
         "required_files": {
             "app.yaml": "declares name, memory_mb, port, domains, dependencies, an "
                         "(optional) database: true flag -- see database_provisioning "
-                        "below -- an (optional) ai: true flag -- see "
+                        "below -- an (optional) redis: true flag -- see "
+                        "redis_provisioning below -- an (optional) ai: true flag -- see "
                         "ai_gateway_provisioning below -- and an (optional) env: "
                         "section for anything beyond the auto-provided vars -- see "
                         "env_vars_beyond_defaults below",
@@ -321,6 +322,17 @@ def get_platform_contract() -> dict:
             "env:'s generate: hex secrets -- you never see or handle the credentials). "
             "Omit database: true (or set it false) if your app has no database -- "
             "nothing gets provisioned and DATABASE_URL is simply not set."
+        ),
+        "redis_provisioning": (
+            "REDIS_URL is NOT provided unconditionally -- set app.yaml's top-level "
+            "redis: true and deploy() provisions a real, dedicated Redis instance for "
+            "your app (never shared with another app) with a generated password, and "
+            "sets REDIS_URL before your container's first real start -- same "
+            "generate-and-set pattern as database: true; you never see or handle the "
+            "credentials. Omit redis: true (or set it false) if your app has no Redis "
+            "need -- nothing gets provisioned and REDIS_URL is simply not set. Treat it "
+            "as a cache/queue, not a system of record -- don't keep "
+            "anything in it you can't rebuild."
         ),
         "ai_gateway_provisioning": (
             "LLM_BASE_URL/LLM_API_KEY are NOT provided unconditionally -- set app.yaml's "
@@ -987,6 +999,7 @@ def analyze_deployment_requirements(
             return {"status": "rejected", "reason": f"app.yaml is malformed: {e}"}
         declared_env = parsed_app_yaml["env"]
         database_requested = parsed_app_yaml["database"]
+        redis_requested = parsed_app_yaml.get("redis", False)
         ai_requested = parsed_app_yaml["ai"]
         env_requirements = {
             "generated_internally": sorted(k for k, spec in declared_env.items() if "generate" in spec),
@@ -1062,6 +1075,7 @@ def analyze_deployment_requirements(
             "warnings": warnings,
             "env_requirements": env_requirements,
             "database_provisioned": database_requested,
+            "redis_provisioned": redis_requested,
             "ai_provisioned": ai_requested,
             **({"ai_gateway": ai_gateway_info} if ai_gateway_info else {}),
             "concurrency_adjusted_estimate_mb": adjusted_estimate_mb,
@@ -1091,6 +1105,7 @@ def analyze_deployment_requirements(
                 "warnings": warnings,
                 "env_requirements": env_requirements,
                 "database_provisioned": database_requested,
+                "redis_provisioned": redis_requested,
                 "ai_provisioned": ai_requested,
                 **({"ai_gateway": ai_gateway_info} if ai_gateway_info else {}),
                 "owner_current_total_mb": current_total_mb,
@@ -1115,6 +1130,7 @@ def analyze_deployment_requirements(
             "warnings": warnings,
             "env_requirements": env_requirements,
             "database_provisioned": database_requested,
+            "redis_provisioned": redis_requested,
             "ai_provisioned": ai_requested,
             **({"ai_gateway": ai_gateway_info} if ai_gateway_info else {}),
             "needs_gpu": needs_gpu,
@@ -1140,6 +1156,7 @@ def analyze_deployment_requirements(
         "framework": framework,
         "env_requirements": env_requirements,
         "database_provisioned": database_requested,
+        "redis_provisioned": redis_requested,
         "ai_provisioned": ai_requested,
         **({"ai_gateway": ai_gateway_info} if ai_gateway_info else {}),
         "needs_gpu": needs_gpu,
