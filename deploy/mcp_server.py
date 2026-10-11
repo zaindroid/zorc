@@ -1357,9 +1357,39 @@ def diagnose_app(ctx: Context, name: str) -> dict:
     }
 
 
+def _infisical_refs_denied(caller: dict, values: dict | None) -> str | None:
+    """Rejection reason if `values` holds a from_infisical reference this
+    caller may not use, else None. Admins may reference anything the
+    machine identity can read; everyone else only projects listed for
+    their owner name in deploy/secrets/infisical.json's project_access --
+    without this, any caller able to deploy() could pull any secret the
+    zorc machine identity can see into an app they own. A malformed
+    reference is rejected here too, before anything else runs."""
+    try:
+        projects = agent.infisical_ref_projects(values)
+    except agent.InfisicalRefError as e:
+        return str(e)
+    if not projects or caller.get("role") == "admin":
+        return None
+    not_allowed = sorted(projects - agent.infisical_project_access(caller.get("name", "")))
+    if not_allowed:
+        return (f"from_infisical: {caller.get('name')!r} is not permitted to reference Infisical "
+                f"project(s) {not_allowed} -- ask an admin to add you to project_access")
+    return None
+
+
+def _infisical_ref_names(values: dict | None) -> list[str]:
+    """Reference paths (never values) for the audit log."""
+    out = []
+    for v in (values or {}).values():
+        if agent.is_infisical_ref(v):
+            out.append(str(v.get("from_infisical")))
+    return sorted(out)
+
+
 @mcp.tool()
 def deploy(ctx: Context, owner_repo: str, name: str, report_id: str, git_branch: str = "main",
-           env_overrides: dict[str, str] | None = None) -> dict:
+           env_overrides: dict[str, str | dict] | None = None) -> dict:
     """Deploys a new app. THE ONLY MUTATING TOOL ON THIS SERVER -- creates
     a brand-new app; never touches, modifies, or deletes any existing one.
     Requires report_id from a prior, APPROVED analyze_deployment_requirements()
@@ -1379,6 +1409,13 @@ def deploy(ctx: Context, owner_repo: str, name: str, report_id: str, git_branch:
     before creating anything, rather than leaving a container crash-looping
     on a missing secret for someone to debug later.
 
+    A value may also be {"from_infisical": "<project-id>/<folder>/<NAME>",
+    "environment": "prod"} (environment optional, default "prod") instead
+    of a literal -- zorc fetches it from the platform's Infisical server
+    side, so you never hold the real value. Non-admin callers can only
+    reference projects an admin has granted them (project_access); a bad
+    or unpermitted reference is rejected up front like a missing var.
+
     Runs the full guardrail sequence: report validity + expiry, name-collision
     refusal, then the actual Coolify/Pages deploy (using the report's
     recommended_memory_mb and recommended_node, and resolving+setting env
@@ -1392,6 +1429,14 @@ def deploy(ctx: Context, owner_repo: str, name: str, report_id: str, git_branch:
     caller = _caller_identity(ctx)
     params = {"owner_repo": owner_repo, "name": name, "report_id": report_id, "git_branch": git_branch,
               "env_overrides_keys": sorted((env_overrides or {}).keys())}  # keys only -- never log secret values
+    if _infisical_ref_names(env_overrides):
+        params["infisical_refs"] = _infisical_ref_names(env_overrides)
+
+    denied = _infisical_refs_denied(caller, env_overrides)
+    if denied:
+        outcome = {"status": "rejected", "reason": denied}
+        _audit("deploy", params, outcome, client=caller)
+        return outcome
 
     entry = _approved_reports.get(report_id)
     if entry is None:
@@ -1551,7 +1596,7 @@ def restart(ctx: Context, name: str) -> dict:
 
 
 @mcp.tool()
-def set_app_env_vars(ctx: Context, name: str, env_vars: dict[str, str]) -> dict:
+def set_app_env_vars(ctx: Context, name: str, env_vars: dict[str, str | dict]) -> dict:
     """Sets or updates one or more env vars on an app you own (or any
     app, if you're admin), then redeploys so the change actually reaches
     the running container -- previously there was no way to do this at
@@ -1566,9 +1611,16 @@ def set_app_env_vars(ctx: Context, name: str, env_vars: dict[str, str]) -> dict:
     owner can already redeploy/restart their own app right now without
     approval, and this changes strictly less than a full redeploy does.
     Values are never logged -- only which keys were touched, same
-    convention as deploy()'s env_overrides_keys."""
+    convention as deploy()'s env_overrides_keys.
+
+    A value may be {"from_infisical": "<project-id>/<folder>/<NAME>",
+    "environment": "prod"} instead of a literal -- same server-side
+    resolution and per-owner project_access rule as deploy()'s
+    env_overrides."""
     caller = _caller_identity(ctx)
     params = {"name": name, "keys": sorted((env_vars or {}).keys())}
+    if _infisical_ref_names(env_vars):
+        params["infisical_refs"] = _infisical_ref_names(env_vars)
 
     gate = _require_owner_or_admin(caller, name)
     if not gate["ok"]:
@@ -1577,6 +1629,12 @@ def set_app_env_vars(ctx: Context, name: str, env_vars: dict[str, str]) -> dict:
 
     if not env_vars:
         outcome = {"status": "rejected", "reason": "env_vars must not be empty"}
+        _audit("set_app_env_vars", params, outcome, client=caller)
+        return outcome
+
+    denied = _infisical_refs_denied(caller, env_vars)
+    if denied:
+        outcome = {"status": "rejected", "reason": denied}
         _audit("set_app_env_vars", params, outcome, client=caller)
         return outcome
 
@@ -1929,7 +1987,7 @@ def request_memory_increase(ctx: Context, name: str, requested_memory_mb: int, r
 
 @mcp.tool()
 def request_gpu_service(ctx: Context, owner_repo: str, name: str, report_id: str,
-                         git_branch: str = "main", env_overrides: dict[str, str] | None = None) -> dict:
+                         git_branch: str = "main", env_overrides: dict[str, str | dict] | None = None) -> dict:
     """Queues a deploy of a NEW AI/API-serving app onto a GPU node --
     does NOT deploy anything itself. An ADMIN must separately call
     approve_action(id) to actually run it (see that tool's docstring).
@@ -1954,6 +2012,14 @@ def request_gpu_service(ctx: Context, owner_repo: str, name: str, report_id: str
     caller = _caller_identity(ctx)
     params = {"owner_repo": owner_repo, "name": name, "report_id": report_id, "git_branch": git_branch,
               "env_overrides_keys": sorted((env_overrides or {}).keys())}
+    if _infisical_ref_names(env_overrides):
+        params["infisical_refs"] = _infisical_ref_names(env_overrides)
+
+    denied = _infisical_refs_denied(caller, env_overrides)
+    if denied:
+        outcome = {"status": "rejected", "reason": denied}
+        _audit("request_gpu_service", params, outcome, client=caller)
+        return outcome
 
     entry = _approved_reports.get(report_id)
     if entry is None:

@@ -982,7 +982,130 @@ def parse_app_yaml(repo_dir: Path) -> dict:
             "persistent_storage": persistent_storage, "health_path": health_path}
 
 
-def resolve_env_vars(repo_dir: Path, env_overrides: dict[str, str] | None) -> tuple[dict[str, str], list[str]]:
+# Infisical machine-identity credentials, same trust tier as coolify.json /
+# cloudflare.json above: a human places this file, zorc only reads it.
+#   {"url": "https://infisical.zaindroid.me",      # optional, this is the default
+#    "client_id": "...", "client_secret": "...",   # Universal Auth machine identity
+#    "project_access": {"<project-id>": ["owner-name", ...]}}
+# project_access is the authorization layer: the machine identity can read
+# every project it was granted in Infisical, so without it any caller who
+# can deploy() could pull any secret that identity can see into an app they
+# own. Non-admin callers may only reference projects that list their owner
+# name here; a project absent from the map is admin-only.
+INFISICAL_CONFIG_PATH = SECRETS / "infisical.json"
+INFISICAL_DEFAULT_URL = "https://infisical.zaindroid.me"
+_INFISICAL_SEGMENT = re.compile(r"[A-Za-z0-9._-]+")
+
+
+class InfisicalRefError(ValueError):
+    """A from_infisical reference that is malformed, not permitted, or
+    could not be resolved. Messages name the reference, never a value."""
+
+
+def is_infisical_ref(value) -> bool:
+    return isinstance(value, dict) and "from_infisical" in value
+
+
+def parse_infisical_ref(value: dict) -> dict:
+    """{"from_infisical": "<project-id>/<folder>/.../<SECRET_NAME>",
+    "environment": "prod"} -> the pieces Infisical's API wants. The first
+    segment is the project id, the last is the secret name, anything
+    between is the folder path ("/" when there is none). environment
+    defaults to "prod"; it is the only other key accepted."""
+    extra = set(value) - {"from_infisical", "environment"}
+    if extra:
+        raise InfisicalRefError(f"from_infisical reference has unsupported keys {sorted(extra)}")
+    ref = value["from_infisical"]
+    if not isinstance(ref, str):
+        raise InfisicalRefError(f"from_infisical must be a string, got {type(ref).__name__}")
+    segments = ref.strip("/").split("/")
+    if len(segments) < 2 or not all(_INFISICAL_SEGMENT.fullmatch(s) and set(s) != {"."} for s in segments):
+        raise InfisicalRefError(
+            f"from_infisical {ref!r} must look like '<project-id>/<optional/folders>/<SECRET_NAME>'"
+        )
+    environment = value.get("environment", "prod")
+    if not isinstance(environment, str) or not _INFISICAL_SEGMENT.fullmatch(environment):
+        raise InfisicalRefError(f"from_infisical {ref!r}: environment must be a slug like 'prod'")
+    return {
+        "project_id": segments[0],
+        "secret_path": "/" + "/".join(segments[1:-1]),
+        "secret_name": segments[-1],
+        "environment": environment,
+        "ref": ref,
+    }
+
+
+def infisical_ref_projects(values: dict | None) -> set[str]:
+    """Project ids referenced by any from_infisical value in `values`.
+    Raises InfisicalRefError on a malformed reference, so callers can
+    reject before doing anything else."""
+    return {parse_infisical_ref(v)["project_id"] for v in (values or {}).values() if is_infisical_ref(v)}
+
+
+def _load_infisical_config() -> dict:
+    try:
+        cfg = json.loads(INFISICAL_CONFIG_PATH.read_text())
+    except FileNotFoundError:
+        raise InfisicalRefError(
+            "from_infisical is not configured on this server (deploy/secrets/infisical.json is missing)"
+        )
+    except json.JSONDecodeError:
+        raise InfisicalRefError("deploy/secrets/infisical.json is not valid JSON")
+    return cfg
+
+
+def infisical_project_access(owner_name: str) -> set[str]:
+    """Project ids this (non-admin) owner may reference. Empty when the
+    config is missing or has no entry for them."""
+    try:
+        cfg = _load_infisical_config()
+    except InfisicalRefError:
+        return set()
+    return {p for p, owners in (cfg.get("project_access") or {}).items() if owner_name in (owners or [])}
+
+
+def resolve_infisical_refs(values: dict | None) -> dict[str, str]:
+    """Returns `values` with every {"from_infisical": ...} entry replaced by
+    the secret's real value, fetched server-side through Infisical's
+    Universal Auth machine-identity API. Plain string values pass through
+    untouched, and with no references present nothing is read or fetched.
+    Values never appear in exceptions or logs."""
+    values = dict(values or {})
+    refs = {k: parse_infisical_ref(v) for k, v in values.items() if is_infisical_ref(v)}
+    if not refs:
+        return values
+
+    cfg = _load_infisical_config()
+    base = (cfg.get("url") or INFISICAL_DEFAULT_URL).rstrip("/")
+    if not cfg.get("client_id") or not cfg.get("client_secret"):
+        raise InfisicalRefError("deploy/secrets/infisical.json is missing client_id/client_secret")
+
+    with httpx.Client(timeout=20) as client:
+        r = client.post(f"{base}/api/v1/auth/universal-auth/login",
+                        json={"clientId": cfg["client_id"], "clientSecret": cfg["client_secret"]})
+        if r.status_code != 200:
+            raise InfisicalRefError(f"Infisical machine-identity login failed (HTTP {r.status_code})")
+        headers = {"Authorization": f"Bearer {r.json()['accessToken']}"}
+
+        for key, ref in refs.items():
+            r = client.get(
+                f"{base}/api/v4/secrets/{ref['secret_name']}", headers=headers,
+                params={"projectId": ref["project_id"], "environment": ref["environment"],
+                        "secretPath": ref["secret_path"]},
+            )
+            if r.status_code != 200:
+                raise InfisicalRefError(
+                    f"could not read {ref['ref']!r} (environment {ref['environment']!r}) from Infisical "
+                    f"for {key}: HTTP {r.status_code}"
+                )
+            secret_value = (r.json().get("secret") or {}).get("secretValue")
+            if not isinstance(secret_value, str):
+                raise InfisicalRefError(f"Infisical returned no value for {ref['ref']!r} (for {key})")
+            values[key] = secret_value
+    return values
+
+
+def resolve_env_vars(repo_dir: Path, env_overrides: dict | None) -> tuple[dict[str, str], list[str]]:
     """Cross-references app.yaml's env: section against env_overrides
     (values the caller already has, e.g. a real third-party API key).
     Returns (vars_to_set, missing_required) -- vars_to_set is the full set
@@ -992,6 +1115,13 @@ def resolve_env_vars(repo_dir: Path, env_overrides: dict[str, str] | None) -> tu
     anything rather than deploying a container guaranteed to crash-loop."""
     env_overrides = env_overrides or {}
     declared = parse_app_yaml(repo_dir)["env"]
+    # from_infisical references are fetched here, before anything has been
+    # created, and only for keys this app actually declares as required --
+    # a failure is a normal resolve_env_vars-step rejection, nothing to
+    # roll back. Plain string values pass through untouched.
+    env_overrides = resolve_infisical_refs(
+        {k: v for k, v in env_overrides.items() if k in declared and "required" in declared[k]}
+    )
     vars_to_set: dict[str, str] = {}
     missing_required: list[str] = []
     for key, spec in declared.items():
@@ -1926,7 +2056,7 @@ class DeployError(Exception):
 
 
 def deploy(*, owner_repo: str, name: str, owner: str, git_branch: str = "main", target_node: str = "servingz",
-           memory_mb_override: int | None = None, env_overrides: dict[str, str] | None = None,
+           memory_mb_override: int | None = None, env_overrides: dict | None = None,
            needs_gpu: bool = False, volumes: list[str] | None = None) -> dict:
     """Full pipeline: clone -> classify -> budget check -> live resource
     check -> either Cloudflare Pages (static) or Coolify (real app), DNS +
@@ -2850,7 +2980,7 @@ def resize_app_memory(name: str, new_memory_mb: int) -> dict:
             "target_node": target_node, "coolify_uuid": coolify_uuid}
 
 
-def set_app_env_vars(name: str, env_vars: dict[str, str]) -> dict:
+def set_app_env_vars(name: str, env_vars: dict) -> dict:
     """Sets or updates one or more env vars on an EXISTING, already-
     registered app, then redeploys so the change actually reaches the
     running container -- an env var update alone does not retroactively
@@ -2862,6 +2992,10 @@ def set_app_env_vars(name: str, env_vars: dict[str, str]) -> dict:
     Single-container Coolify applications only (kind "coolify" in
     resource_map.json), same scope as redeploy()/resize_app_memory() and
     for the same reason -- no zorc-agent app has needed this yet.
+
+    A value may be {"from_infisical": "<project-id>/<folder>/<NAME>",
+    "environment": "prod"} instead of a literal string -- resolved here,
+    server-side, through resolve_infisical_refs() before anything is set.
 
     Refuses (ValueError, never silently no-ops) if the app isn't
     registered, isn't a Coolify app, or env_vars is empty."""
@@ -2880,7 +3014,8 @@ def set_app_env_vars(name: str, env_vars: dict[str, str]) -> dict:
     if not coolify_uuid:
         raise ValueError(f"{name!r} has no recorded coolify_uuid in resource_map.json -- cannot update")
 
-    set_coolify_env_vars(coolify_uuid, env_vars)
+    resolved = resolve_infisical_refs(env_vars)
+    set_coolify_env_vars(coolify_uuid, resolved)
     trigger_coolify_deploy(coolify_uuid)
 
     return {"updated": name, "keys": sorted(env_vars.keys()), "coolify_uuid": coolify_uuid}
