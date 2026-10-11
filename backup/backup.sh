@@ -6,7 +6,9 @@
 # this, a rebuild needs an entirely new tunnel and a DNS update for every
 # subdomain, instead of just reconnecting the existing one). Redis is
 # deliberately NOT backed up: AGENTS.md documents it as cache/queue only,
-# nothing irreplaceable.
+# nothing irreplaceable. Every app's dedicated Postgres on this node IS
+# included (see the DEDICATED_LIST block); remote nodes' are still listed by
+# hand below (blylinks-crm).
 #
 # Archive is gpg-encrypted locally before it ever leaves the host, then
 # uploaded to Cloudflare R2. Local copies kept 7 days, remote copies 30 days.
@@ -53,6 +55,36 @@ ssh -o StrictHostKeyChecking=accept-new -o ConnectTimeout=10 \
     -i /home/zman/zorc/deploy/secrets/hostinger_vps_deploy_key root@100.112.175.41 \
     "docker exec yxwbfp5davvvc81kz9z4htkq pg_dumpall -U postgres" | gzip > "$WORKDIR/blylinks_crm_postgres.sql.gz"
 
+echo "[$TS] dumping per-app dedicated postgres instances on this node..."
+# deploy()'s `database: true` creates one Postgres per app; resource_map.json
+# records each app's instance and registry.yaml which node it is on. This
+# replaces hardcoding one instance at a time -- an instance missing from this
+# list was silently unbacked-up (Infisical's, for one: losing it loses every
+# secret stored in Infisical). A recorded instance that isn't running here is
+# warned about and skipped; a dump that fails aborts and alerts like the rest.
+DEDICATED_LIST="$(/home/zman/zorc/monitoring/.venv/bin/python - <<'PY'
+import json
+import yaml
+
+rm = json.load(open("/home/zman/zorc/deploy/resource_map.json"))
+reg = {a["name"]: a for a in yaml.safe_load(open("/home/zman/zorc/registry.yaml"))["apps"]}
+for name, entry in sorted(rm.items()):
+    uid = entry.get("coolify_postgres_uuid")
+    if uid and reg.get(name, {}).get("target") == "servingz":
+        print(f"{name} {uid}")
+PY
+)"
+DEDICATED_FILES=()
+while read -r app uid; do
+  [ -z "${app:-}" ] && continue
+  if docker ps --format '{{.Names}}' | grep -qx "$uid"; then
+    docker exec "$uid" pg_dumpall -U postgres | gzip > "$WORKDIR/dedicated_postgres_${app}.sql.gz"
+    DEDICATED_FILES+=("dedicated_postgres_${app}.sql.gz")
+  else
+    echo "WARN: dedicated postgres $uid for $app is not running on this node; skipped"
+  fi
+done <<< "$DEDICATED_LIST"
+
 echo "[$TS] dumping coolify's own postgres..."
 docker exec coolify-db pg_dumpall -U coolify | gzip > "$WORKDIR/coolify_postgres.sql.gz"
 
@@ -76,7 +108,7 @@ docker run --rm -v xqs09x5gbtz6evz7szqty7u4_n8n-data:/data -v "$WORKDIR":/backup
 
 
 ARCHIVE="$WORKDIR/backup_${TS}.tar.gz"
-tar czf "$ARCHIVE" -C "$WORKDIR" app_postgres.sql.gz blylinks_crm_postgres.sql.gz coolify_postgres.sql.gz coolify_data.tar.gz cloudflared.tar.gz iht_news_automation.db.gz iht_news_typesense.tar.gz iht_news_n8n.tar.gz
+tar czf "$ARCHIVE" -C "$WORKDIR" app_postgres.sql.gz blylinks_crm_postgres.sql.gz coolify_postgres.sql.gz coolify_data.tar.gz cloudflared.tar.gz iht_news_automation.db.gz iht_news_typesense.tar.gz iht_news_n8n.tar.gz ${DEDICATED_FILES[@]+"${DEDICATED_FILES[@]}"}
 
 echo "[$TS] encrypting..."
 ENCRYPTED="$STAGING/backup_${TS}.tar.gz.gpg"
