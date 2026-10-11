@@ -296,7 +296,8 @@ def get_platform_contract() -> dict:
         "required_files": {
             "app.yaml": "declares name, memory_mb, port, domains, dependencies, an "
                         "(optional) database: true flag -- see database_provisioning "
-                        "below -- an (optional) ai: true flag -- see "
+                        "below -- an (optional) redis: true flag -- see "
+                        "redis_provisioning below -- an (optional) ai: true flag -- see "
                         "ai_gateway_provisioning below -- and an (optional) env: "
                         "section for anything beyond the auto-provided vars -- see "
                         "env_vars_beyond_defaults below",
@@ -321,6 +322,16 @@ def get_platform_contract() -> dict:
             "env:'s generate: hex secrets -- you never see or handle the credentials). "
             "Omit database: true (or set it false) if your app has no database -- "
             "nothing gets provisioned and DATABASE_URL is simply not set."
+        ),
+        "redis_provisioning": (
+            "REDIS_URL is NOT provided unconditionally -- set app.yaml's top-level "
+            "redis: true and deploy() provisions a real, dedicated Redis instance for "
+            "your app (same contract as database: true -- a DEDICATED container per "
+            "app, not a shared instance with a per-app logical DB index) and sets "
+            "REDIS_URL before your container's first real start (same generate-and-set "
+            "pattern as database: true -- you never see or handle the credentials). "
+            "Omit redis: true (or set it false) if your app has no Redis need -- "
+            "nothing gets provisioned and REDIS_URL is simply not set."
         ),
         "ai_gateway_provisioning": (
             "LLM_BASE_URL/LLM_API_KEY are NOT provided unconditionally -- set app.yaml's "
@@ -890,6 +901,12 @@ def analyze_deployment_requirements(
     warning (not a block) telling you to add it -- deploy() won't inject
     anything without the flag actually being set.
 
+    The report also surfaces redis_provisioned -- whether app.yaml
+    declares `redis: true` (same contract as database: true, see
+    get_platform_contract's redis_provisioning: a DEDICATED Redis
+    instance per app, REDIS_URL set automatically, credentials never
+    exposed to the caller).
+
     architecture="frontend_backend_split" means this repo runs two
     independent processes (e.g. a separate SPA build and its own API
     server) that can't both live in one container. This platform's
@@ -987,6 +1004,7 @@ def analyze_deployment_requirements(
             return {"status": "rejected", "reason": f"app.yaml is malformed: {e}"}
         declared_env = parsed_app_yaml["env"]
         database_requested = parsed_app_yaml["database"]
+        redis_requested = parsed_app_yaml["redis"]
         ai_requested = parsed_app_yaml["ai"]
         env_requirements = {
             "generated_internally": sorted(k for k, spec in declared_env.items() if "generate" in spec),
@@ -1062,6 +1080,7 @@ def analyze_deployment_requirements(
             "warnings": warnings,
             "env_requirements": env_requirements,
             "database_provisioned": database_requested,
+            "redis_provisioned": redis_requested,
             "ai_provisioned": ai_requested,
             **({"ai_gateway": ai_gateway_info} if ai_gateway_info else {}),
             "concurrency_adjusted_estimate_mb": adjusted_estimate_mb,
@@ -1091,6 +1110,7 @@ def analyze_deployment_requirements(
                 "warnings": warnings,
                 "env_requirements": env_requirements,
                 "database_provisioned": database_requested,
+                "redis_provisioned": redis_requested,
                 "ai_provisioned": ai_requested,
                 **({"ai_gateway": ai_gateway_info} if ai_gateway_info else {}),
                 "owner_current_total_mb": current_total_mb,
@@ -1115,6 +1135,7 @@ def analyze_deployment_requirements(
             "warnings": warnings,
             "env_requirements": env_requirements,
             "database_provisioned": database_requested,
+            "redis_provisioned": redis_requested,
             "ai_provisioned": ai_requested,
             **({"ai_gateway": ai_gateway_info} if ai_gateway_info else {}),
             "needs_gpu": needs_gpu,
@@ -1140,6 +1161,7 @@ def analyze_deployment_requirements(
         "framework": framework,
         "env_requirements": env_requirements,
         "database_provisioned": database_requested,
+        "redis_provisioned": redis_requested,
         "ai_provisioned": ai_requested,
         **({"ai_gateway": ai_gateway_info} if ai_gateway_info else {}),
         "needs_gpu": needs_gpu,

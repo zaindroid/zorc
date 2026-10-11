@@ -43,26 +43,33 @@ def _load_resource_map() -> dict:
 
 def record_resource(name: str, *, kind: str, coolify_uuid: str | None = None,
                      domains: list[str] | None = None, coolify_postgres_uuid: str | None = None,
+                     coolify_redis_uuid: str | None = None,
                      container_name: str | None = None, postgres_container_name: str | None = None,
+                     redis_container_name: str | None = None,
                      node: str | None = None) -> None:
     """kind: 'coolify' | 'coolify-service' | 'pages' | 'zorc-agent'. domains is only
     needed for 'coolify-service' -- a docker-compose stack can expose
     several subdomains that don't derive from `name` the way a normal
     app's single hostname does, so delete_app needs them listed explicitly
-    to clean DNS up properly. coolify_postgres_uuid is set when
-    provision_dedicated_postgres() created a database for this app --
-    kept alongside so a future teardown/backup step can find it without
-    re-deriving the name. container_name/postgres_container_name/node are
+    to clean DNS up properly. coolify_postgres_uuid/coolify_redis_uuid are
+    set when provision_dedicated_postgres()/provision_dedicated_redis()
+    created a database for this app -- kept alongside so a future
+    teardown/backup step can find it without re-deriving the name.
+    container_name/postgres_container_name/redis_container_name/node are
     the zorc-agent equivalents -- no UUIDs exist on that backend, teardown
     needs the container name plus which node it's actually on."""
     m = _load_resource_map()
     entry = {"kind": kind, "coolify_uuid": coolify_uuid, "domains": domains or []}
     if coolify_postgres_uuid:
         entry["coolify_postgres_uuid"] = coolify_postgres_uuid
+    if coolify_redis_uuid:
+        entry["coolify_redis_uuid"] = coolify_redis_uuid
     if container_name:
         entry["container_name"] = container_name
     if postgres_container_name:
         entry["postgres_container_name"] = postgres_container_name
+    if redis_container_name:
+        entry["redis_container_name"] = redis_container_name
     if node:
         entry["node"] = node
     m[name] = entry
@@ -870,8 +877,8 @@ _ENV_GENERATE_STRATEGIES = {"hex": lambda: secrets.token_hex(32)}
 
 
 def parse_app_yaml(repo_dir: Path) -> dict:
-    """Reads app.yaml's optional `env:` section and `database:`/`ai:` flags,
-    if present. Format:
+    """Reads app.yaml's optional `env:` section and `database:`/`redis:`/
+    `ai:` flags, if present. Format:
 
         database: true          # provisions a dedicated Postgres instance
                                  # for this app -- zorc creates it, creates
@@ -880,6 +887,16 @@ def parse_app_yaml(repo_dir: Path) -> dict:
                                  # provision_dedicated_postgres()). The
                                  # instance's own superuser credentials are
                                  # never exposed to the app or the caller.
+        redis: true              # provisions a dedicated Redis instance
+                                 # for this app -- same contract as
+                                 # database: true (zorc creates it, sets
+                                 # REDIS_URL itself before the container's
+                                 # first real start, caller never sees
+                                 # credentials) via
+                                 # provision_dedicated_redis(). A DEDICATED
+                                 # container per app, not a shared instance
+                                 # with a per-app logical DB index -- see
+                                 # docs/infisical-plan.md for why.
         ai: true                 # wires this app up to the shared LLM
                                  # gateway (AGENTS.md section 2) -- no new
                                  # resource gets created (unlike database:
@@ -914,7 +931,7 @@ def parse_app_yaml(repo_dir: Path) -> dict:
     true is what actually makes that promise real."""
     app_yaml_path = repo_dir / "app.yaml"
     if not app_yaml_path.exists():
-        return {"env": {}, "database": False, "ai": False, "persistent_storage": None}
+        return {"env": {}, "database": False, "redis": False, "ai": False, "persistent_storage": None}
     try:
         parsed = yaml.safe_load(app_yaml_path.read_text()) or {}
     except yaml.YAMLError as e:
@@ -933,6 +950,9 @@ def parse_app_yaml(repo_dir: Path) -> dict:
     database = parsed.get("database", False)
     if not isinstance(database, bool):
         raise ValueError(f"app.yaml database must be true or false, got {database!r}")
+    redis = parsed.get("redis", False)
+    if not isinstance(redis, bool):
+        raise ValueError(f"app.yaml redis must be true or false, got {redis!r}")
     ai = parsed.get("ai", False)
     if not isinstance(ai, bool):
         raise ValueError(f"app.yaml ai must be true or false, got {ai!r}")
@@ -942,7 +962,7 @@ def parse_app_yaml(repo_dir: Path) -> dict:
             raise ValueError(
                 f"app.yaml persistent_storage must be {{mount_path: /some/path}}, got {persistent_storage!r}"
             )
-    return {"env": env, "database": database, "ai": ai, "persistent_storage": persistent_storage}
+    return {"env": env, "database": database, "redis": redis, "ai": ai, "persistent_storage": persistent_storage}
 
 
 def resolve_env_vars(repo_dir: Path, env_overrides: dict[str, str] | None) -> tuple[dict[str, str], list[str]]:
@@ -1133,6 +1153,145 @@ def provision_dedicated_postgres(app_name: str, target_node: str,
 
     database_url = f"postgres://{db_role}:{db_password}@{container_name}:5432/{db_role}"
     return container_name, database_url
+
+
+# Extra memory to add to an app's own registry.yaml memory_mb when it gets
+# a dedicated Redis via provision_dedicated_redis() -- same accounting
+# reason as DEDICATED_POSTGRES_MEMORY_MB above. Placeholder pending a real
+# observed-live number (redis:7-alpine's idle footprint is small, well
+# under Postgres' -- padded generously anyway until there's a live
+# instance to measure).
+DEDICATED_REDIS_MEMORY_MB = 50
+
+
+def _provision_redis_coolify(app_name: str, node: dict, image: str = "redis:7-alpine") -> tuple[str, str]:
+    """Coolify-backend equivalent of _provision_postgres_coolify() -- creates
+    a dedicated Redis database resource via Coolify's own /databases/redis
+    API (confirmed against Coolify's published OpenAPI spec: that endpoint
+    accepts redis_password directly in the create payload), waits
+    (bounded, 90s) for it to report healthy, and returns (container_name,
+    redis_url) directly.
+
+    No SQL-equivalent tail here, unlike _provision_postgres_coolify() --
+    Postgres needs a CREATE ROLE/DATABASE step because the instance it
+    creates could in principle be shared; a dedicated-per-app Redis
+    container has nothing further to carve out (no users, no logical DB
+    index to allocate) because the whole container already belongs to
+    just this one app -- see docs/infisical-plan.md for why this
+    deliberately replaces the old shared-instance-plus-DB-index design
+    that registry.yaml's now-dead redis_db field was for.
+
+    The password is generated here, up front, and handed to Coolify in
+    the create call -- never fetched back afterwards, same "we generate
+    it, Coolify never invents it" shape as every other credential this
+    agent creates."""
+    password = secrets.token_hex(24)
+    with httpx.Client(timeout=30) as client:
+        r = client.post(f"{COOLIFY_URL}/databases/redis", headers=_coolify_headers(), json={
+            "project_uuid": COOLIFY_PROJECT_UUID,
+            "server_uuid": node["server_uuid"],
+            "environment_name": COOLIFY_ENVIRONMENT_NAME,
+            "name": f"{app_name}-redis",
+            "image": image,
+            "redis_password": password,
+        })
+        r.raise_for_status()
+        db_uuid = r.json()["uuid"]
+
+        # POST, not GET -- same Coolify API shape as the Postgres head above.
+        r = client.post(f"{COOLIFY_URL}/databases/{db_uuid}/start", headers=_coolify_headers())
+        r.raise_for_status()
+
+    deadline = time.time() + 90
+    healthy = False
+    while time.time() < deadline:
+        with httpx.Client(timeout=15) as client:
+            r = client.get(f"{COOLIFY_URL}/databases/{db_uuid}", headers=_coolify_headers())
+            r.raise_for_status()
+            if r.json().get("status") == "running:healthy":
+                healthy = True
+                break
+        time.sleep(5)
+    if not healthy:
+        raise RuntimeError(f"dedicated redis {db_uuid} for {app_name!r} did not become healthy within 90s")
+
+    # Same convention as Postgres: Coolify's internal Docker-network
+    # hostname for a database resource is its own UUID.
+    container_name = db_uuid
+    return container_name, f"redis://:{password}@{container_name}:6379/0"
+
+
+def _provision_redis_zorc_agent(app_name: str, node: dict, image: str = "redis:7-alpine") -> tuple[str, str]:
+    """Backend-specific head #2: a direct `docker run` on the zorc-agent
+    network, matching _provision_postgres_zorc_agent()'s shape -- no
+    Coolify API involved, generated `--requirepass` password used only
+    for the readiness check below, never returned or logged except
+    embedded in the connection string this returns. Returns
+    (container_name, redis_url) directly -- see
+    _provision_redis_coolify()'s docstring for why no further tail is
+    needed."""
+    tailscale_ip = node.get("tailscale_ip")
+    if not tailscale_ip:
+        raise RuntimeError("node has no tailscale_ip in registry.yaml -- cannot reach it")
+    ssh_key = ZORC_DIR / node["ssh_key"]
+    user = node.get("ssh_user", "root")
+
+    _zorc_agent_ensure_network(tailscale_ip, ssh_key, user)
+    container_name = f"{app_name}-redis"
+    password = secrets.token_hex(24)
+    rc, out, err = _ssh_run(
+        tailscale_ip, ssh_key,
+        ["docker", "run", "-d", "--name", container_name, "--network", ZORC_AGENT_NETWORK,
+         "--restart", "unless-stopped", "--label", "managed-by=zorc", "--label", f"zorc-app={app_name}",
+         image, "redis-server", "--requirepass", password],
+        user, timeout=30,
+    )
+    if rc != 0:
+        raise RuntimeError(f"failed to start dedicated redis for {app_name!r}: {err[-500:]}")
+    container_id = out.strip()
+    _zorc_agent_wait_healthy(tailscale_ip, ssh_key, user, container_id, timeout_sec=60)
+
+    # Container-running is not the same as Redis-accepting-connections --
+    # same race-avoidance reasoning as the pg_isready wait in
+    # _provision_postgres_zorc_agent(), even though Redis itself starts
+    # much faster than Postgres.
+    ready_deadline = time.time() + 30
+    ready = False
+    while time.time() < ready_deadline:
+        rc, out, _ = _ssh_run(
+            tailscale_ip, ssh_key,
+            ["docker", "exec", container_name, "redis-cli", "-a", password, "--no-auth-warning", "ping"],
+            user,
+        )
+        if rc == 0 and "PONG" in out:
+            ready = True
+            break
+        time.sleep(2)
+    if not ready:
+        raise RuntimeError(f"dedicated redis for {app_name!r} did not become ready within 30s")
+
+    return container_name, f"redis://:{password}@{container_name}:6379/0"
+
+
+def provision_dedicated_redis(app_name: str, target_node: str, image: str = "redis:7-alpine") -> tuple[str, str]:
+    """Creates a new, single-app-dedicated Redis instance on target_node --
+    via Coolify's API for backend: coolify nodes, or a direct `docker run`
+    for backend: zorc-agent nodes (see the two heads above), mirroring
+    provision_dedicated_postgres()'s dispatch exactly. Returns
+    (container_identifier, redis_url); the password never leaves this
+    function except embedded in that returned connection string -- not
+    returned separately, not logged.
+
+    Unlike provision_dedicated_postgres(), there's no shared SQL tail
+    here: a dedicated Redis container has no per-app role/database/DB-
+    index to carve out, because the entire container already belongs to
+    just this one app. That's the whole point of this design over the
+    old shared-instance-plus-DB-index model (registry.yaml's now-dead
+    redis_db field) -- see docs/infisical-plan.md."""
+    node = node_config(target_node)
+    if node.get("backend") == "zorc-agent":
+        return _provision_redis_zorc_agent(app_name, node, image=image)
+    return _provision_redis_coolify(app_name, node, image=image)
 
 
 def check_deploy_budget(name: str, memory_mb: int, node_name: str = "servingz") -> tuple[bool, str]:
@@ -1566,7 +1725,7 @@ def register_app(*, name: str, memory_mb: int, subdomain: str, repo: str, owner:
     memory_mb: {memory_mb}
     subdomain: {subdomain}
     database: {"true" if database else "null"}
-    redis_db: null
+    redis: {"true" if redis else "null"}
     ai: {"true" if ai else "null"}
     storage_prefix: null
     repo: "{repo}"
@@ -1669,7 +1828,8 @@ def git_commit_and_push(message: str) -> None:
 
 def _deploy_zorc_agent(*, step, log: list, node: dict, target_node: str, name: str, owner_repo: str, owner: str,
                         repo_dir: Path, classification: dict, memory_mb: int, env_vars_to_set: dict[str, str],
-                        needs_gpu: bool, needs_database: bool, needs_ai: bool, postgres_container_name: str | None,
+                        needs_gpu: bool, needs_database: bool, needs_redis: bool, needs_ai: bool,
+                        postgres_container_name: str | None, redis_container_name: str | None,
                         domain: str, volumes: list[str] | None = None) -> dict:
     """The zorc-agent equivalent of deploy()'s Coolify branch below --
     everything from here down runs entirely over SSH against a non-root
@@ -1711,9 +1871,10 @@ def _deploy_zorc_agent(*, step, log: list, node: dict, target_node: str, name: s
 
         step("register_app", register_app, name=name, memory_mb=memory_mb, subdomain=name,
              repo=f"github.com/{owner_repo}", owner=owner, target=target_node, database=needs_database,
-             ai=needs_ai)
+             redis=needs_redis, ai=needs_ai)
         step("record_resource", record_resource, name, kind="zorc-agent", container_name=name,
-             postgres_container_name=postgres_container_name, node=target_node)
+             postgres_container_name=postgres_container_name, redis_container_name=redis_container_name,
+             node=target_node)
         step("commit_and_push", git_commit_and_push, f"registry: add {name} (deployed via zorc-agent)")
     except DeployError:
         # container/database creation already succeeded above -- clean up
@@ -1723,6 +1884,8 @@ def _deploy_zorc_agent(*, step, log: list, node: dict, target_node: str, name: s
         rollback_targets = [name]
         if postgres_container_name:
             rollback_targets.append(postgres_container_name)
+        if redis_container_name:
+            rollback_targets.append(redis_container_name)
         rollback_results = _zorc_agent_rollback(tailscale_ip, ssh_key, user, rollback_targets)
         log.append({"step": "rollback_zorc_agent", "ok": all(r["ok"] for r in rollback_results),
                     "detail": rollback_results})
@@ -1736,6 +1899,7 @@ def _deploy_zorc_agent(*, step, log: list, node: dict, target_node: str, name: s
         "target_node": target_node,
         "container_name": name,
         "postgres_container_name": postgres_container_name,
+        "redis_container_name": redis_container_name,
         "message": f"{name} created on {target_node} (zorc-agent) at port {port}, routed at "
                     f"https://{domain} via Cloudflare Tunnel, registered in registry.yaml.",
     }
@@ -1867,9 +2031,13 @@ def deploy(*, owner_repo: str, name: str, owner: str, git_branch: str = "main", 
     # the static budget check would pass on a number the deploy would then
     # exceed once provision_dedicated_postgres() actually runs.
     needs_database = classification["kind"] != "static" and parse_app_yaml(repo_dir).get("database", False)
-    # No new resource gets created for this one (unlike needs_database) --
-    # the LLM gateway already exists, this just injects env vars pointing
-    # at it, so it's not folded into memory_mb below either.
+    # Same reasoning as needs_database -- folded into memory_mb before
+    # budget_check runs, not deferred, so the extra memory a dedicated
+    # Redis needs is already accounted for.
+    needs_redis = classification["kind"] != "static" and parse_app_yaml(repo_dir).get("redis", False)
+    # No new resource gets created for this one (unlike needs_database/
+    # needs_redis) -- the LLM gateway already exists, this just injects
+    # env vars pointing at it, so it's not folded into memory_mb below either.
     needs_ai = classification["kind"] != "static" and parse_app_yaml(repo_dir).get("ai", False)
     # Coolify-only today (zorc-agent has no app that needs this yet) -- see
     # add_coolify_persistent_storage(). {mount_path: "/opt/data"} in app.yaml.
@@ -1878,6 +2046,8 @@ def deploy(*, owner_repo: str, name: str, owner: str, git_branch: str = "main", 
     memory_mb = memory_mb_override if memory_mb_override is not None else classification["memory_mb"]
     if needs_database:
         memory_mb += DEDICATED_POSTGRES_MEMORY_MB
+    if needs_redis:
+        memory_mb += DEDICATED_REDIS_MEMORY_MB
 
     ok, reason = step("budget_check", check_deploy_budget, name, memory_mb, target_node)
     if not ok:
@@ -1917,6 +2087,11 @@ def deploy(*, owner_repo: str, name: str, owner: str, git_branch: str = "main", 
         postgres_uuid, database_url = step("provision_database", provision_dedicated_postgres, name, target_node)
         env_vars_to_set["DATABASE_URL"] = database_url
 
+    redis_uuid = None
+    if needs_redis:
+        redis_uuid, redis_url = step("provision_redis", provision_dedicated_redis, name, target_node)
+        env_vars_to_set["REDIS_URL"] = redis_url
+
     if needs_ai:
         env_vars_to_set["LLM_BASE_URL"] = AI_GATEWAY_INTERNAL_URL
         env_vars_to_set["LLM_API_KEY"] = AI_GATEWAY_DUMMY_API_KEY
@@ -1941,7 +2116,8 @@ def deploy(*, owner_repo: str, name: str, owner: str, git_branch: str = "main", 
             step=step, log=log, node=node, target_node=target_node, name=name, owner_repo=owner_repo,
             owner=owner, repo_dir=repo_dir, classification=classification, memory_mb=memory_mb,
             env_vars_to_set=env_vars_to_set, needs_gpu=needs_gpu, needs_database=needs_database,
-            needs_ai=needs_ai, postgres_container_name=postgres_uuid, domain=domain, volumes=volumes,
+            needs_redis=needs_redis, needs_ai=needs_ai, postgres_container_name=postgres_uuid,
+            redis_container_name=redis_uuid, domain=domain, volumes=volumes,
         )
 
     is_private = step("check_repo_visibility", _is_private_repo, owner_repo)
@@ -1982,9 +2158,9 @@ def deploy(*, owner_repo: str, name: str, owner: str, git_branch: str = "main", 
 
         step("register_app", register_app, name=name, memory_mb=memory_mb, subdomain=name,
              repo=f"github.com/{owner_repo}", owner=owner, target=target_node, database=needs_database,
-             ai=needs_ai)
+             redis=needs_redis, ai=needs_ai)
         step("record_resource", record_resource, name, kind="coolify", coolify_uuid=coolify_result.get("uuid"),
-             coolify_postgres_uuid=postgres_uuid)
+             coolify_postgres_uuid=postgres_uuid, coolify_redis_uuid=redis_uuid)
         step("commit_and_push", git_commit_and_push, f"registry: add {name} (deployed via deploy agent)")
     except DeployError:
         # create_coolify_app already succeeded above -- a real app now
@@ -2017,6 +2193,17 @@ def deploy(*, owner_repo: str, name: str, owner: str, git_branch: str = "main", 
                         log.append({"step": "rollback_postgres", "ok": True})
             except Exception as cleanup_err:
                 log.append({"step": "rollback_postgres", "ok": False, "error": str(cleanup_err)})
+        if redis_uuid:
+            try:
+                with httpx.Client(timeout=30) as client:
+                    r = client.delete(f"{COOLIFY_URL}/databases/{redis_uuid}", headers=_coolify_headers())
+                    if r.status_code not in (200, 404):
+                        log.append({"step": "rollback_redis", "ok": False,
+                                    "error": f"cleanup returned HTTP {r.status_code}"})
+                    else:
+                        log.append({"step": "rollback_redis", "ok": True})
+            except Exception as cleanup_err:
+                log.append({"step": "rollback_redis", "ok": False, "error": str(cleanup_err)})
         raise
 
     result = {
@@ -2027,6 +2214,7 @@ def deploy(*, owner_repo: str, name: str, owner: str, git_branch: str = "main", 
         "target_node": target_node,
         "coolify_uuid": coolify_result.get("uuid"),
         "coolify_postgres_uuid": postgres_uuid,
+        "coolify_redis_uuid": redis_uuid,
         "message": f"{name} created in Coolify on {target_node}, routed at https://{domain}, "
                     f"registered in registry.yaml. First build is running in Coolify now.",
     }
@@ -2816,6 +3004,8 @@ def delete_app(name: str) -> dict:
         rollback_targets = [mapped.get("container_name") or name]
         if mapped.get("postgres_container_name"):
             rollback_targets.append(mapped["postgres_container_name"])
+        if mapped.get("redis_container_name"):
+            rollback_targets.append(mapped["redis_container_name"])
         rollback_results = _zorc_agent_rollback(tailscale_ip, ssh_key, user, rollback_targets)
 
         repo_config_path = ZORC_DIR / "cloudflared" / "config.yml"

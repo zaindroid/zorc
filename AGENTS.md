@@ -138,17 +138,19 @@ instances below are separate, dedicated deployments.
 
 | Service | Reach it at | Use for | Never |
 |---|---|---|---|
-| **Postgres 18** | `t5amapezxhesfta6w82ksyt0:5432` (internal Docker network only, `coolify` network) | relational data, job state, anything durable | query another app's DB; add a second Postgres |
-| **Redis 7** | `h8nk9npsxzv9kkklvgqb93zj:6379` (internal Docker network only, `coolify` network) | queues, cache, rate limits, locks | store anything you can't lose; add another broker |
+| **Postgres** | a dedicated per-app instance, created on request | relational data, job state, anything durable | query another app's DB; add a second Postgres |
+| **Redis** | a dedicated per-app instance, created on request | queues, cache, rate limits, locks | store anything you can't lose; add another broker |
 | **Object storage** | not provisioned — ask first | files, audio, images, exports over ~100 KB | store user files on the container filesystem |
 | **LLM gateway** | `ai-gateway-internal:8080` (internal Docker network only, `coolify` network; stable Coolify `custom_network_aliases`, not the raw container name, which changes every redeploy) | all LLM chat-completion calls | call a provider SDK directly; hold a provider key in an app; assume VLM/embedding/STT/TTS work yet (chat completions only so far) |
 
-Postgres/Redis: **one database + one role per app** (Postgres) / **one
-logical DB index per app** (Redis) — created on request when an app needs
-one, not self-service. Connection details arrive as `DATABASE_URL`/
-`REDIS_URL` environment variables at deploy time. Never hardcode the
-hostnames above directly in app code — use the env vars so credentials and
-routing can change without an app redeploy.
+Postgres/Redis: **a DEDICATED container per app** for both (set
+`database: true`/`redis: true` in app.yaml) — not a shared instance with a
+per-app role (Postgres) or logical DB index (Redis); that was the original
+design and never actually got built for either. Connection details arrive
+as `DATABASE_URL`/`REDIS_URL` environment variables, generated and set
+before the container's first real start — you never see or handle the
+credentials. See `deploy/agent.py`'s `provision_dedicated_postgres()`/
+`provision_dedicated_redis()` for the real mechanism.
 
 The LLM gateway is OpenAI-compatible — set app.yaml's `ai: true` and
 deploy() injects `LLM_BASE_URL`/`LLM_API_KEY` automatically (same pattern

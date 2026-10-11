@@ -223,7 +223,7 @@ apps:
     memory_mb: 384
     subdomain: amtsampel
     database: null
-    redis_db: null
+    redis: null
     ai: null
     storage_prefix: null
     repo: "github.com/zaindroid/amtsampel-web"
@@ -236,7 +236,7 @@ apps:
     memory_mb: 662
     subdomain: blylinks-records
     database: true
-    redis_db: null
+    redis: null
     ai: null
     storage_prefix: null
     repo: "github.com/zaindroid/blylinks-records"
@@ -249,7 +249,7 @@ apps:
     memory_mb: 384
     subdomain: ivay-launch-board
     database: null
-    redis_db: null
+    redis: null
     ai: null
     storage_prefix: null
     repo: "github.com/zaindroid/ivay-manage"
@@ -262,7 +262,7 @@ apps:
     memory_mb: 384
     subdomain: call-recreator-portal-2
     database: null
-    redis_db: null
+    redis: null
     ai: null
     storage_prefix: null
     repo: "github.com/zaindroid/call-recreator-portal"
@@ -275,7 +275,7 @@ apps:
     memory_mb: 384
     subdomain: call-recreator-portal
     database: null
-    redis_db: null
+    redis: null
     ai: null
     storage_prefix: null
     repo: "github.com/zaindroid/call-recreator-portal"
@@ -288,7 +288,7 @@ apps:
     memory_mb: 384
     subdomain: gpu-fleet-dashboard
     database: null
-    redis_db: null
+    redis: null
     ai: null
     storage_prefix: null
     repo: "github.com/zaindroid/gpu-fleet-dashboard"
@@ -301,7 +301,7 @@ apps:
     memory_mb: 512
     subdomain: mailz-de-dev
     database: null
-    redis_db: null
+    redis: null
     ai: true
     storage_prefix: null
     repo: "github.com/zaindroid/mailz"
@@ -314,7 +314,7 @@ apps:
     memory_mb: 534
     subdomain: ivay-voice-portal
     database: true
-    redis_db: null
+    redis: null
     ai: null
     storage_prefix: null
     repo: "github.com/zaindroid/ivay-voice-portal"
@@ -327,7 +327,7 @@ apps:
     memory_mb: 2048
     subdomain: laya
     database: null
-    redis_db: null
+    redis: null
     ai: null
     storage_prefix: null
     repo: "github.com/zaindroid/laya"
@@ -340,7 +340,7 @@ apps:
     memory_mb: 4096
     subdomain: codez
     database: null
-    redis_db: null
+    redis: null
     ai: null
     storage_prefix: null
     repo: "github.com/zaindroid/claude-code_but_cool"
@@ -353,7 +353,7 @@ apps:
     memory_mb: 768
     subdomain: zorc-search
     database: null
-    redis_db: null
+    redis: null
     ai: null
     storage_prefix: null
     repo: "github.com/zaindroid/zorc-search"
@@ -366,7 +366,7 @@ apps:
     memory_mb: 512
     subdomain: mailz
     database: null
-    redis_db: null
+    redis: null
     ai: null
     storage_prefix: null
     repo: "github.com/zaindroid/mailz"
@@ -379,7 +379,7 @@ apps:
     memory_mb: 2048
     subdomain: stirling-pdf
     database: null
-    redis_db: null
+    redis: null
     ai: null
     storage_prefix: null
     repo: "github.com/zaindroid/stirling-pdf"
@@ -392,7 +392,7 @@ apps:
     memory_mb: 768
     subdomain: voice-clone-extract
     database: null
-    redis_db: null
+    redis: null
     ai: null
     storage_prefix: null
     repo: "github.com/zaindroid/voice-clone-extract"
@@ -405,7 +405,7 @@ apps:
     memory_mb: 384
     subdomain: call-editing-tool
     database: null
-    redis_db: null
+    redis: null
     ai: true
     storage_prefix: null
     repo: "github.com/zaindroid/call-fabrication-studio"
@@ -418,7 +418,7 @@ apps:
     memory_mb: 534
     subdomain: ivay-staging
     database: true
-    redis_db: null
+    redis: null
     ai: true
     storage_prefix: null
     repo: "github.com/zaindroid/ivay-el-dev"
@@ -431,7 +431,7 @@ apps:
     memory_mb: 534
     subdomain: ivay-dev
     database: true
-    redis_db: null
+    redis: null
     ai: true
     storage_prefix: null
     repo: "github.com/zaindroid/ivay-el-dev"
@@ -444,7 +444,7 @@ apps:
     memory_mb: 384
     subdomain: purepak
     database: null
-    redis_db: null
+    redis: null
     ai: null
     storage_prefix: null
     repo: "github.com/zaindroid/purepak"
@@ -457,7 +457,7 @@ apps:
     memory_mb: 768
     subdomain: zorc-portal
     database: null
-    redis_db: null
+    redis: null
     ai: null
     storage_prefix: null
     repo: "github.com/zaindroid/zorc-portal"
@@ -470,7 +470,7 @@ apps:
     memory_mb: 576
     subdomain: lootrader
     database: null
-    redis_db: null
+    redis: null
     ai: null
     storage_prefix: null
     repo: "github.com/zaindroid/loot-radar"
@@ -483,7 +483,7 @@ apps:
     memory_mb: 1110
     subdomain: loot-radar
     database: true
-    redis_db: null
+    redis: null
     ai: null
     storage_prefix: null
     repo: "github.com/meanmachines/loot-radar"
@@ -496,7 +496,7 @@ apps:
     memory_mb: 384
     subdomain: ai-gateway
     database: null
-    redis_db: null
+    redis: null
     storage_prefix: null
     repo: "github.com/zaindroid/zorc-ai-gateway"
     owner: "zainey"
@@ -508,7 +508,7 @@ apps:
     memory_mb: 1024
     subdomain: zbots-dev
     database: null
-    redis_db: null
+    redis: null
     storage_prefix: null
     repo: "github.com/meanmachines/zbots"
     owner: "zbots"
@@ -520,7 +520,7 @@ apps:
     memory_mb: 1024
     subdomain: zbots
     database: null
-    redis_db: null
+    redis: null
     storage_prefix: null
     repo: "github.com/meanmachines/zbots"
     owner: "zbots"
@@ -532,7 +532,7 @@ apps:
     memory_mb: 512
     subdomain: esp32-mesh
     database: null
-    redis_db: null
+    redis: null
     storage_prefix: null
     repo: "github.com/zaindroid/esp32-federated-mesh"
     owner: "zainey"
@@ -544,7 +544,7 @@ apps:
     memory_mb: 40000
     subdomain: hermes4-rtx
     database: null
-    redis_db: null
+    redis: null
     storage_prefix: null
     repo: "github.com/zaindroid/hermes4-rtx"
     owner: "zainey"
@@ -556,7 +556,7 @@ apps:
     memory_mb: 48000
     subdomain: hermes4-api
     database: null
-    redis_db: null
+    redis: null
     storage_prefix: null
     repo: "github.com/zaindroid/hermes4-api"
     owner: "zainey"
@@ -568,7 +568,7 @@ apps:
     memory_mb: 662
     subdomain: thor-platform
     database: true
-    redis_db: null
+    redis: null
     storage_prefix: null
     repo: "github.com/zaindroid/benchmarks-blackwell-nvidia_thor"
     owner: "zainey"
@@ -580,7 +580,7 @@ apps:
     memory_mb: 1536
     subdomain: hermes
     database: null
-    redis_db: null
+    redis: null
     storage_prefix: null
     repo: "github.com/zaindroid/hermes-agent-wrapper"
     owner: "zainey"
@@ -592,7 +592,7 @@ apps:
     memory_mb: 18000
     subdomain: hermes-sglang
     database: null
-    redis_db: null
+    redis: null
     storage_prefix: null
     repo: "github.com/zaindroid/hermes-sglang-wrapper"
     owner: "zainey"
@@ -604,7 +604,7 @@ apps:
     memory_mb: 1046
     subdomain: ivay-caller-portal
     database: true
-    redis_db: null
+    redis: null
     storage_prefix: null
     repo: "github.com/zaindroid/ivay-caller_portal"
     owner: "zainey"
@@ -616,7 +616,7 @@ apps:
     memory_mb: 768
     subdomain: iht-search
     database: null
-    redis_db: null
+    redis: null
     storage_prefix: null
     repo: "github.com/zaindroid/iht_news"
     owner: "zainey"
@@ -628,7 +628,7 @@ apps:
     memory_mb: 768
     subdomain: iht-news
     database: null
-    redis_db: null
+    redis: null
     storage_prefix: null
     repo: "github.com/zaindroid/iht_news"
     owner: "zainey"
@@ -640,7 +640,7 @@ apps:
     memory_mb: 128
     subdomain: mcp
     database: null
-    redis_db: null
+    redis: null
     storage_prefix: null
     repo: "github.com/zaindroid/zorc"
     owner: "zainey"
@@ -658,7 +658,7 @@ apps:
     # nameservers are Hostinger's, not Cloudflare's.
     subdomain: null
     database: true
-    redis_db: null
+    redis: null
     storage_prefix: null
     repo: "github.com/zaindroid/blylinks-crm"
     owner: "zainey"
