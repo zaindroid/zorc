@@ -218,19 +218,6 @@ owner_budgets:
 # Applications. Add new entries at the end. Keep alphabetical within groups.
 # ---------------------------------------------------------------------------
 apps:
-  - name: lifeline-portal
-    target: hostinger-vps
-    memory_mb: 640
-    subdomain: lifeline-portal
-    database: null
-    redis: null
-    ai: null
-    storage_prefix: null
-    repo: "github.com/zaindroid/lifeline-portal"
-    owner: "deepcode"
-    critical: false
-    depends_on: []
-
   - name: infisical
     target: servingz
     memory_mb: 918
