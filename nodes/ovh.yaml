@@ -1,0 +1,16 @@
+node: ovh
+tailscale_ip: null
+arch: x86_64
+accelerator: null
+cpu:
+  model: Intel Core Processor (Haswell, no TSX)
+  cores: 1
+  threads: 2
+ram_mb: 3814
+power:
+  source: ac
+  on_battery: false
+capabilities: []
+labels: []
+status: unreachable
+last_seen: '2026-10-12T16:51:10.593256+00:00'

@@ -97,5 +97,121 @@
     "kind": "coolify",
     "coolify_uuid": "eollunnvhfekycbxgwjanorx",
     "domains": []
+  },
+  "ivay-dev": {
+    "kind": "coolify",
+    "coolify_uuid": "5uquh93a2ukxxo0bpecdbfad",
+    "domains": [],
+    "coolify_postgres_uuid": "uudqblzzj6mhc3xkoerm5qt4"
+  },
+  "ivay-staging": {
+    "kind": "coolify",
+    "coolify_uuid": "mosjh6zisybwk7opfx9xyby6",
+    "domains": [],
+    "coolify_postgres_uuid": "7sfggkhvlewyzd9hfpzzuv3k"
+  },
+  "call-editing-tool": {
+    "kind": "coolify",
+    "coolify_uuid": "mo6rxeecryoy5o9mcbvwxpnw",
+    "domains": []
+  },
+  "voice-clone-extract": {
+    "kind": "zorc-agent",
+    "coolify_uuid": null,
+    "domains": [],
+    "container_name": "voice-clone-extract",
+    "node": "rtx5090"
+  },
+  "stirling-pdf": {
+    "kind": "coolify",
+    "coolify_uuid": "5ekrmmpdxa9w9nbltd6yybwz",
+    "domains": []
+  },
+  "mailz": {
+    "kind": "coolify",
+    "coolify_uuid": "hwherodsronzse1xjflqd9zr",
+    "domains": []
+  },
+  "zorc-search": {
+    "kind": "coolify",
+    "coolify_uuid": "lavuauup4snq5ddy2p1wc5na",
+    "domains": []
+  },
+  "codez": {
+    "kind": "coolify",
+    "coolify_uuid": "n06traqdp2xyefn5e3ockq0n",
+    "domains": []
+  },
+  "laya": {
+    "kind": "zorc-agent",
+    "coolify_uuid": null,
+    "domains": [],
+    "container_name": "laya",
+    "node": "rtx5090"
+  },
+  "ivay-voice-portal": {
+    "kind": "coolify",
+    "coolify_uuid": "nuuyjvutieke3lqt2b5xicu0",
+    "domains": [],
+    "coolify_postgres_uuid": "qcmdbpqbxfdgy0kpffkehapw"
+  },
+  "mailz-de-dev": {
+    "kind": "zorc-agent",
+    "coolify_uuid": null,
+    "domains": [],
+    "container_name": "mailz-de-dev",
+    "node": "rtx5090"
+  },
+  "gpu-fleet-dashboard": {
+    "kind": "coolify",
+    "coolify_uuid": "xijb9rmxjdfnxmt3ej7gniwj",
+    "domains": []
+  },
+  "call-recreator-portal": {
+    "kind": "zorc-agent",
+    "coolify_uuid": null,
+    "domains": [],
+    "container_name": "call-recreator-portal",
+    "node": "rtx5090"
+  },
+  "call-recreator-portal-2": {
+    "kind": "zorc-agent",
+    "coolify_uuid": null,
+    "domains": [],
+    "container_name": "call-recreator-portal-2",
+    "node": "rtx5090"
+  },
+  "ivay-launch-board": {
+    "kind": "coolify",
+    "coolify_uuid": "af0q4khzffsgwv4fd2edoy1g",
+    "domains": []
+  },
+  "blylinks-records": {
+    "kind": "coolify",
+    "coolify_uuid": "qvg8nfdknfb6g4bfuebzbwl7",
+    "domains": [],
+    "coolify_postgres_uuid": "i2ijayxa3ofycq1ovjglyeiq"
+  },
+  "amtsampel": {
+    "kind": "coolify",
+    "coolify_uuid": "yihyocgyzaapswzhmepzmlvw",
+    "domains": []
+  },
+  "infisical": {
+    "kind": "coolify",
+    "coolify_uuid": "bxoq5kvabdcryhob18jrdwad",
+    "domains": [],
+    "coolify_postgres_uuid": "rjrw6wtnvcuqwhkla99z1be2",
+    "coolify_redis_uuid": "8dmuoaascaq8qoeddxh5nvyl"
+  },
+  "kinwell": {
+    "kind": "coolify",
+    "coolify_uuid": "tctdiq7j0dll5amwvqa7gqbk",
+    "domains": []
+  },
+  "kinwell-app": {
+    "kind": "coolify",
+    "coolify_uuid": "boz9bjd2rlyyqgjopgz3nojs",
+    "domains": []
   }
 }
