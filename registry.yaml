@@ -218,19 +218,6 @@ owner_budgets:
 # Applications. Add new entries at the end. Keep alphabetical within groups.
 # ---------------------------------------------------------------------------
 apps:
-  - name: kinwell-app
-    target: hostinger-vps
-    memory_mb: 768
-    subdomain: kinwell-app
-    database: null
-    redis: null
-    ai: null
-    storage_prefix: null
-    repo: "github.com/zaindroid/OnlyHacks"
-    owner: "zainey"
-    critical: false
-    depends_on: []
-
   - name: kinwell
     target: hostinger-vps
     memory_mb: 768
