@@ -486,3 +486,24 @@ A dedicated healthchecks.io dead-man's-switch check (`servingz-backup`,
 ~26h period) now pings on every successful run, separate from the host
 watchdog's own check — a silently-failing backup is now distinguishable
 from a healthy host.
+
+## Groundswell hackathon stack (2026-10-19)
+
+Open Agent Hackathon 2026 project (repo `zaindroid/groundswell`, cloned at `~/apps/groundswell`). Pre-window
+infra only; the agent app arrives after 22 Oct. Everything below is **internal only**: host ports bind to
+127.0.0.1, so nothing is reachable from LAN or tailnet, and the DOCKER-USER rule (80/443/8000) needs no change.
+
+| Piece | How it runs | Reach | Notes |
+|---|---|---|---|
+| PostGIS 16-3.4 | Coolify service `groundswell-infra` (uuid `kux1td6eevamtwdjt50bnmxq`), container `postgis-kux1td6eevamtwdjt50bnmxq` | `127.0.0.1:5432`, `postgis:5432` on `groundswell-net` | db `groundswell`, role `gt`; credentials in `~/apps/groundswell/infra/.env` (600). 1536m limit |
+| MinIO | same service, `minio-kux1td6eevamtwdjt50bnmxq` | `127.0.0.1:9000` (S3), `127.0.0.1:9001` (console), `minio:9000` on `groundswell-net` | bucket `groundswell`. Image `cgr.dev/chainguard/minio@sha256:2915cb40…` because minio/minio and quay.io/minio are no longer published. 768m limit |
+| Zetaris platform 2.4.3.1 (hackathon bundle) | `docker compose` in `~/apps/zetaris/zetaris-platform` (vendor file untouched; `docker-compose.override.yml` adds memory limits + `groundswell-net`). **Not a Coolify resource**: the organiser's setup guide requires the local bundle | UI `127.0.0.1:3000`, REST `127.0.0.1:8888/api/v1.0`, JDBC `127.0.0.1:10000`, Spark UI `127.0.0.1:4040` | Images from `zetarishackathon.azurecr.io` (zman is logged in). Sized 4g Spark / 4 cores, roughly 8–9 GB total with limits. Telemetry off. Back up its `.env`: it holds the keypair password |
+| `groundswell.zaindroid.me` | tunnel route → `https://localhost:443` (Traefik), DNS CNAME to the tunnel | Cloudflare Access app `groundswell` (policy copied from `status`) | Until the app service exists (22 Oct), Traefik answers 404 behind Access. Created by `deploy/expose_groundswell.py` (idempotent) |
+
+- Bootstrap scripts (idempotent): `deploy/create_groundswell_service.py` (Coolify service + env from infra/.env),
+  `deploy/expose_groundswell.py` (Access → DNS → tunnel, in that order).
+- Watchdog: `monitoring/config.json` `service_checks` (new generic mechanism: `pg` = pg_isready in a container,
+  `http` = status probe): `groundswell_postgis`, `groundswell_minio`, `zetaris_rest` (`/redoc/docs.yaml`, 401 = up), `zetaris_ui`,
+  `groundswell_app` (disabled until 22 Oct; probes `https://127.0.0.1/healthz` with `Host: groundswell.zaindroid.me`).
+- To view the Zetaris UI from a laptop: `ssh -L 3000:127.0.0.1:3000 -L 8888:127.0.0.1:8888 servingz-ts`, then
+  http://localhost:3000. The UI needs a secure context, and plain-HTTP localhost qualifies.
