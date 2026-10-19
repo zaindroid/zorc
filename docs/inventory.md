@@ -10,13 +10,17 @@
 
 | Name | Engine | Host | Port | Notes |
 |------|--------|------|------|-------|
-|      |        |      |      |       |
+| undercurrent | postgres:16 (UTF8, C.UTF-8) | servingz, Coolify service `undercurrent` (container uc-postgres-m73ti7hbd4pw2kperaqnx1n3) | 127.0.0.1:5433 | Undercurrent's own DB, user `uc`; also `uc-postgres:5432` on groundswell-net (Zetaris JDBC `uc_postgres`) |
+| groundswell | postgis/postgis:16-3.4 | servingz, Coolify service `groundswell-infra` | 127.0.0.1:5432 | Groundswell's DB, user `gt` |
 
 ## Domains
 
 | Domain | Points to | Notes |
 |--------|-----------|-------|
-|        |           |       |
+| coolify.zaindroid.me | Coolify dashboard (localhost:8000) | Cloudflare Access |
+| status.zaindroid.me | zorc status page / approvals | Cloudflare Access |
+| groundswell.zaindroid.me | Traefik (https://localhost:443) | Cloudflare Access; app not deployed before 22 Oct |
+| undercurrent.zaindroid.me | Traefik (https://localhost:443) -> Coolify service `undercurrent`, uc-app:8080 | Cloudflare Access app `undercurrent` (policy copied from status), until the submission is public |
 
 ## Storage
 
@@ -32,10 +36,10 @@
 
 - OS: Ubuntu 24.04.4 LTS, kernel 6.8.0-137-generic
 - Docker: 29.7.2 (docker-ce, official repo), Compose plugin v5.4.0. Data root on
-  SSD (default), daily prune via /etc/cron.daily/docker-prune (keeps <168h old).
+  the NVMe at /mnt/fast/docker (see "Storage (updated 2026-08-08)"), daily prune via /etc/cron.daily/docker-prune (keeps <168h old).
 - Firewall: UFW active, default deny incoming / allow outgoing. Port 22 allowed
-  only from 192.168.0.0/24 (LAN) and 100.64.0.0/10 (Tailscale CGNAT, reserved
-  for future use — Tailscale itself not installed yet).
+  only from 192.168.0.0/24 (LAN) and 100.64.0.0/10 (Tailscale CGNAT; Tailscale
+  is installed, see Networking).
 - fail2ban: active, default sshd jail.
 - Unattended security upgrades: enabled (/etc/apt/apt.conf.d/20auto-upgrades). Automatic-Reboot explicitly set to false in /etc/apt/apt.conf.d/50unattended-upgrades (was commented/default, made explicit given the EFI boot-order fragility).
 - SSH: password authentication disabled (key-only), see
@@ -65,10 +69,10 @@
   zone zaindroid.me. Config at /etc/cloudflared/config.yml (installed copy) and
   ~/.cloudflared/config.yml (source), credentials at
   ~/.cloudflared/a8ceda0a-a10a-4924-8095-fb443319382d.json. cloudflared systemd
-  service enabled on boot. Subdomain scheme: *.apps.zaindroid.me (no wildcard
-  DNS record yet — only status.apps.zaindroid.me routed as a placeholder,
-  service http://localhost:9999, nothing listening there yet). Real app
-  hostnames to be added when Coolify + watchdog exist.
+  service enabled on boot. Hostnames are flat `*.zaindroid.me` (the
+  `*.apps.zaindroid.me` plan was dropped, see "Cloudflare zone / certificate
+  note"); Coolify-managed apps route to Traefik at https://localhost:443 and
+  each gets a Cloudflare Access app before its route is added (see Domains).
 
 ## Coolify
 
@@ -486,3 +490,23 @@ A dedicated healthchecks.io dead-man's-switch check (`servingz-backup`,
 ~26h period) now pings on every successful run, separate from the host
 watchdog's own check — a silently-failing backup is now distinguishable
 from a healthy host.
+
+## Hackathon services: Groundswell + Undercurrent (2026-10-19)
+
+Two Open Agent Hackathon 2026 projects share one set of sponsor services on servingz; nothing is duplicated.
+
+| Service | Owner / source | Shared how |
+|---|---|---|
+| Zetaris platform (zetaris-ui/api/driver/postgres, ~/apps/zetaris/zetaris-platform) | bootstrap/20-zetaris-groundswell.sh | ONE instance. Groundswell objects: groundswell_pg, groundswell_s3, groningen_api, container groundswell. Undercurrent objects: uc_postgres, uc_s3, uc_eurostat_api, uc_worldbank_api, container undercurrent (bootstrap/21-zetaris-undercurrent.sh adds its S3A bucket block). All ports 127.0.0.1 |
+| MinIO (minio-kux1td6eevamtwdjt50bnmxq) | Coolify service groundswell-infra | bucket `groundswell` (root key) and bucket `undercurrent` with its own user `undercurrent` + policy `undercurrent-rw` limited to that bucket |
+| Docker network `groundswell-net` | created by groundswell-infra | joined by Zetaris driver/api, Groundswell postgis/minio and Undercurrent's uc-* services. Undercurrent's services all carry `uc-` names: a generic Compose service name on this network becomes a DNS alias and can shadow another project's (Undercurrent's first `postgres` service broke the Zetaris metastore login until renamed) |
+| Model route | Meterless credit / NIM fallback per app | not configured yet for either app (no credit email or NIM key on the box as of 2026-10-19); METERLESS_APP differs per app |
+
+Undercurrent: Coolify service `undercurrent` (uuid m73ti7hbd4pw2kperaqnx1n3), created by deploy/create_undercurrent_service.py
+(builds undercurrent-app:<sha> on the host, pushes infra/docker-compose.yml + env from ~/apps/undercurrent/infra/.env),
+exposed by deploy/expose_undercurrent.py. Services: uc-app (8080, no host port), uc-postgres (127.0.0.1:5433), uc-s3-alias
+(socat answering as undercurrent.minio for Zetaris' virtual-host S3A addressing). Volumes pgdata and memory (Undercurrent's
+own agent memory, never shared with Groundswell) under /mnt/fast/docker. Coolify still lists stale sub-resources `app`,
+`s3-alias` and database `postgres` (exited, no URL) from before the uc- rename; the API has no delete for them.
+Watchdog service_checks: undercurrent_postgres (pg_isready), undercurrent_app (https://127.0.0.1/healthz via Traefik, 200);
+shared groundswell_minio, zetaris_rest, zetaris_ui cover the shared services.
