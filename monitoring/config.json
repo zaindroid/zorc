@@ -37,5 +37,12 @@
     "tailscale_ip": "100.115.156.84",
     "labels": ["always-on", "control-plane"],
     "capabilities": ["orchestrator", "docker", "coolify", "cuda-legacy", "x86"]
-  }
+  },
+  "service_checks": [
+    {"id": "groundswell_postgis", "kind": "pg", "container": "postgis-kux1td6eevamtwdjt50bnmxq", "user": "gt", "db": "groundswell"},
+    {"id": "groundswell_minio", "kind": "http", "url": "http://127.0.0.1:9000/minio/health/live", "expect": [200]},
+    {"id": "zetaris_rest", "kind": "http", "url": "http://127.0.0.1:8888/redoc/docs.yaml", "expect": [200, 401]},
+    {"id": "zetaris_ui", "kind": "http", "url": "http://127.0.0.1:3000/api/config", "expect": [200]},
+    {"id": "groundswell_app", "kind": "http", "url": "https://127.0.0.1/healthz", "host_header": "groundswell.zaindroid.me", "expect": [200], "enabled": false}
+  ]
 }
