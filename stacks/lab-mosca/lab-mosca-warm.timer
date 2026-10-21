@@ -1,0 +1,10 @@
+[Unit]
+Description=POST /ask to lab-mosca every 30 minutes so a changed estate is explained before anyone asks
+
+[Timer]
+OnCalendar=*:00/30
+RandomizedDelaySec=60
+Persistent=false
+
+[Install]
+WantedBy=timers.target

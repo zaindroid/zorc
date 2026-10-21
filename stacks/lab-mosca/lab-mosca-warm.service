@@ -1,0 +1,8 @@
+[Unit]
+Description=Keep lab-mosca explanations cached: one POST /ask through Traefik (explanations and brief are cached by claim hash)
+After=network-online.target docker.service
+
+[Service]
+Type=oneshot
+User=zman
+ExecStart=/usr/bin/curl -sk --max-time 170 -o /dev/null -w "lab-mosca /ask HTTP %%{http_code} in %%{time_total}s\n" -X POST -H "Host: mosca.zaindroid.me" -H "Content-Type: application/json" -d "{}" https://127.0.0.1/ask
