@@ -218,6 +218,32 @@ owner_budgets:
 # Applications. Add new entries at the end. Keep alphabetical within groups.
 # ---------------------------------------------------------------------------
 apps:
+  - name: lab-mosca
+    target: servingz
+    memory_mb: 768
+    subdomain: mosca
+    database: null
+    redis: null
+    ai: null
+    storage_prefix: null
+    repo: "github.com/zaindroid/openhack"
+    owner: "zainey"
+    critical: false
+    depends_on: [lab-mosca-pg]
+
+  - name: lab-mosca-pg
+    target: servingz
+    memory_mb: 256
+    subdomain: null
+    database: null
+    redis: null
+    ai: null
+    storage_prefix: null
+    repo: "github.com/zaindroid/openhack"
+    owner: "zainey"
+    critical: false
+    depends_on: []
+
   - name: kinwell-v2
     target: hostinger-vps
     memory_mb: 768

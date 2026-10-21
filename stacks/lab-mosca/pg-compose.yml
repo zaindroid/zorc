@@ -1,0 +1,74 @@
+name: lab-mosca-pg
+
+# Mosca's own Postgres (database `mosca`, one DB for this app only), registered in the shared Zetaris as source
+# `mosca_pg`. Joins the external groundswell-net so zetaris-driver can reach it as lab-mosca-pg:5432; every name is
+# lab-mosca-* because Compose registers service names as DNS aliases on shared networks (a bare `postgres` once
+# shadowed the Zetaris metastore). No host port: load with `docker exec -i <container> psql`.
+services:
+  lab-mosca-pg:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: mosca
+      POSTGRES_PASSWORD: ${MOSCA_PG_PASSWORD:?set in Coolify env}
+      POSTGRES_DB: mosca
+      POSTGRES_INITDB_ARGS: "--encoding=UTF8 --locale=C.UTF-8"
+    volumes: ["pgdata:/var/lib/postgresql/data"]
+    networks: [default, groundswell-net]
+    mem_limit: 256m
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U mosca -d mosca"]
+      interval: 10s
+      retries: 10
+
+  # Live gateway to crt.sh's public certwatch database for Zetaris source crtsh_pg. Zetaris' JDBC reader cannot use
+  # crt.sh directly: crt.sh rejects the search_path startup parameter, and its only indexed path is a full-text predicate
+  # Spark cannot push down (an equality filter is a seq scan over ~25e9 rows and times out). This Postgres holds no data,
+  # only a dblink view that sends crt.sh the exact indexed query at SELECT time.
+  lab-mosca-crtsh:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: crtsh
+      POSTGRES_PASSWORD: ${MOSCA_CRTSH_PASSWORD:?set in Coolify env}
+      POSTGRES_DB: crtsh
+      INIT_SQL: |
+        CREATE EXTENSION IF NOT EXISTS dblink;
+        CREATE OR REPLACE VIEW zaindroid_ct AS
+        SELECT * FROM dblink('host=crt.sh port=5432 dbname=certwatch user=guest connect_timeout=30',
+          $$$$SELECT c.ID, encode(x509_serialNumber(c.CERTIFICATE), 'hex'), CAST(x509_notAfter(c.CERTIFICATE) AS date),
+                   x509_keyAlgorithm(c.CERTIFICATE), x509_keySize(c.CERTIFICATE), x509_commonName(c.CERTIFICATE),
+                   x509_issuerName(c.CERTIFICATE)
+            FROM certificate c WHERE plainto_tsquery('certwatch', 'zaindroid.me') @@ identities(c.CERTIFICATE)$$$$)
+          AS t(crtsh_id bigint, serial text, not_after date, key_alg text, key_bits int, cn text, issuer text);
+    entrypoint:
+      - sh
+      - -c
+      - |
+        echo "$$INIT_SQL" > /docker-entrypoint-initdb.d/10-crtsh.sql
+        exec docker-entrypoint.sh postgres
+    networks: [default, groundswell-net]
+    mem_limit: 128m
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U crtsh -d crtsh"]
+      interval: 10s
+      retries: 10
+
+  # Lightning's S3A client addresses bucket `mosca` virtual-host style (http://mosca.minio:9000). The shared MinIO only
+  # carries Groundswell's alias, so this forwarder answers as `mosca.minio` and passes the Host header through unchanged;
+  # MinIO (MINIO_DOMAIN=minio) resolves the bucket from it. Same pattern as Undercurrent's uc-s3-alias.
+  lab-mosca-s3-alias:
+    image: alpine/socat:1.8.0.1
+    command: ["TCP-LISTEN:9000,fork,reuseaddr", "TCP:minio:9000"]
+    networks:
+      groundswell-net:
+        aliases: ["mosca.minio"]
+    mem_limit: 32m
+    restart: unless-stopped
+
+networks:
+  groundswell-net:
+    external: true
+    name: groundswell-net
+
+volumes: { pgdata: {} }
