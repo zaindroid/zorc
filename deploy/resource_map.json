@@ -209,9 +209,33 @@
     "coolify_uuid": "tctdiq7j0dll5amwvqa7gqbk",
     "domains": []
   },
-  "kinwell-app": {
+  "kinwell-v2": {
     "kind": "coolify",
-    "coolify_uuid": "boz9bjd2rlyyqgjopgz3nojs",
+    "coolify_uuid": "g7ci8b352ge7uz9jenzfflzo",
     "domains": []
+  },
+  "groundswell-infra": {
+    "kind": "coolify-service",
+    "coolify_uuid": "kux1td6eevamtwdjt50bnmxq",
+    "domains": []
+  },
+  "undercurrent": {
+    "kind": "coolify-service",
+    "coolify_uuid": "m73ti7hbd4pw2kperaqnx1n3",
+    "domains": [
+      "undercurrent.zaindroid.me"
+    ]
+  },
+  "lab-mosca-pg": {
+    "kind": "coolify-service",
+    "coolify_uuid": "rkestrpl953rpc5qqwqciqip",
+    "domains": []
+  },
+  "lab-mosca": {
+    "kind": "coolify-app",
+    "coolify_uuid": "lwi4ztdndayvfurixtocxhay",
+    "domains": [
+      "mosca.zaindroid.me"
+    ]
   }
 }

@@ -21,7 +21,11 @@
     "/mnt/fast": "nvme0n1 (NVMe, Docker data-root)",
     "/mnt/data": "sdb1 (HDD, bulk storage)"
   },
-  "smart_devices": ["/dev/sda", "/dev/sdb", "/dev/nvme0n1"],
+  "smart_devices": [
+    "/dev/sda",
+    "/dev/sdb",
+    "/dev/nvme0n1"
+  ],
   "coolify_containers": [
     "coolify",
     "coolify-db",
@@ -29,13 +33,102 @@
     "coolify-realtime",
     "coolify-proxy"
   ],
-  "mounts": ["/mnt/fast", "/mnt/data"],
-  "docker_user_block_ports": [8000, 80, 443],
+  "mounts": [
+    "/mnt/fast",
+    "/mnt/data"
+  ],
+  "docker_user_block_ports": [
+    8000,
+    80,
+    443
+  ],
   "cloudflare_tunnel_name": "servingz",
   "node": {
     "name": "servingz",
     "tailscale_ip": "100.115.156.84",
-    "labels": ["always-on", "control-plane"],
-    "capabilities": ["orchestrator", "docker", "coolify", "cuda-legacy", "x86"]
-  }
+    "labels": [
+      "always-on",
+      "control-plane"
+    ],
+    "capabilities": [
+      "orchestrator",
+      "docker",
+      "coolify",
+      "cuda-legacy",
+      "x86"
+    ]
+  },
+  "service_checks": [
+    {
+      "id": "groundswell_postgis",
+      "kind": "pg",
+      "container": "postgis-kux1td6eevamtwdjt50bnmxq",
+      "user": "gt",
+      "db": "groundswell"
+    },
+    {
+      "id": "groundswell_minio",
+      "kind": "http",
+      "url": "http://127.0.0.1:9000/minio/health/live",
+      "expect": [
+        200
+      ]
+    },
+    {
+      "id": "zetaris_rest",
+      "kind": "http",
+      "url": "http://127.0.0.1:8888/redoc/docs.yaml",
+      "expect": [
+        200,
+        401
+      ]
+    },
+    {
+      "id": "zetaris_ui",
+      "kind": "http",
+      "url": "http://127.0.0.1:3000/api/config",
+      "expect": [
+        200
+      ]
+    },
+    {
+      "id": "groundswell_app",
+      "kind": "http",
+      "url": "https://127.0.0.1/healthz",
+      "host_header": "groundswell.zaindroid.me",
+      "expect": [
+        200
+      ]
+    },
+    {
+      "id": "undercurrent_postgres",
+      "kind": "pg",
+      "container": "uc-postgres-m73ti7hbd4pw2kperaqnx1n3",
+      "user": "uc",
+      "db": "undercurrent"
+    },
+    {
+      "id": "undercurrent_app",
+      "kind": "http",
+      "url": "https://127.0.0.1/healthz",
+      "host_header": "undercurrent.zaindroid.me",
+      "expect": [
+        200
+      ]
+    },
+    {
+      "id": "lab_mosca_postgres",
+      "kind": "pg",
+      "container": "lab-mosca-pg-rkestrpl953rpc5qqwqciqip",
+      "user": "mosca",
+      "db": "mosca"
+    },
+    {
+      "id": "lab_mosca_app",
+      "kind": "whycore",
+      "url": "https://127.0.0.1",
+      "host_header": "mosca.zaindroid.me",
+      "expect_backend": "zetaris"
+    }
+  ]
 }

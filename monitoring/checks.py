@@ -236,6 +236,54 @@ def postgres_ready(cfg: dict) -> dict:
     return {"status": CRIT, "value": False, "message": f"pg_isready failed: {(err or out).strip()}"}
 
 
+def container_pg_ready(container: str, user: str, db: str) -> dict:
+    """pg_isready inside an app's own Postgres container (not coolify-db, see postgres_ready)."""
+    rc, out, err = _run(["docker", "exec", container, "pg_isready", "-U", user, "-d", db])
+    if rc == 0:
+        return {"status": OK, "value": True, "message": f"{container}: {out.strip() or 'accepting connections'}"}
+    return {"status": CRIT, "value": False, "message": f"{container}: pg_isready failed: {(err or out).strip()}"}
+
+
+def http_probe(url: str, expect: list[int] | None = None, host_header: str | None = None,
+               timeout: int = 10) -> dict:
+    """HTTP status probe for loopback-bound services (MinIO, Zetaris REST, apps behind Traefik).
+    `expect` lists acceptable status codes; default any 2xx/3xx/401/403 ("something is answering")."""
+    cmd = ["curl", "-sk", "-o", "/dev/null", "-w", "%{http_code}", "--max-time", str(timeout), url]
+    if host_header:
+        cmd[1:1] = ["-H", f"Host: {host_header}"]
+    rc, out, err = _run(cmd, timeout=timeout + 5)
+    code = int(out) if out.strip().isdigit() else 0
+    ok_codes = expect or [c for c in range(200, 400)] + [401, 403]
+    if code in ok_codes:
+        return {"status": OK, "value": code, "message": f"{url}: HTTP {code}"}
+    return {"status": CRIT, "value": code, "message": f"{url}: HTTP {code or 'no answer'} {err.strip()}".strip()}
+
+
+def whycore_app(base: str, host_header: str, expect_backend: str = "zetaris", timeout: int = 20) -> dict:
+    """A whycore (openhack) app is healthy only when /healthz answers ok AND /meta reports the expected data backend
+    and model.online=true. An HTTP 200 alone is not healthy: the app silently degrades to DuckDB seed data or the
+    offline templater when Zetaris or the model endpoint is unreachable."""
+    import json as _json
+    got = {}
+    for path in ("/healthz", "/meta"):
+        rc, out, err = _run(["curl", "-sk", "--max-time", str(timeout), "-H", f"Host: {host_header}", base.rstrip("/") + path], timeout=timeout + 5)
+        try:
+            got[path] = _json.loads(out)
+        except ValueError:
+            return {"status": CRIT, "value": False, "message": f"{host_header}{path}: no JSON ({(err or out).strip()[:120]})"}
+    h, m = got["/healthz"], got["/meta"]
+    problems = []
+    if not h.get("ok"):
+        problems.append("healthz not ok")
+    if m.get("data_backend") != expect_backend:
+        problems.append(f"data_backend={m.get('data_backend')} (want {expect_backend})")
+    if not (m.get("model") or {}).get("online"):
+        problems.append(f"model offline ({(m.get('model') or {}).get('last_error')})")
+    if problems:
+        return {"status": CRIT, "value": False, "message": f"{host_header}: " + "; ".join(problems)}
+    return {"status": OK, "value": True, "message": f"{host_header}: ok, data_backend={expect_backend}, model online ({m['model'].get('reason_model')})"}
+
+
 def tailscaled(cfg: dict) -> dict:
     active = _systemctl_is_active("tailscaled")
     if not active:

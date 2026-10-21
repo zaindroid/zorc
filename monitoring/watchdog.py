@@ -157,6 +157,18 @@ def run_all_checks(cfg: dict) -> dict[str, dict]:
     results["mounts"] = checks.mounts(cfg)
     results["docker_user_port_block"] = checks.docker_user_port_block(cfg)
 
+    # Per-app service checks declared in config.json "service_checks" (pg / http). An entry with
+    # "enabled": false is skipped, so a check can be staged before its service exists.
+    for sc in cfg.get("service_checks", []):
+        if not sc.get("enabled", True):
+            continue
+        if sc["kind"] == "pg":
+            results[sc["id"]] = checks.container_pg_ready(sc["container"], sc["user"], sc["db"])
+        elif sc["kind"] == "http":
+            results[sc["id"]] = checks.http_probe(sc["url"], sc.get("expect"), sc.get("host_header"))
+        elif sc["kind"] == "whycore":
+            results[sc["id"]] = checks.whycore_app(sc["url"], sc["host_header"], sc.get("expect_backend", "zetaris"))
+
     for app in checks.deploy_agent.list_apps():
         results[f"app_mem_{app['name']}"] = checks.app_memory_pressure(
             app["name"], app["memory_mb"], cfg
@@ -253,6 +265,15 @@ FRIENDLY_NAMES = {
     "coolify_containers": "App platform (Coolify)",
     "postgres_ready": "Shared database",
     "systemd_failed": "Background services",
+    "groundswell_postgis": "Groundswell PostGIS",
+    "groundswell_minio": "Groundswell MinIO",
+    "zetaris_rest": "Zetaris REST API",
+    "zetaris_ui": "Zetaris UI",
+    "groundswell_app": "Groundswell app",
+    "undercurrent_postgres": "Undercurrent Postgres",
+    "undercurrent_app": "Undercurrent app",
+    "lab_mosca_postgres": "Mosca Postgres",
+    "lab_mosca_app": "Mosca app (Zetaris + model)",
 }
 
 
