@@ -20,7 +20,8 @@ DESTINATION = "anxumm5olvxni6em8r3wj08p"     # Coolify StandaloneDocker on netwo
 ENV_FILE = Path.home() / "apps" / "openhack-mosca" / "infra" / ".env"
 KEYS = {"ZETARIS_USER", "ZETARIS_PASSWORD", "ZETARIS_ORG_ID", "MODEL_ROUTE", "NIM_BASE_URL", "NIM_API_KEY", "NIM_REASON", "NIM_FAST",
         "METERLESS_BASE_URL", "METERLESS_API_KEY", "METERLESS_REASON", "METERLESS_FAST", "MODEL_FALLBACK_ROUTE",
-        "MODEL_REASON_FALLBACK", "MODEL_THINKING", "MODEL_CONCURRENCY"}
+        "MODEL_REASON_FALLBACK", "MODEL_THINKING", "MODEL_CONCURRENCY",
+        "DEMO_APPLY_URL", "DEMO_APPLY_TOKEN", "APPLY_ALLOW", "APPLY_ENABLED"}   # demo fixture + apply guardrail (openhack docs/demo.md)
 FIXED = {"APP_NAME": "lab-mosca", "METERLESS_APP": "lab-mosca", "DATA_BACKEND": "zetaris",
          "ZETARIS_TABLES": "assets=mosca_s3.assets,probes=mosca_s3.probes,data_classes=mosca_pg.data_classes,migration_paths=mosca_pg.migration_paths,scenarios=mosca_pg.scenarios",
          "ZETARIS_REST": "http://zetaris-api-1:8888/api/v1.0", "ZETARIS_PREFIX": "mosca_pg.", "MEMORY_DIR": "/srv/data/memory"}
