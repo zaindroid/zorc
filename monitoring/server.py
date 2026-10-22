@@ -282,11 +282,97 @@ APPROVALS_HTML = """<!doctype html>
     </div>
   </div>
 
+  <div id="token-list"></div>
+
   <div id="list"></div>
 </div>
 
 <script>
 let lastTitle = null;
+
+// Everything rendered from a token request is attacker-supplied: the
+// /token-request endpoint on zorc-mcp takes no credentials, so `reason` is
+// free text from anyone and `source_ip` is a caller-set header. This page
+// sits behind Cloudflare Access and can grant admin tokens, so injecting
+// markup here would be a real escalation, not a cosmetic bug. Escape
+// everything; never interpolate these raw.
+function esc(s) {
+  return String(s === null || s === undefined ? '' : s).replace(/[&<>"']/g,
+    c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+}
+
+function mins(sec) {
+  const m = Math.floor((sec || 0) / 60);
+  return m >= 1 ? `${m} min` : `${Math.max(0, sec | 0)} s`;
+}
+
+async function loadTokens() {
+  const box = document.getElementById('token-list');
+  let rows;
+  try {
+    rows = await (await fetch('/api/token-requests', { cache: 'no-store' })).json();
+  } catch (e) {
+    return;  // the deploy-approvals half of this page still works
+  }
+  const pending = rows.filter(r => r.status === 'pending');
+  const recent = rows.filter(r => r.status !== 'pending').slice(0, 5);
+  if (!pending.length && !recent.length) { box.innerHTML = ''; return; }
+
+  const busy = new Set([...box.querySelectorAll('.card[data-pending]')].map(el => el.id));
+
+  const pendingCards = pending.map(r => {
+    if (busy.has('tok-' + r.id)) return document.getElementById('tok-' + r.id).outerHTML;
+    return `
+      <div class="glass card" id="tok-${esc(r.id)}">
+        <h2 data-scramble>${esc(r.name)}</h2>
+        <div class="sha">wants a <b>${esc(r.role_requested)}</b> token &middot; from ${esc(r.source_ip)}
+             &middot; expires in ${esc(mins(r.expires_in_sec))}</div>
+        <div class="preview-label">Why it says it needs one:</div>
+        <div class="preview-missing">${esc(r.reason)}</div>
+        <div class="actions">
+          <button class="approve" onclick="decideToken('${esc(r.id)}','approve','client',this)">Approve as client</button>
+          <button class="approve" onclick="decideToken('${esc(r.id)}','approve','admin',this)">Approve as admin</button>
+          <button class="deny" onclick="decideToken('${esc(r.id)}','reject',null,this)">Reject</button>
+        </div>
+      </div>`;
+  }).join('');
+
+  const recentLines = recent.map(r =>
+    `<div>${esc(r.name)} &mdash; ${esc(r.status)}${r.role_granted ? ' as ' + esc(r.role_granted) : ''}</div>`
+  ).join('');
+
+  box.innerHTML = `
+    <div class="glass hero">
+      <div class="orb ${pending.length ? 'warn' : 'ok'}"></div>
+      <div class="hero-text">
+        <h1>${pending.length ? pending.length + ' agent token request' + (pending.length === 1 ? '' : 's') : 'No token requests waiting'}</h1>
+        <div class="sub">An agent with no credentials asked for one. Approving mints nothing here &mdash;
+          the agent collects the token itself with the claim secret it already holds. You choose the role.</div>
+      </div>
+    </div>
+    ${pendingCards}
+    ${recentLines ? `<div class="empty">Recently decided:${recentLines}</div>` : ''}`;
+  zorcEffects.wireScrambleHovers(box);
+}
+
+async function decideToken(id, decision, role, btn) {
+  const card = btn.closest('.card');
+  card.setAttribute('data-pending', '1');
+  card.querySelectorAll('button').forEach(b => b.disabled = true);
+  try {
+    const r = await fetch('/api/token-requests/decide', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ id, decision, role }),
+    });
+    if (!r.ok) throw new Error((await r.json()).detail || r.statusText);
+    await loadTokens();
+  } catch (e) {
+    card.removeAttribute('data-pending');
+    card.querySelectorAll('button').forEach(b => b.disabled = false);
+    alert('Failed to record decision: ' + e.message);
+  }
+}
 function setTitle(titleEl, text) {
   if (text !== lastTitle) { zorcEffects.decodeIn(titleEl, text); lastTitle = text; }
 }
@@ -379,7 +465,10 @@ zorcEffects.shimmer(brandEl);
 zorcEffects.wireScrambleHovers(document.querySelector('.tabs'));
 
 load();
+loadTokens();
 setInterval(load, 10000);
+// Token requests expire in 30 minutes, so poll them faster than deploys.
+setInterval(loadTokens, 5000);
 </script>
 </body>
 </html>"""
@@ -388,6 +477,94 @@ setInterval(load, 10000);
 @app.get("/approvals", response_class=HTMLResponse)
 def approvals_page():
     return APPROVALS_HTML
+
+
+# ------------------------------------------------------ token requests ----
+# The approval half of zorc-mcp's unauthenticated token-request flow (see
+# the /token-request endpoints in deploy/mcp_server.py). An agent with no
+# credentials files a request there; this is where the one human behind
+# Cloudflare Access decides on it and picks the role. Both processes run on
+# servingz off the same checkout, so they share the queue file directly
+# rather than one calling the other's API.
+TOKEN_REQUESTS_PATH = BASE_DIR.parent / "deploy" / "token_requests.json"
+# Must match TOKEN_REQUEST_TTL_SEC in deploy/mcp_server.py, which is the
+# source of truth -- it is duplicated rather than imported because importing
+# mcp_server would construct the whole MCP application as a side effect.
+TOKEN_REQUEST_TTL_SEC = 1800
+
+
+class TokenDecision(BaseModel):
+    id: str
+    decision: str
+    role: str | None = None
+
+
+def _read_token_requests() -> dict:
+    if not TOKEN_REQUESTS_PATH.exists():
+        return {}
+    try:
+        return json.loads(TOKEN_REQUESTS_PATH.read_text())
+    except (json.JSONDecodeError, OSError) as e:
+        print(f"[token-requests] unreadable queue: {e}", flush=True)
+        return {}
+
+
+@app.get("/api/token-requests")
+def api_token_requests():
+    """Pending and recently-decided agent token requests. Never returns the
+    claim secret hash -- the browser has no use for it, and it is the one
+    field that would let a reader collect someone else's token."""
+    import time as _time
+    now = _time.time()
+    rows = []
+    for rid, r in _read_token_requests().items():
+        reference = r.get("decided_at") or r.get("requested_at", 0)
+        age = now - reference
+        if age > TOKEN_REQUEST_TTL_SEC:
+            continue
+        rows.append({
+            "id": rid,
+            "name": r.get("name"),
+            "role_requested": r.get("role_requested"),
+            "reason": r.get("reason"),
+            "source_ip": r.get("source_ip"),
+            "requested_at": r.get("requested_at"),
+            "status": r.get("status"),
+            "role_granted": r.get("role_granted"),
+            "decided_by": r.get("decided_by"),
+            "expires_in_sec": max(0, int(TOKEN_REQUEST_TTL_SEC - age)),
+        })
+    rows.sort(key=lambda r: r.get("requested_at") or 0, reverse=True)
+    return rows
+
+
+@app.post("/api/token-requests/decide")
+def decide_token_request(d: TokenDecision):
+    """Approve (with a role) or reject one request. Approving does not mint
+    anything here -- zorc-mcp mints when the agent collects with its claim
+    secret, so no raw token is ever written to this file or shown here."""
+    if d.decision not in ("approve", "reject"):
+        raise HTTPException(400, "decision must be 'approve' or 'reject'")
+    role = d.role or "client"
+    if d.decision == "approve" and role not in ("admin", "client"):
+        raise HTTPException(400, "role must be 'admin' or 'client'")
+
+    requests_map = _read_token_requests()
+    row = requests_map.get(d.id)
+    if row is None:
+        raise HTTPException(404, "no such token request (it may have expired)")
+    if row.get("status") != "pending":
+        raise HTTPException(409, f"request was already {row.get('status')} -- decisions are final")
+
+    import time as _time
+    row["status"] = "approved" if d.decision == "approve" else "rejected"
+    row["role_granted"] = role if d.decision == "approve" else None
+    row["decided_by"] = DASHBOARD_OWNER
+    row["decided_at"] = _time.time()
+    requests_map[d.id] = row
+    TOKEN_REQUESTS_PATH.write_text(json.dumps(requests_map, indent=2) + "\n")
+    return {"status": row["status"], "id": d.id, "name": row.get("name"),
+            "role_granted": row.get("role_granted")}
 
 
 DEPLOY_HTML = """<!doctype html>
