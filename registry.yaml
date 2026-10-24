@@ -218,6 +218,19 @@ owner_budgets:
 # Applications. Add new entries at the end. Keep alphabetical within groups.
 # ---------------------------------------------------------------------------
 apps:
+  - name: floodsense-agents
+    target: hostinger-vps
+    memory_mb: 384
+    subdomain: floodsense-agents
+    database: null
+    redis: null
+    ai: null
+    storage_prefix: null
+    repo: "github.com/zaindroid/floodsense-agents"
+    owner: "zainey"
+    critical: false
+    depends_on: []
+
   - name: lab-mosca
     target: servingz
     memory_mb: 768
