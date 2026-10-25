@@ -31,7 +31,14 @@ nodes:
     total_memory_mb: 32000
     reserved_mb: 4500        # platform + Postgres + Redis + Traefik + OS
     usable_mb: 27500
-    max_utilisation: 0.80    # never allocate beyond 22000 MB
+    max_utilisation: 0.82    # never allocate beyond 22550 MB
+                             # Raised from 0.80 on 2026-10-25 by the owner's explicit
+                             # decision, as an exception to check_budget.py's "Do NOT
+                             # raise max_utilisation": floodsense-llm needs 384 MB and
+                             # must sit on this node to reach ai-gateway-internal, whose
+                             # Docker alias is per host. Headroom was 364 MB. The node
+                             # has 20 GB of its 32 GB free in practice; declarations here
+                             # run about twice actual use.
     server_uuid: ynlpfb7qft2ld6a0coagy5nm   # Coolify server UUID ("localhost")
     has_public_ip: false     # home network, reachable only via Cloudflare Tunnel
     provider: self-hosted
