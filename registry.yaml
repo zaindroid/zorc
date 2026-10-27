@@ -225,6 +225,19 @@ owner_budgets:
 # Applications. Add new entries at the end. Keep alphabetical within groups.
 # ---------------------------------------------------------------------------
 apps:
+  - name: ivay-stall-demo
+    target: servingz
+    memory_mb: 384
+    subdomain: ivay-stall-demo
+    database: null
+    redis: null
+    ai: true
+    storage_prefix: null
+    repo: "github.com/zaindroid/ivay-stall-demo"
+    owner: "zainey"
+    critical: false
+    depends_on: []
+
   - name: floodsense-desk
     target: servingz
     memory_mb: 384
