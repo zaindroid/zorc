@@ -420,19 +420,6 @@ apps:
     critical: false
     depends_on: []
 
-  - name: gpu-fleet-dashboard
-    target: servingz
-    memory_mb: 384
-    subdomain: gpu-fleet-dashboard
-    database: null
-    redis: null
-    ai: null
-    storage_prefix: null
-    repo: "github.com/zaindroid/gpu-fleet-dashboard"
-    owner: "zainey"
-    critical: false
-    depends_on: []
-
   - name: mailz-de-dev
     target: rtx5090
     memory_mb: 512
