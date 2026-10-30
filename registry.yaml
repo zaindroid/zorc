@@ -225,6 +225,19 @@ owner_budgets:
 # Applications. Add new entries at the end. Keep alphabetical within groups.
 # ---------------------------------------------------------------------------
 apps:
+  - name: floodsense-nebius
+    target: servingz
+    memory_mb: 512
+    subdomain: floodsense-nebius
+    database: null
+    redis: null
+    ai: null
+    storage_prefix: null
+    repo: "github.com/zaindroid/floodsense-nebius"
+    owner: "zainey"
+    critical: false
+    depends_on: []
+
   - name: ivay-stall-demo
     target: servingz
     memory_mb: 384
