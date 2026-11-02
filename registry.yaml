@@ -95,11 +95,7 @@ nodes:
     server_uuid: jzgl7ifmkzmvibhglt9hfln0
     has_public_ip: true      # real public IPv4 ONLY -- no IPv6 on this plan
     ip: 167.86.78.234
-    # tailscale_ip deliberately absent for now: Tailscale 1.104.4 is
-    # installed and tailscaled is enabled, but the node has not been
-    # authenticated into the tailnet yet. Live checks therefore fall back
-    # to the public IP, which _node_probe_address() supports explicitly
-    # (the ovh case). Fill this in once `tailscale up` is completed.
+    tailscale_ip: 100.105.206.126   # used for live cross-node resource checks (deploy/agent.py live_headroom_mb)
     provider: contabo
     backend: coolify
     is_control_plane: false

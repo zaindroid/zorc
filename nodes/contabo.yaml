@@ -1,5 +1,5 @@
 node: contabo
-tailscale_ip: null
+tailscale_ip: 100.105.206.126
 arch: x86_64
 accelerator: null
 cpu:
@@ -14,6 +14,7 @@ capabilities:
 - docker
 - coolify-managed
 - public-ip
+- tailscale
 - x86
 labels:
 - contabo
