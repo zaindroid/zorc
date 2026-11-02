@@ -74,6 +74,36 @@ nodes:
     backend: coolify
     is_control_plane: false
 
+  contabo:
+    # Added 2026-11-02. Primary intended tenant: the Lifeline Veterinary
+    # Hospital commercial platform. No memory is fenced off for it yet --
+    # that app does not exist, so any reservation would be a guess; carve
+    # one out of reserved_mb once its services are real and measurable
+    # (explicit user decision, 2026-11-02). Until then the spare capacity
+    # is available to other zorc apps, but Lifeline's claim comes first --
+    # flag it before placing anything sizeable here.
+    #
+    # Largest usable worker in the fleet: hostinger-vps is budgeted to
+    # ~5160 MB but runs with almost no real headroom, and ovh is down.
+    total_memory_mb: 7941
+    reserved_mb: 900         # Docker + coolify-proxy/sentinel + OS (observed 631MB live
+                             # baseline immediately after provisioning, budgeted above
+                             # that for growth -- no shared Postgres/Redis here, so the
+                             # same shape as ovh rather than hostinger-vps)
+    usable_mb: 7041
+    max_utilisation: 0.80    # never allocate beyond ~5632 MB
+    server_uuid: jzgl7ifmkzmvibhglt9hfln0
+    has_public_ip: true      # real public IPv4 ONLY -- no IPv6 on this plan
+    ip: 167.86.78.234
+    # tailscale_ip deliberately absent for now: Tailscale 1.104.4 is
+    # installed and tailscaled is enabled, but the node has not been
+    # authenticated into the tailnet yet. Live checks therefore fall back
+    # to the public IP, which _node_probe_address() supports explicitly
+    # (the ovh case). Fill this in once `tailscale up` is completed.
+    provider: contabo
+    backend: coolify
+    is_control_plane: false
+
   rtx5090:
     # Personal GPU workstation, NOT zorc-owned -- already runs 40+ of the
     # user's own containers (Supabase, n8n, Langfuse, inference services)

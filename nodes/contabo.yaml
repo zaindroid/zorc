@@ -1,0 +1,23 @@
+node: contabo
+tailscale_ip: null
+arch: x86_64
+accelerator: null
+cpu:
+  model: AMD EPYC Processor (with IBPB)
+  cores: 4
+  threads: 4
+ram_mb: 7941
+power:
+  source: ac
+  on_battery: false
+capabilities:
+- docker
+- coolify-managed
+- public-ip
+- x86
+labels:
+- contabo
+- registered-manually
+- lifeline-primary-tenant
+status: online
+last_seen: '2026-11-02T12:26:14.069912+00:00'
