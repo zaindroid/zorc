@@ -306,7 +306,7 @@ def _node_probe_address(node_name: str, node: dict) -> str:
     Tailscale, like hostinger-vps), else the node's own public ip when
     has_public_ip is true (a backend: coolify node with a real IP and no
     Tailscale -- e.g. a freshly-registered VPS before anyone's bothered
-    installing Tailscale on it, see the ovh node). Raises for anything
+    installing Tailscale on it). Raises for anything
     with neither, same as the old unconditional tailscale_ip requirement
     this replaces -- a zorc-agent node genuinely needs Tailscale (no
     public IP by definition), so that case is unchanged."""
@@ -3028,7 +3028,7 @@ def set_custom_domain(name: str, domain: str, replace: bool = False) -> dict:
     up the domain and issues its own Let's Encrypt cert once DNS actually
     points at the node, same as any other Coolify-managed FQDN.
 
-    Only works for apps on a has_public_ip node (hostinger-vps, ovh, any
+    Only works for apps on a has_public_ip node (hostinger-vps, contabo, any
     future one) -- a domain can only be pointed at a node with a real IP
     to receive it. servingz has no public IP of its own (home network,
     reachable only via the existing Cloudflare Tunnel); a custom domain
@@ -3078,7 +3078,7 @@ def set_custom_domain(name: str, domain: str, replace: bool = False) -> dict:
     if not node_cfg.get("has_public_ip"):
         raise ValueError(
             f"{name!r} is on {target_node!r}, which has no public IP of its own -- a custom domain can't "
-            f"point directly at it. Either move this app to a public-IP node (hostinger-vps or ovh), or use "
+            f"point directly at it. Either move this app to a public-IP node (hostinger-vps or contabo), or use "
             f"the Cloudflare Tunnel mechanism instead (CNAME to the tunnel + a cloudflared public-hostname "
             f"route, see mailzchat.com's setup) -- that path isn't automated by this function yet."
         )

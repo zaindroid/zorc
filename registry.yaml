@@ -61,16 +61,29 @@ nodes:
     backend: coolify
     is_control_plane: false
 
-  ovh:
-    total_memory_mb: 3814
-    reserved_mb: 800         # Docker + coolify-proxy/sentinel + OS (observed ~607MB live baseline,
-                              # budgeted above that for growth -- no shared Postgres/Redis here)
-    usable_mb: 3014
-    max_utilisation: 0.80    # never allocate beyond ~2411 MB
-    server_uuid: zzul4u2bbawhudsecnbqlzd2
-    has_public_ip: true      # real public IPv4+IPv6 -- can take direct ingress
-    ip: 149.56.142.170
-    provider: ovhcloud
+  contabo:
+    # Added 2026-11-02. Primary intended tenant: the Lifeline Veterinary
+    # Hospital commercial platform. No memory is fenced off for it yet --
+    # that app does not exist, so any reservation would be a guess; carve
+    # one out of reserved_mb once its services are real and measurable
+    # (explicit user decision, 2026-11-02). Until then the spare capacity
+    # is available to other zorc apps, but Lifeline's claim comes first --
+    # flag it before placing anything sizeable here.
+    #
+    # Largest usable worker in the fleet by a wide margin: servingz and
+    # hostinger-vps both run with almost no static headroom left.
+    total_memory_mb: 7941
+    reserved_mb: 900         # Docker + coolify-proxy/sentinel + OS (observed 631MB live
+                             # baseline immediately after provisioning, budgeted above
+                             # that for growth -- no shared Postgres/Redis on this node,
+                             # so a smaller reservation than hostinger-vps needs)
+    usable_mb: 7041
+    max_utilisation: 0.80    # never allocate beyond ~5632 MB
+    server_uuid: jzgl7ifmkzmvibhglt9hfln0
+    has_public_ip: true      # real public IPv4 ONLY -- no IPv6 on this plan
+    ip: 167.86.78.234
+    tailscale_ip: 100.105.206.126   # used for live cross-node resource checks (deploy/agent.py live_headroom_mb)
+    provider: contabo
     backend: coolify
     is_control_plane: false
 
