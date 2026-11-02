@@ -1,0 +1,127 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>servingz — architecture</title>
+<link rel="stylesheet" href="/theme.css">
+<script src="/effects.js"></script>
+<style>
+/* Architecture view. The palette, glass surfaces and type all come from
+   /theme.css; only what this page adds lives here. Two views on one hash
+   route: the fleet, and one service at a time. */
+a { color: var(--accent); }
+:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; border-radius: 6px; }
+
+.mk { flex: none; display: block; }
+.mono { flex: none; display: inline-flex; align-items: center; justify-content: center;
+  border-radius: 4px; font-weight: 700; letter-spacing: -0.02em; line-height: 1; }
+/* Infisical ships as a lockup on its lime ground; framed on the infinity mark
+   alone so it still reads at icon size, using the real artwork rather than a
+   redrawn copy. Source is 258x195; at 156% the window lands on the glyph and
+   stops above the wordmark. */
+.mk-infisical { flex: none; display: inline-block; border-radius: 3px;
+  background-repeat: no-repeat; background-size: 156% auto; background-position: 50% 6%; }
+.mk-livekit { flex: none; display: block; border-radius: 3px; }
+
+.legend { display: flex; flex-wrap: wrap; gap: 0.35rem; }
+.legend span { font-size: 0.66rem; letter-spacing: 0.05em; color: var(--text-dim);
+  padding: 0.28rem 0.55rem; border-radius: 999px; border: 1px solid var(--border);
+  display: inline-flex; align-items: center; gap: 0.35rem; white-space: nowrap; }
+
+.hint { color: var(--text-faint); }
+.back { display: inline-block; font-size: 0.74rem; letter-spacing: 0.06em;
+  text-decoration: none; margin-bottom: 1rem; }
+.back:hover { text-decoration: underline; }
+
+.orb.none { background: radial-gradient(circle at 35% 30%, #8d9aa6, #566270);
+  box-shadow: 0 0 18px 3px rgba(86,98,112,0.5); }
+
+/* Diagrams scroll sideways on their own so the page body never does. */
+.dg { overflow-x: auto; padding: 1.4rem 1rem 1.1rem; }
+.dg svg { display: block; width: 100%; height: auto; }
+
+.node { padding: 1.1rem 1.25rem; margin-bottom: 0.75rem; }
+.node-head { display: flex; align-items: center; justify-content: space-between;
+  flex-wrap: wrap; gap: 0.4rem 0.9rem; }
+.node-name { font-size: 0.98rem; font-weight: 600; letter-spacing: 0.05em;
+  display: flex; align-items: center; gap: 0.5rem; min-width: 0; }
+.node-meta { color: var(--text-faint); font-size: 0.72rem; letter-spacing: 0.04em; }
+.tags { display: flex; flex-wrap: wrap; gap: 0.3rem; margin-top: 0.65rem; align-items: center; }
+.tag { font-size: 0.64rem; letter-spacing: 0.06em; padding: 0.2rem 0.5rem; border-radius: 999px;
+  color: var(--text-dim); border: 1px solid var(--border); white-space: nowrap;
+  display: inline-flex; align-items: center; gap: 0.3rem; }
+.tag.role { color: var(--accent); border-color: rgba(94,177,255,0.3); background: rgba(94,177,255,0.08); }
+
+.bar-row { margin-top: 0.85rem; }
+.bar-label { display: flex; justify-content: space-between; font-size: 0.7rem;
+  color: var(--text-dim); margin-bottom: 0.3rem; gap: 1rem; flex-wrap: wrap; }
+.bar { height: 6px; border-radius: 999px; background: rgba(255,255,255,0.06); overflow: hidden; }
+.bar i { display: block; height: 100%; border-radius: 999px;
+  background: linear-gradient(90deg, var(--accent), var(--ok)); }
+.bar i.hot { background: linear-gradient(90deg, var(--warn), var(--crit)); }
+.node-note { color: var(--text-dim); font-size: 0.74rem; line-height: 1.55; margin-top: 0.7rem; }
+
+a.app { display: block; padding: 0.75rem 0.85rem; border-radius: 11px; text-decoration: none;
+  color: inherit; background: rgba(255,255,255,0.028); border: 1px solid var(--border);
+  min-width: 0; transition: border-color 0.15s ease, background 0.15s ease, transform 0.15s ease; }
+a.app:hover { border-color: var(--border-hi); background: rgba(255,255,255,0.055); transform: translateY(-1px); }
+.app-top { display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 0.25rem 0.5rem; }
+.app-name { font-size: 0.8rem; min-width: 0; flex: 1 1 auto; overflow-wrap: break-word; word-break: break-word; }
+.badge.none { color: var(--text-faint); border: 1px solid var(--border); background: none; box-shadow: none; }
+.app-sub { color: var(--text-faint); font-size: 0.68rem; margin-top: 0.45rem;
+  display: flex; align-items: center; flex-wrap: wrap; gap: 0.3rem 0.5rem; }
+.app-sub .mb { color: var(--text-dim); }
+.app-wires { display: inline-flex; align-items: center; gap: 0.3rem; }
+.app-dom { font-size: 0.68rem; margin-top: 0.35rem; overflow-wrap: anywhere;
+  display: flex; align-items: center; gap: 0.33rem; color: var(--accent); }
+
+.facts { padding: 0.3rem 1.25rem; }
+.fact { display: flex; gap: 1rem; padding: 0.85rem 0; border-bottom: 1px solid var(--border); flex-wrap: wrap; }
+.fact:last-child { border-bottom: none; }
+.fact-k { flex: 0 0 150px; display: flex; align-items: center; gap: 0.45rem; font-size: 0.72rem;
+  letter-spacing: 0.08em; text-transform: uppercase; color: var(--text-faint); }
+.fact-v { flex: 1 1 260px; min-width: 0; font-size: 0.78rem; line-height: 1.6;
+  color: var(--text); overflow-wrap: anywhere; }
+.fact-v code { color: var(--text); background: rgba(255,255,255,0.06);
+  padding: 0.05em 0.3em; border-radius: 4px; font-size: 0.95em; }
+@media (max-width: 560px) { .fact-k { flex-basis: 100%; } }
+
+.flat { display: grid; grid-template-columns: repeat(auto-fill, minmax(min(250px, 100%), 1fr)); gap: 0.6rem; }
+.svc { padding: 0.85rem 0.95rem; }
+.svc-name { font-size: 0.82rem; display: flex; align-items: center; gap: 0.5rem; flex-wrap: wrap; }
+.svc-mb { color: var(--text-faint); font-size: 0.68rem; letter-spacing: 0.04em; }
+.svc-detail { color: var(--text-dim); font-size: 0.72rem; margin-top: 0.5rem; line-height: 1.5; }
+.svc-detail code { color: var(--text); background: rgba(255,255,255,0.06);
+  padding: 0.05em 0.3em; border-radius: 4px; font-size: 0.95em; }
+.svc.offp { border-color: rgba(255,180,84,0.22); }
+
+@media (max-width: 520px) {
+  .node { padding: 0.95rem 1rem; }
+  .facts { padding: 0.3rem 1rem; }
+}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <div class="topbar">
+    <a class="brand" href="/"><span class="pip" id="brand-pip"></span> <span id="brand-text">SERVINGZ</span></a>
+    <div class="tabs">
+      <a href="/" data-scramble>Status</a>
+      <a href="/approvals" data-scramble>Approvals</a>
+      <a href="/deploy" data-scramble>Deploy</a>
+      <a href="/apps" data-scramble>Apps</a>
+      <a href="/architecture" class="active" data-scramble>Architecture</a>
+    </div>
+  </div>
+  <div class="legend" id="legend" style="margin-bottom:1.5rem"></div>
+  <div id="view"><div class="empty">Loading the fleet&hellip;</div></div>
+</div>
+
+<script src="/arch/logos.js"></script>
+<script src="/arch/stack.js"></script>
+<script src="/arch/apps-snapshot.js"></script>
+<script src="/arch/diagram.js"></script>
+<script src="/arch/view.js"></script>
+</body>
+</html>

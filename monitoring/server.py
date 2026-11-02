@@ -73,6 +73,64 @@ def theme_css():
     return Response((STATUS_DIR / "theme.css").read_text(), media_type="text/css")
 
 
+ARCH_DIR = STATUS_DIR / "arch"
+# Explicit allowlist: these are served by name from a user-supplied path, so a
+# dict lookup is the whole defence against traversal.
+ARCH_ASSETS = {
+    "logos.js": "application/javascript",
+    "stack.js": "application/javascript",
+    "apps-snapshot.js": "application/javascript",
+    "diagram.js": "application/javascript",
+    "view.js": "application/javascript",
+}
+
+
+@app.get("/architecture", response_class=HTMLResponse)
+def architecture_page():
+    return (STATUS_DIR / "architecture.html").read_text(encoding="utf-8")
+
+
+@app.get("/arch/{name}")
+def arch_asset(name: str):
+    media = ARCH_ASSETS.get(name)
+    if media is None:
+        raise HTTPException(404, "no such asset")
+    return Response((ARCH_DIR / name).read_text(encoding="utf-8"), media_type=media)
+
+
+@app.get("/api/architecture")
+def api_architecture():
+    """Placement, memory and wiring straight from registry.yaml, so the
+    architecture view is never stale on the things that change most. The
+    detected per-repo stack ships as a dated snapshot instead: resolving it
+    means a GitHub call per repository, which does not belong in a page load."""
+    data = yaml.safe_load(REGISTRY_PATH.read_text())
+    node_keys = ("provider", "backend", "is_control_plane", "has_public_ip", "ip",
+                 "tailscale_ip", "total_memory_mb", "reserved_mb", "usable_mb",
+                 "max_utilisation")
+    nodes = {k: {f: v.get(f) for f in node_keys}
+             for k, v in (data.get("nodes") or {}).items()}
+    apps = [{
+        "n": a.get("name"),
+        "node": a.get("target"),
+        "mb": a.get("memory_mb") or 0,
+        "repo": a.get("repo"),
+        "owner": a.get("owner"),
+        "db": bool(a.get("database")),
+        "redis": bool(a.get("redis")),
+        "ai": bool(a.get("ai")),
+        "crit": bool(a.get("critical")),
+        "dep": a.get("depends_on") or [],
+        "urls": [],
+        "st": None,
+        "pack": None,
+        "port": None,
+        "health": None,
+        "branch": "main",
+    } for a in (data.get("apps") or []) if a.get("name")]
+    return {"nodes": nodes, "apps": apps}
+
+
 @app.get("/effects.js")
 def effects_js():
     return Response((STATUS_DIR / "effects.js").read_text(), media_type="application/javascript")
@@ -271,6 +329,7 @@ APPROVALS_HTML = """<!doctype html>
       <a href="/approvals" class="active" data-scramble>Approvals</a>
       <a href="/deploy" data-scramble>Deploy</a>
       <a href="/apps" data-scramble>Apps</a>
+      <a href="/architecture" data-scramble>Architecture</a>
     </div>
   </div>
 
@@ -434,6 +493,7 @@ DEPLOY_HTML = """<!doctype html>
       <a href="/approvals" data-scramble>Approvals</a>
       <a href="/deploy" class="active" data-scramble>Deploy</a>
       <a href="/apps" data-scramble>Apps</a>
+      <a href="/architecture" data-scramble>Architecture</a>
     </div>
   </div>
 
@@ -632,6 +692,7 @@ APPS_HTML = """<!doctype html>
       <a href="/approvals" data-scramble>Approvals</a>
       <a href="/deploy" data-scramble>Deploy</a>
       <a href="/apps" class="active" data-scramble>Apps</a>
+      <a href="/architecture" data-scramble>Architecture</a>
     </div>
   </div>
 
