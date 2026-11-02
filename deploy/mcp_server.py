@@ -945,7 +945,7 @@ def analyze_deployment_requirements(
     admin to raise your override in registry.yaml if a real need
     outgrows it.
 
-    preferred_node: if a human names a specific host ("put this on ovh",
+    preferred_node: if a human names a specific host ("put this on contabo",
     "deploy it to hostinger"), pass that node's exact registry.yaml name
     here -- it is honored as a hard request, not a hint. Only this node is
     checked (the automatic fleet-wide scorer in recommend_placement() is
@@ -1670,7 +1670,7 @@ def add_custom_domain(ctx: Context, name: str, domain: str, replace: bool = Fals
     blylinks-crm's portal.blylinks.com already uses by hand, now reachable
     through zorc instead of the Coolify dashboard directly.
 
-    Only works for apps on a public-IP node (hostinger-vps, ovh, any
+    Only works for apps on a public-IP node (hostinger-vps, contabo, any
     future one) -- a domain's DNS has to point somewhere real, and
     servingz has no public IP of its own (home network, Cloudflare Tunnel
     only). Rejected with a clear reason for a servingz app; use the

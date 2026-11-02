@@ -70,7 +70,7 @@ env:
 two-step: deploy first, then `set_app_env_vars()` with the real URL, then
 `redeploy()`. Same pattern already proven working this session.
 
-**Target node:** `hostinger-vps` or `ovh` if a custom domain via
+**Target node:** `hostinger-vps` or `contabo` if a custom domain via
 `add_custom_domain()` matters later; `servingz` is fine for internal-only use.
 
 ## 3. The actual payoff: seamless secret resolution at deploy time
