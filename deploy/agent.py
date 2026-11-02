@@ -82,6 +82,18 @@ def record_resource(name: str, *, kind: str, coolify_uuid: str | None = None,
 COOLIFY_PROJECT_UUID = "p81uewe25gri9vdgtbt4kx7c"
 COOLIFY_ENVIRONMENT_NAME = "production"
 COOLIFY_ENVIRONMENT_UUID = "bn4ub336dd38hhe59qq04xtg"
+
+# server_uuid -> destination_uuid, for servers with more than one.
+# Coolify refuses a create that does not name a destination when the server
+# has several ("Server has multiple destinations and you do not set
+# destination_uuid"), and it reports this the same way whatever the real
+# problem is. servingz gained a second network, groundswell-net, which is
+# what started it; the value here is the shared "coolify" network Traefik
+# routes on, where every existing app lives. A server with one destination
+# needs no entry -- Coolify picks it, which is what it has always done.
+COOLIFY_DESTINATIONS = {
+    "ynlpfb7qft2ld6a0coagy5nm": "qtjr1an65odrn9f3k4eymdk4",  # servingz -> coolify
+}
 # The GitHub App Coolify already has installed for private-repo access
 # (confirmed live: iht-news deploys through it). create_coolify_app() uses
 # this instead of the public/unauthenticated source whenever the target
@@ -1480,6 +1492,10 @@ def create_coolify_app(*, name: str, git_repository: str, git_branch: str,
         "project_uuid": COOLIFY_PROJECT_UUID,
         "server_uuid": server_uuid,
         "environment_name": COOLIFY_ENVIRONMENT_NAME,
+        # Coolify 4.3.19 lists environment_uuid as required on BOTH create
+        # endpoints, not just the private one, and a public create without
+        # it is a bare 400 with no body. Sent for every repo now.
+        "environment_uuid": COOLIFY_ENVIRONMENT_UUID,
         "git_repository": git_repository,
         "git_branch": git_branch,
         "build_pack": build_pack,
@@ -1493,6 +1509,9 @@ def create_coolify_app(*, name: str, git_repository: str, git_branch: str,
         "health_check_path": health_check_path,
         "instant_deploy": instant_deploy,
     }
+    destination_uuid = COOLIFY_DESTINATIONS.get(server_uuid)
+    if destination_uuid:
+        payload["destination_uuid"] = destination_uuid
     if private:
         # Coolify's OpenAPI schema lists both environment_name and
         # environment_uuid as "required" on this endpoint even though the
@@ -1509,7 +1528,15 @@ def create_coolify_app(*, name: str, git_repository: str, git_branch: str,
     endpoint = "private-github-app" if private else "public"
     with httpx.Client(timeout=30) as client:
         r = client.post(f"{COOLIFY_URL}/applications/{endpoint}", headers=_coolify_headers(), json=payload)
-        r.raise_for_status()
+        if r.status_code >= 400:
+            # raise_for_status() discards the body, and Coolify puts the only
+            # useful part of a validation failure there -- which field it
+            # rejected. Without this a bad uuid and a missing field look
+            # identical: "400 Bad Request", nothing more.
+            raise RuntimeError(
+                f"Coolify refused {endpoint} create: {r.status_code} {r.text[:900]} "
+                f"| sent keys: {sorted(payload)}"
+            )
         return r.json()
 
 
