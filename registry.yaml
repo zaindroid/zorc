@@ -238,6 +238,19 @@ owner_budgets:
 # Applications. Add new entries at the end. Keep alphabetical within groups.
 # ---------------------------------------------------------------------------
 apps:
+  - name: sealed-signals
+    target: contabo
+    memory_mb: 768
+    subdomain: sealed-signals
+    database: null
+    redis: null
+    ai: null
+    storage_prefix: null
+    repo: "github.com/zaindroid/HFG8-ACAPS-Ground-Truth"
+    owner: "zainey"
+    critical: false
+    depends_on: []
+
   - name: ivay-latency-probe
     target: contabo
     memory_mb: 662
