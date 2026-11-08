@@ -238,6 +238,19 @@ owner_budgets:
 # Applications. Add new entries at the end. Keep alphabetical within groups.
 # ---------------------------------------------------------------------------
 apps:
+  - name: sealed-signals-ai
+    target: contabo
+    memory_mb: 768
+    subdomain: sealed-signals-ai
+    database: null
+    redis: null
+    ai: true
+    storage_prefix: null
+    repo: "github.com/zaindroid/HFG8-ACAPS-Ground-Truth"
+    owner: "zainey"
+    critical: false
+    depends_on: []
+
   - name: purepak-prod
     target: contabo
     memory_mb: 384
