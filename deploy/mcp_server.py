@@ -83,11 +83,24 @@ AUDIT_LOG_PATH = Path(os.environ.get("ZORC_MCP_AUDIT_LOG_PATH", str(Path(__file_
 # env-var-override pattern as the two paths above, same reason.
 PENDING_ACTIONS_PATH = Path(os.environ.get("ZORC_MCP_PENDING_ACTIONS_PATH",
                                              str(Path(__file__).parent / "pending_actions.json")))
+# Queue for the unauthenticated token-request flow (see the /token-request
+# endpoints near the platform endpoints below). Same durability reasoning as
+# PENDING_ACTIONS_PATH: a request an admin hasn't decided on yet has to
+# survive this process restarting. Holds only the claim secret's HASH and,
+# once decided, the granted role -- never a raw token, never a raw secret.
+TOKEN_REQUESTS_PATH = Path(os.environ.get("ZORC_MCP_TOKEN_REQUESTS_PATH",
+                                          str(Path(__file__).parent / "token_requests.json")))
 
 # Public, unauthenticated paths -- Coolify's own health checker has no
 # bearer token, and per AGENTS.md's app contract /health must not require
 # anything special. Everything else needs the token.
 PUBLIC_PATHS = {"/health", "/ready", "/version"}
+# ...plus everything under this prefix. The token-request flow exists
+# precisely for an agent that has no token yet, so it cannot sit behind the
+# bearer check. Filing a request mints nothing by itself -- an admin still
+# has to approve it and choose the role -- and collecting the resulting token
+# additionally requires the claim secret issued at request time.
+PUBLIC_PATH_PREFIX = "/token-request"
 
 # Every mutating tool checks its own rate limit through this one
 # function -- a single place to disable all of them at once for a given
@@ -2280,6 +2293,20 @@ REVOKE_TOKEN_RATE_LIMIT = 5
 REVOKE_TOKEN_RATE_WINDOW_SEC = 3600
 _revoke_token_timestamps: deque[float] = deque()
 
+# The token-request endpoint is reachable without any credential, so its
+# rate limit is per source IP rather than one global bucket: one noisy
+# source must not be able to lock everyone else out of requesting.
+TOKEN_REQUEST_RATE_LIMIT = 5
+TOKEN_REQUEST_RATE_WINDOW_SEC = 3600
+_token_request_timestamps: dict[str, deque[float]] = {}
+# A request nobody decides on, and an approval nobody collects, both stop
+# being usable after this long -- an approved-but-forgotten request should
+# not stay claimable indefinitely.
+TOKEN_REQUEST_TTL_SEC = 1800
+# Bound on stored requests, so an unauthenticated endpoint can't grow this
+# file without limit even within the rate limit.
+TOKEN_REQUEST_MAX_STORED = 200
+
 
 def _write_token_map(token_map: dict) -> None:
     MCP_TOKEN_PATH.write_text(json.dumps(token_map, indent=2) + "\n")
@@ -2436,6 +2463,148 @@ def revoke_client_token(ctx: Context, name: str) -> dict:
     _revoke_token_timestamps.append(now)
     outcome = {"status": "revoked", "name": name}
     _audit("revoke_client_token", params, outcome, client=caller)
+    return outcome
+
+
+# ------------------------------------------------------ token requests ----
+# An agent that has no token yet cannot call any tool on this server, which
+# left exactly one way to onboard one: a human with SSH access running
+# scripts/mint_token.py, or an already-credentialed session minting on the
+# new agent's behalf and then handing the raw token over by hand. Both mean
+# a real credential travels through a chat transcript or a terminal. This
+# flow removes that: the agent asks over an unauthenticated endpoint, an
+# admin approves it in the portal and picks the role, and the agent collects
+# the token itself. Nobody has to see or paste the secret.
+#
+# What makes an unauthenticated endpoint acceptable here:
+#   - Filing a request mints nothing. It is an inert row until an admin
+#     decides on it, and the admin picks the role, not the requester.
+#   - Collecting the token needs the claim secret returned at request time,
+#     so watching an approval happen is not enough to steal the result.
+#   - Only the claim secret's hash is stored, and the token is minted at
+#     collection time, so neither is ever at rest in this file.
+#   - Per-IP rate limit, a hard cap on stored rows, and a TTL on both the
+#     pending and the approved state.
+
+
+def _load_token_requests() -> dict:
+    if not TOKEN_REQUESTS_PATH.exists():
+        return {}
+    try:
+        return json.loads(TOKEN_REQUESTS_PATH.read_text())
+    except (json.JSONDecodeError, OSError):
+        # Never let a corrupt queue file take the whole endpoint down --
+        # an unreadable queue means "no pending requests", and the next
+        # write rebuilds it.
+        return {}
+
+
+def _save_token_requests(requests: dict) -> None:
+    TOKEN_REQUESTS_PATH.write_text(json.dumps(requests, indent=2) + "\n")
+
+
+def _prune_token_requests(requests: dict) -> dict:
+    """Drops rows that can no longer do anything: expired pending ones,
+    expired approved-but-never-collected ones, and already-resolved ones
+    past their TTL. Keeps the newest TOKEN_REQUEST_MAX_STORED regardless,
+    so the file stays bounded even under sustained requests."""
+    now = time.time()
+    kept = {}
+    for rid, r in requests.items():
+        reference = r.get("decided_at") or r.get("requested_at", 0)
+        if now - reference <= TOKEN_REQUEST_TTL_SEC:
+            kept[rid] = r
+    if len(kept) > TOKEN_REQUEST_MAX_STORED:
+        newest = sorted(kept.items(), key=lambda kv: kv[1].get("requested_at", 0), reverse=True)
+        kept = dict(newest[:TOKEN_REQUEST_MAX_STORED])
+    return kept
+
+
+def _token_request_public_view(rid: str, r: dict) -> dict:
+    """Everything about one request that is safe to show an admin -- i.e.
+    all of it except the claim secret's hash."""
+    return {
+        "id": rid,
+        "name": r.get("name"),
+        "role_requested": r.get("role_requested"),
+        "reason": r.get("reason"),
+        "source_ip": r.get("source_ip"),
+        "requested_at": r.get("requested_at"),
+        "status": r.get("status"),
+        "role_granted": r.get("role_granted"),
+        "decided_by": r.get("decided_by"),
+        "decided_at": r.get("decided_at"),
+        "expires_in_sec": max(0, int(TOKEN_REQUEST_TTL_SEC - (time.time() - (r.get("decided_at") or r.get("requested_at", 0))))),
+    }
+
+
+@mcp.tool()
+def list_token_requests(ctx: Context) -> dict:
+    """Pending and recently-decided token requests filed through the
+    unauthenticated /token-request endpoint -- ADMIN ONLY, since this is
+    the queue that grants credentials. Never returns a claim secret or a
+    token. The same list drives the portal's approvals page; this tool
+    exists so an admin agent can work the queue without the browser.
+    Read-only, not rate-limited."""
+    caller = _caller_identity(ctx)
+    if caller.get("role") != "admin":
+        return {"status": "rejected", "reason": "list_token_requests is admin-only"}
+    requests = _prune_token_requests(_load_token_requests())
+    _save_token_requests(requests)
+    rows = [_token_request_public_view(rid, r) for rid, r in requests.items()]
+    rows.sort(key=lambda r: r["requested_at"] or 0, reverse=True)
+    return {"requests": rows, "pending": sum(1 for r in rows if r["status"] == "pending")}
+
+
+@mcp.tool()
+def decide_token_request(ctx: Context, id: str, decision: Literal["approve", "reject"],
+                         role: Literal["admin", "client"] | None = None) -> dict:
+    """Approves or rejects one token request -- ADMIN ONLY. The ROLE comes
+    from this call, not from what the requester asked for: an agent asking
+    for admin gets whatever the admin actually grants here, so a request is
+    a suggestion, never an escalation. Approving does NOT mint anything
+    yet -- the token is created when the requester collects it with its
+    claim secret, so no raw token is ever written to disk. Audited (the
+    decision and role, never the secret)."""
+    caller = _caller_identity(ctx)
+    params = {"id": id, "decision": decision, "role": role}
+    if caller.get("role") != "admin":
+        outcome = {"status": "rejected", "reason": "decide_token_request is admin-only"}
+        _audit("decide_token_request", params, outcome, client=caller)
+        return outcome
+
+    requests = _prune_token_requests(_load_token_requests())
+    row = requests.get(id)
+    if row is None:
+        outcome = {"status": "rejected", "reason": f"no pending token request {id!r} (it may have expired)"}
+        _audit("decide_token_request", params, outcome, client=caller)
+        return outcome
+    if row.get("status") != "pending":
+        outcome = {"status": "rejected",
+                   "reason": f"request {id!r} was already {row.get('status')} -- decisions are final"}
+        _audit("decide_token_request", params, outcome, client=caller)
+        return outcome
+
+    if decision == "approve":
+        granted = role or row.get("role_requested") or "client"
+        if granted not in ("admin", "client"):
+            outcome = {"status": "rejected", "reason": f"invalid role {granted!r}"}
+            _audit("decide_token_request", params, outcome, client=caller)
+            return outcome
+        row["status"] = "approved"
+        row["role_granted"] = granted
+    else:
+        row["status"] = "rejected"
+        row["role_granted"] = None
+    row["decided_by"] = caller.get("name")
+    row["decided_at"] = time.time()
+    requests[id] = row
+    _save_token_requests(requests)
+
+    outcome = {"status": row["status"], "id": id, "name": row.get("name"),
+               "role_granted": row.get("role_granted"),
+               "collectable_for_sec": TOKEN_REQUEST_TTL_SEC if decision == "approve" else 0}
+    _audit("decide_token_request", params, outcome, client=caller)
     return outcome
 
 
@@ -2657,6 +2826,8 @@ class BearerAuthMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request: Request, call_next):
         path = request.url.path
         if (path in PUBLIC_PATHS
+                or path == PUBLIC_PATH_PREFIX
+                or path.startswith(PUBLIC_PATH_PREFIX + "/")
                 or path in self._OAUTH_DISCOVERY_PATHS
                 or path.startswith(self._OAUTH_DISCOVERY_PREFIXES)):
             return await call_next(request)
@@ -2694,6 +2865,154 @@ async def version(request: Request):
     return JSONResponse({"sha": BUILD_SHA, "built": None})
 
 
+# ------------------------------------------------ token-request endpoints ----
+# The unauthenticated half of the flow described above the token-request
+# tools. These two are the only routes on this server that run without a
+# bearer token, because their whole purpose is serving a caller that does
+# not have one yet.
+
+def _request_source_ip(request: Request) -> str:
+    """Best-effort source IP for rate limiting and for showing the admin
+    who is asking. This server is only reachable through the Cloudflare
+    Tunnel, so CF-Connecting-IP is the real client; it is a caller-supplied
+    header and therefore spoofable by anything that can reach the origin
+    directly, which is why it is used for rate-limit bucketing and display
+    only, never as an authorization input."""
+    forwarded = request.headers.get("cf-connecting-ip") or request.headers.get("x-forwarded-for", "")
+    if forwarded:
+        return forwarded.split(",")[0].strip()[:64]
+    return (request.client.host if request.client else "unknown")[:64]
+
+
+async def token_request_create(request: Request):
+    """POST /token-request {name, role, reason} -> {request_id, claim_secret}.
+
+    Queues a request. Mints nothing: an admin decides, in the portal or via
+    decide_token_request(), and chooses the role."""
+    source_ip = _request_source_ip(request)
+    bucket = _token_request_timestamps.setdefault(source_ip, deque())
+    if _rate_limited(bucket, TOKEN_REQUEST_RATE_LIMIT, TOKEN_REQUEST_RATE_WINDOW_SEC):
+        return JSONResponse(
+            {"error": f"rate limit: {TOKEN_REQUEST_RATE_LIMIT} token requests per "
+                      f"{TOKEN_REQUEST_RATE_WINDOW_SEC}s from one source"},
+            status_code=429)
+
+    try:
+        body = await request.json()
+    except (json.JSONDecodeError, ValueError):
+        return JSONResponse({"error": "body must be JSON"}, status_code=400)
+    if not isinstance(body, dict):
+        return JSONResponse({"error": "body must be a JSON object"}, status_code=400)
+
+    name = str(body.get("name") or "").strip()
+    role = str(body.get("role") or "client").strip()
+    reason = str(body.get("reason") or "").strip()[:500]
+    # The name ends up as a client identity and is rendered in the portal,
+    # so keep it to an unambiguous character set rather than sanitizing later.
+    if not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", name):
+        return JSONResponse(
+            {"error": "name must be 1-64 chars of letters, digits, hyphen or underscore"},
+            status_code=400)
+    if role not in ("admin", "client"):
+        return JSONResponse({"error": "role must be 'admin' or 'client'"}, status_code=400)
+    if not reason:
+        return JSONResponse(
+            {"error": "reason is required -- the admin approving this needs to know what it is for"},
+            status_code=400)
+
+    requests_map = _prune_token_requests(_load_token_requests())
+    request_id = secrets_module.token_hex(8)
+    claim_secret = secrets_module.token_hex(32)
+    requests_map[request_id] = {
+        "name": name,
+        "role_requested": role,
+        "reason": reason,
+        "source_ip": source_ip,
+        "requested_at": time.time(),
+        "status": "pending",
+        "role_granted": None,
+        "decided_by": None,
+        "decided_at": None,
+        "claim_secret_sha256": hashlib.sha256(claim_secret.encode()).hexdigest(),
+    }
+    _save_token_requests(requests_map)
+    bucket.append(time.time())
+    _audit("token_request_create",
+           {"name": name, "role_requested": role, "source_ip": source_ip},
+           {"status": "pending", "id": request_id},
+           client={"name": f"anonymous@{source_ip}", "role": None})
+
+    return JSONResponse({
+        "request_id": request_id,
+        "claim_secret": claim_secret,
+        "status": "pending",
+        "expires_in_sec": TOKEN_REQUEST_TTL_SEC,
+        "collect_with": f"GET /token-request/{request_id} with header X-Zorc-Claim-Secret",
+        "note": "An admin must approve this before a token exists. Poll the URL above.",
+    }, status_code=202)
+
+
+async def token_request_poll(request: Request):
+    """GET /token-request/{id} with header X-Zorc-Claim-Secret.
+
+    While pending, reports status. Once an admin has approved it, mints the
+    token and returns it EXACTLY ONCE -- the row is marked collected
+    immediately, so a replayed request gets nothing."""
+    request_id = request.path_params.get("request_id", "")
+    presented = request.headers.get("x-zorc-claim-secret", "")
+    if not presented:
+        return JSONResponse({"error": "X-Zorc-Claim-Secret header is required"}, status_code=401)
+
+    requests_map = _prune_token_requests(_load_token_requests())
+    row = requests_map.get(request_id)
+    if row is None:
+        # Same answer whether the id never existed or has expired -- there is
+        # nothing useful to tell an unauthenticated caller apart here.
+        return JSONResponse({"error": "no such token request (it may have expired)"}, status_code=404)
+    if not secrets_module.compare_digest(
+            hashlib.sha256(presented.encode()).hexdigest(),
+            row.get("claim_secret_sha256", "")):
+        return JSONResponse({"error": "claim secret does not match"}, status_code=403)
+
+    status = row.get("status")
+    if status == "pending":
+        return JSONResponse({"status": "pending", "name": row.get("name"),
+                             "note": "waiting for an admin to approve this in the zorc portal"})
+    if status == "rejected":
+        return JSONResponse({"status": "rejected", "name": row.get("name"),
+                            "note": "an admin declined this request"}, status_code=403)
+    if status == "collected":
+        return JSONResponse({"status": "collected",
+                             "note": "this token was already collected once and cannot be re-issued"},
+                            status_code=410)
+    if status != "approved":
+        return JSONResponse({"status": status or "unknown"}, status_code=409)
+
+    # Approved and not yet collected: mint now, hand it over once.
+    name = row.get("name")
+    role = row.get("role_granted") or "client"
+    try:
+        token_map = _load_token_map()
+    except Exception:
+        token_map = {}
+    token_map = {h: info for h, info in token_map.items() if info.get("name") != name}
+    token = secrets_module.token_hex(32)
+    token_map[hashlib.sha256(token.encode()).hexdigest()] = {"name": name, "role": role}
+    _write_token_map(token_map)
+
+    row["status"] = "collected"
+    row["collected_at"] = time.time()
+    requests_map[request_id] = row
+    _save_token_requests(requests_map)
+    _audit("token_request_collect",
+           {"id": request_id, "name": name, "role": role},
+           {"status": "collected"},
+           client={"name": row.get("decided_by") or "unknown", "role": "admin"})
+
+    return JSONResponse({"status": "approved", "name": name, "role": role, "token": token,
+                         "note": "Shown once. Configure it now; it cannot be retrieved again."})
+
+
 def build_app() -> Starlette:
     # Load (and validate) the token map now, at process startup, rather than
     # waiting for the first request to discover a missing/malformed
@@ -2720,6 +3039,8 @@ def build_app() -> Starlette:
     app.add_route("/health", health, methods=["GET"])
     app.add_route("/ready", ready, methods=["GET"])
     app.add_route("/version", version, methods=["GET"])
+    app.add_route("/token-request", token_request_create, methods=["POST"])
+    app.add_route("/token-request/{request_id}", token_request_poll, methods=["GET"])
     app.add_middleware(BearerAuthMiddleware)
     return app
 
