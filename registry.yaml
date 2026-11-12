@@ -238,6 +238,19 @@ owner_budgets:
 # Applications. Add new entries at the end. Keep alphabetical within groups.
 # ---------------------------------------------------------------------------
 apps:
+  - name: bgapi-worker
+    target: rtx5090
+    memory_mb: 3200
+    subdomain: bgapi-worker
+    database: null
+    redis: null
+    ai: null
+    storage_prefix: null
+    repo: "github.com/zaindroid/bgapi-worker"
+    owner: "zainey"
+    critical: false
+    depends_on: []
+
   - name: bgapi-gateway
     target: contabo
     memory_mb: 662
