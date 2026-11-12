@@ -238,6 +238,19 @@ owner_budgets:
 # Applications. Add new entries at the end. Keep alphabetical within groups.
 # ---------------------------------------------------------------------------
 apps:
+  - name: bgapi-gateway
+    target: contabo
+    memory_mb: 662
+    subdomain: bgapi-gateway
+    database: true
+    redis: null
+    ai: null
+    storage_prefix: null
+    repo: "github.com/zaindroid/bgapi"
+    owner: "zainey"
+    critical: false
+    depends_on: []
+
   - name: sealed-signals-ai
     target: contabo
     memory_mb: 896
