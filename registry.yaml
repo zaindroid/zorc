@@ -238,6 +238,19 @@ owner_budgets:
 # Applications. Add new entries at the end. Keep alphabetical within groups.
 # ---------------------------------------------------------------------------
 apps:
+  - name: kite-studio
+    target: contabo
+    memory_mb: 768
+    subdomain: kite-studio
+    database: null
+    redis: null
+    ai: null
+    storage_prefix: null
+    repo: "github.com/zaindroid/junction26-kite"
+    owner: "zainey"
+    critical: false
+    depends_on: []
+
   - name: bgapi-worker
     target: rtx5090
     memory_mb: 3200
