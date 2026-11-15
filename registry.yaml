@@ -238,6 +238,19 @@ owner_budgets:
 # Applications. Add new entries at the end. Keep alphabetical within groups.
 # ---------------------------------------------------------------------------
 apps:
+  - name: kite-app
+    target: contabo
+    memory_mb: 896
+    subdomain: kite-app
+    database: null
+    redis: null
+    ai: null
+    storage_prefix: null
+    repo: "github.com/zaindroid/kite-app"
+    owner: "zainey"
+    critical: false
+    depends_on: []
+
   - name: kite-studio
     target: contabo
     memory_mb: 768
